@@ -4468,6 +4468,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_table_txn_builder_removes_table_properties() -> delta_kernel::Result<()> {
+        let (store, kernel_engine, table_url) =
+            test_utils::engine_store_setup("test_remove_table_properties", None);
+        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+            "id",
+            DataType::INTEGER,
+        )])?);
+        delta_kernel::transaction::create_table::create_table(
+            table_url.as_str(),
+            schema,
+            "test-engine/1.0",
+            true,
+        )
+        .with_table_properties([("app.removed", "1"), ("app.kept", "2")])
+        .build(&kernel_engine, Box::new(FileSystemCommitter::new()))?
+        .commit(&kernel_engine)?
+        .unwrap_committed();
+        let engine = engine_handle_for_store(store);
+
+        let snapshot =
+            delta_kernel::Snapshot::builder_for(table_url.clone()).build(&kernel_engine)?;
+        let snapshot_handle: Handle<SharedSnapshot> = snapshot.into();
+        let mut builder = unsafe {
+            ok_or_panic(new_update_table_txn_builder(
+                snapshot_handle.shallow_copy(),
+                KernelUpdateTableOperation::AlterTable,
+                ffi_str("test-engine/1.0"),
+                false,
+                engine.shallow_copy(),
+            ))
+        };
+        builder = ok_or_panic(unsafe {
+            update_table_txn_builder_with_table_property_removed(
+                builder,
+                ffi_str("app.removed"),
+                engine.shallow_copy(),
+            )
+        });
+        let txn =
+            ok_or_panic(unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
+        unsafe {
+            free_committed_transaction(committed);
+            free_snapshot(snapshot_handle);
+            free_engine(engine);
+        }
+
+        let snapshot = delta_kernel::Snapshot::builder_for(table_url).build(&kernel_engine)?;
+        let configuration = &snapshot.table_properties().unknown_properties;
+        assert!(!configuration.contains_key("app.removed"));
+        assert_eq!(configuration.get("app.kept").map(String::as_str), Some("2"));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_create_table_with_custom_committer() -> KernelResult<()> {
         let (store, _test_engine, table_url) =
             test_utils::engine_store_setup("test_create_table", None);

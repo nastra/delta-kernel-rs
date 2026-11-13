@@ -208,8 +208,11 @@ pub(super) fn prepare_update_table_metadata(
     if should_emit_protocol {
         table_config.ensure_write_supported()?;
     }
-    let should_emit_metadata =
-        has_schema_changes || table_config.metadata() != read_config.metadata();
+    // Like Java, a removal request emits Metadata even when no requested key exists, so a
+    // removal-only ALTER TABLE commits.
+    let should_emit_metadata = has_schema_changes
+        || !property_keys_removed.is_empty()
+        || table_config.metadata() != read_config.metadata();
     Ok(PreparedUpdateTableMetadata {
         table_config,
         should_emit_metadata,

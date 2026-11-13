@@ -23,7 +23,7 @@ Pass it explicitly when you construct the builder. The table shows typical workf
 | Transaction Component | ALTER TABLE | SCHEMA EVOLUTION |
 |--------|------------------------|---------------------------------|
 | Operation | `UpdateTableOperation::AlterTable` | The data operation, such as `UpdateTableOperation::Write` |
-| Schema operations | Required | Queued alongside the data operation |
+| Schema operations | Required unless table properties are removed | Queued alongside the data operation |
 | Data-file changes | None staged | Staged on the built transaction |
 | `data_change` constructor argument | `false` | `true` if records change; `false` otherwise |
 

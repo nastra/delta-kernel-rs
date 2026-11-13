@@ -554,6 +554,28 @@ pub unsafe extern "C" fn update_table_txn_builder_with_domain_metadata_removed(
     unsafe { result.into_extern_result(&engine) }
 }
 
+/// Adds a table property key to remove from the table configuration.
+///
+/// Keys are matched exactly. Removing an absent key is not an error. Building rejects keys that
+/// start with `delta.` (case-insensitive) and keys that are also set in the same transaction.
+///
+/// # Safety
+///
+/// All handles and `key` must be valid. This call borrows `engine` and `key` and unconditionally
+/// consumes `builder`, including on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn update_table_txn_builder_with_table_property_removed(
+    builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
+    key: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
+    let builder = unsafe { *builder.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    let key: KernelResult<String> = unsafe { TryFromStringSlice::try_from_slice(&key) };
+    let result = key.map(|key| Box::new(builder.with_table_properties_removed([key])).into());
+    unsafe { result.into_extern_result(&engine) }
+}
+
 /// Set an explicit row-tracking high-water mark for this transaction.
 ///
 /// Use this when row IDs must also be coordinated with another system. Kernel still assigns

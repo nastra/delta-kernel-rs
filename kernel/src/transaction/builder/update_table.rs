@@ -18,6 +18,7 @@ use crate::table_features::{
     IcebergCompatValidationContext, Operation, V2_VALIDATOR, V3_VALIDATOR,
     validate_iceberg_compat_if_needed,
 };
+use crate::table_properties::DELTA_PROPERTY_PREFIX;
 use crate::transaction::domain_metadata::validate_unique_domains;
 use crate::transaction::schema_evolution::SchemaOperation;
 use crate::transaction::{
@@ -66,8 +67,7 @@ pub struct UpdateTableBuilderState {
     snapshot: SnapshotRef,
     operation: UpdateTableOperation,
     schema_changes: Option<Vec<SchemaOperation>>,
-    // Configuration overrides for the shared update preparation path. No public setter populates
-    // these yet.
+    // Configuration overrides for the shared update preparation path.
     properties_added: HashMap<String, String>,
     property_keys_removed: HashSet<String>,
     domain_metadata_removals: Vec<String>,
@@ -190,6 +190,25 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         self
     }
 
+    /// Removes table properties from the table configuration.
+    ///
+    /// Keys are matched exactly, so removing `app.key` leaves `APP.KEY` in place. Removing a key
+    /// that the table does not have is not an error: the commit still includes a Metadata action,
+    /// with an unchanged configuration. Calls accumulate keys.
+    ///
+    /// Only user properties can be removed. [`build`](Self::build) rejects keys that start with
+    /// `delta.`, compared case-insensitively, and keys that are also set in the same transaction.
+    /// Removing a property never changes the protocol.
+    pub fn with_table_properties_removed(
+        mut self,
+        keys: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.local_state
+            .property_keys_removed
+            .extend(keys.into_iter().map(Into::into));
+        self
+    }
+
     /// Adds a user-controlled domain metadata removal to the transaction.
     ///
     /// If the domain exists, commit emits a tombstone that preserves its previous configuration.
@@ -225,6 +244,7 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// - Invalid operation intent, including incompatible blind-append or schema intent.
     /// - Unsupported table writes, schema evolution, or CDF validation failures.
     /// - Conflicting application ids or domain metadata, or reserved or unsupported domains.
+    /// - Removal of a `delta.` table property, or of a property that is also set.
     /// - Connector commit information that does not contain exactly one row.
     ///
     /// Schema changes are rejected when `icebergCompatV2`, `icebergCompatV3`, or
@@ -265,6 +285,14 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
                     "ALTER TABLE requires data_change to be false",
                 ));
             }
+        }
+        if let Some(key) = self.local_state.property_keys_removed.iter().find(|key| {
+            key.get(..DELTA_PROPERTY_PREFIX.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(DELTA_PROPERTY_PREFIX))
+        }) {
+            return Err(KernelError::unsupported(format!(
+                "Unsetting 'delta.' table properties is currently unsupported: '{key}'"
+            )));
         }
         if self.local_state.is_blind_append && !self.common_state.data_change {
             return Err(KernelError::invalid_transaction_state(
@@ -417,7 +445,8 @@ mod tests {
     use crate::table_configuration::InCommitTimestampEnablement;
     use crate::table_features::TableFeature;
     use crate::table_properties::{
-        ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
+        DELTA_PROPERTY_PREFIX, ENABLE_CHANGE_DATA_FEED, ENABLE_ICEBERG_COMPAT_V2,
+        ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
     };
     use crate::transaction::create_table::create_table;
     use crate::transaction::{SchemaOperation, UpdateTableOperation};
@@ -1212,6 +1241,121 @@ mod tests {
             reloaded.reader().get_in_commit_timestamp(&engine)?,
             Some(timestamp)
         );
+        Ok(())
+    }
+
+    fn create_table_with_user_properties(engine: &dyn Engine) -> Result<SnapshotRef> {
+        Ok(create_table("memory:///", test_schema_flat(), "test", true)
+            .with_table_properties([
+                ("app.key", "lower"),
+                ("APP.KEY", "upper"),
+                ("app.other", "other"),
+                (ENABLE_CHANGE_DATA_FEED, "true"),
+            ])
+            .build(engine, Box::new(FileSystemCommitter::new()))?
+            .commit(engine)?
+            .unwrap_post_commit_snapshot())
+    }
+
+    #[rstest]
+    #[case::exact_case_match(vec![vec!["app.key"]], &["APP.KEY", "app.other"])]
+    #[case::other_case_match(vec![vec!["APP.KEY"]], &["app.key", "app.other"])]
+    #[case::absent_key(vec![vec!["app.missing"]], &["app.key", "APP.KEY", "app.other"])]
+    #[case::calls_accumulate(
+        vec![vec!["app.key"], vec!["APP.KEY", "app.missing"]],
+        &["app.other"]
+    )]
+    fn alter_table_removes_only_requested_user_properties(
+        #[case] removals: Vec<Vec<&str>>,
+        #[case] remaining_user_keys: &[&str],
+    ) -> Result<()> {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let snapshot = create_table_with_user_properties(&engine)?;
+        let mut builder =
+            snapshot
+                .clone()
+                .update_table(UpdateTableOperation::AlterTable, "test-engine", false);
+        for keys in removals {
+            builder = builder.with_table_properties_removed(keys);
+        }
+        let transaction = builder.build(&engine, Box::new(FileSystemCommitter::new()))?;
+        assert!(transaction.should_emit_metadata);
+        assert!(!transaction.should_emit_protocol);
+        transaction.commit(&engine)?.unwrap_committed();
+
+        let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
+        assert_eq!(reloaded.version(), snapshot.version() + 1);
+        let old_config = snapshot.table_configuration();
+        let new_config = reloaded.table_configuration();
+        assert_eq!(new_config.protocol(), old_config.protocol());
+        let mut expected = old_config.metadata().configuration().clone();
+        expected.retain(|key, _| {
+            key.starts_with(DELTA_PROPERTY_PREFIX) || remaining_user_keys.contains(&key.as_str())
+        });
+        assert_eq!(new_config.metadata().configuration(), &expected);
+        Ok(())
+    }
+
+    #[rstest]
+    fn removing_delta_properties_is_rejected(
+        #[values(
+            "delta.enableChangeDataFeed",
+            "DELTA.enableChangeDataFeed",
+            "Delta.enableChangeDataFeed",
+            "delta.feature.changeDataFeed",
+            "delta.missing"
+        )]
+        key: &str,
+    ) -> Result<()> {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let snapshot = create_table_with_user_properties(&engine)?;
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_removed(["app.key", key])
+            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(matches!(error, KernelError::Unsupported(_)), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("Unsetting 'delta.' table properties is currently unsupported"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::same_key("app.key", Some("both set and unset"))]
+    #[case::different_case("APP.KEY", None)]
+    fn removed_properties_must_not_overlap_set_properties(
+        #[case] removed: &str,
+        #[case] expected_error: Option<&str>,
+    ) -> Result<()> {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let snapshot = create_table_with_user_properties(&engine)?;
+        let mut builder = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_removed([removed]);
+        builder
+            .local_state
+            .properties_added
+            .insert("app.key".to_string(), "new".to_string());
+        let result = builder.build(&engine, Box::new(FileSystemCommitter::new()));
+        match expected_error {
+            Some(expected) => {
+                let error = result.unwrap_err();
+                assert!(error.to_string().contains(expected), "{error}");
+            }
+            None => {
+                let committed = result?.commit(&engine)?.unwrap_post_commit_snapshot();
+                let configuration = committed.table_configuration().metadata().configuration();
+                assert_eq!(
+                    configuration.get("app.key").map(String::as_str),
+                    Some("new")
+                );
+                assert!(!configuration.contains_key(removed));
+            }
+        }
         Ok(())
     }
 
