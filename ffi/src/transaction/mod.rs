@@ -4457,6 +4457,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_table_txn_builder_rejects_invalid_table_properties()
+    -> delta_kernel::Result<()> {
+        let (store, kernel_engine, table_url) =
+            test_utils::engine_store_setup("test_update_builder_invalid_table_properties", None);
+        delta_kernel::transaction::create_table::create_table(
+            table_url.as_str(),
+            schema_ref! { nullable "id": INTEGER },
+            "test-engine/1.0",
+            true,
+        )
+        .build(&kernel_engine, Box::new(FileSystemCommitter::new()))?
+        .commit(&kernel_engine)?
+        .unwrap_committed();
+        let engine = engine_handle_for_store(store);
+        let snapshot =
+            delta_kernel::Snapshot::builder_for(table_url.clone()).build(&kernel_engine)?;
+        let read_configuration = snapshot
+            .table_configuration()
+            .metadata()
+            .configuration()
+            .clone();
+        let snapshot_handle: Handle<SharedSnapshot> = snapshot.into();
+        let builder = unsafe {
+            ok_or_panic(new_update_table_txn_builder(
+                snapshot_handle.shallow_copy(),
+                KernelUpdateTableOperation::AlterTable,
+                ffi_str("test-engine/1.0"),
+                false,
+                engine.shallow_copy(),
+            ))
+        };
+        let entries = [FfiStringMapEntry {
+            key: ffi_str("delta.unknown"),
+            value: ffi_str("x"),
+        }];
+        let properties = unsafe { FfiStringMap::new_unsafe(&entries) };
+        let builder = ok_or_panic(unsafe {
+            update_table_txn_builder_with_table_properties_added(
+                builder,
+                &properties,
+                engine.shallow_copy(),
+            )
+        });
+        assert_extern_result_error_contains(
+            unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) },
+            FFIKernelError::GenericError,
+            "Setting delta property 'delta.unknown' is not supported",
+        );
+        unsafe {
+            free_snapshot(snapshot_handle);
+            free_engine(engine);
+        }
+
+        let reloaded = delta_kernel::Snapshot::builder_for(table_url).build(&kernel_engine)?;
+        assert_eq!(reloaded.version(), 0);
+        assert_eq!(
+            reloaded.table_configuration().metadata().configuration(),
+            &read_configuration
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_update_table_txn_builder_applies_nested_schema_changes()
     -> delta_kernel::Result<()> {
         let (store, kernel_engine, table_url) =
