@@ -1,22 +1,25 @@
 //! Builder for transactions against an existing table.
 
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 
 use delta_kernel_derive::internal_api;
 
 use super::TransactionBuilder;
 use super::state::TransactionBuilderState;
+use super::update_metadata::{
+    PreparedUpdateTableMetadata, UpdateTableMetadataRequest, prepare_update_table_metadata,
+};
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
-use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    IcebergCompatValidationContext, Operation, TableFeature, V2_VALIDATOR, V3_VALIDATOR,
+    IcebergCompatValidationContext, Operation, V2_VALIDATOR, V3_VALIDATOR,
     validate_iceberg_compat_if_needed,
 };
 use crate::transaction::domain_metadata::validate_unique_domains;
-use crate::transaction::schema_evolution::{SchemaOperation, evolve_table_config};
+use crate::transaction::schema_evolution::SchemaOperation;
 use crate::transaction::{
     ExecutionMode, Imperative, Transaction, UpdateTable, UpdateTableOperation,
 };
@@ -44,6 +47,10 @@ use crate::{Engine, KernelError, KernelResult};
 /// them. For schema evolution, stage data-file changes on the returned [`Transaction`], using the
 /// evolved schema provided by [`Transaction::write_state`].
 ///
+/// When the evolved schema contains a type or annotation whose table feature the protocol does not
+/// support, such as `timestampNtz`, `variantType`, or `collations`, `build()` adds the feature and
+/// the commit includes a Protocol action. Existing protocol features are always retained.
+///
 /// Set `data_change` when constructing the builder: `true` for logical data changes, or `false`
 /// for metadata-only changes and data-preserving rewrites. `ALTER TABLE` requires `false`, while
 /// blind append requires `true`. [`build`](UpdateTableTransactionBuilder::build) rejects
@@ -59,6 +66,10 @@ pub struct UpdateTableBuilderState {
     snapshot: SnapshotRef,
     operation: UpdateTableOperation,
     schema_changes: Option<Vec<SchemaOperation>>,
+    // Configuration overrides for the shared update preparation path. No public setter populates
+    // these yet.
+    properties_added: HashMap<String, String>,
+    property_keys_removed: HashSet<String>,
     domain_metadata_removals: Vec<String>,
     is_blind_append: bool,
 }
@@ -89,6 +100,8 @@ impl TransactionBuilder<UpdateTable> {
                 snapshot,
                 operation,
                 schema_changes: None,
+                properties_added: HashMap::new(),
+                property_keys_removed: HashSet::new(),
                 domain_metadata_removals: Vec::new(),
                 is_blind_append: false,
             },
@@ -234,7 +247,10 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
             .validate()
             .map_err(KernelError::invalid_transaction_state)?;
         if operation == &UpdateTableOperation::AlterTable {
-            if self.local_state.schema_changes.is_none() {
+            if self.local_state.schema_changes.is_none()
+                && self.local_state.properties_added.is_empty()
+                && self.local_state.property_keys_removed.is_empty()
+            {
                 return Err(KernelError::invalid_transaction_state(
                     "ALTER TABLE requires at least one schema change",
                 ));
@@ -300,6 +316,8 @@ fn try_new_update_table<MODE: ExecutionMode>(
         snapshot: read_snapshot,
         operation,
         schema_changes,
+        properties_added,
+        property_keys_removed,
         domain_metadata_removals,
         is_blind_append,
     } = local_state;
@@ -330,29 +348,37 @@ fn try_new_update_table<MODE: ExecutionMode>(
         read_version = read_snapshot.version(),
     );
 
-    let effective_table_config = read_snapshot.table_configuration().clone();
-
+    let read_table_config = read_snapshot.table_configuration();
     validate_iceberg_compat_if_needed(
-        &effective_table_config,
+        read_table_config,
         &V2_VALIDATOR,
         IcebergCompatValidationContext::Write,
     )?;
-
     validate_iceberg_compat_if_needed(
-        &effective_table_config,
+        read_table_config,
         &V3_VALIDATOR,
         IcebergCompatValidationContext::Write,
     )?;
 
-    let should_emit_metadata = schema_changes.is_some();
-    let effective_table_config = match schema_changes {
-        Some(changes) => apply_schema_changes(effective_table_config, changes)?,
-        None => effective_table_config,
-    };
+    let PreparedUpdateTableMetadata {
+        table_config: effective_table_config,
+        should_emit_metadata,
+        should_emit_protocol,
+    } = prepare_update_table_metadata(
+        &read_snapshot,
+        UpdateTableMetadataRequest {
+            schema_changes,
+            properties_added,
+            property_keys_removed,
+        },
+        commit_timestamp,
+        engine,
+    )?;
 
     Ok(Transaction {
         read_snapshot_opt: Some(read_snapshot),
         should_emit_metadata,
+        should_emit_protocol,
         user_domain_removals: domain_metadata_removals,
         is_blind_append,
         physical_clustering_columns: clustering_columns,
@@ -365,33 +391,6 @@ fn try_new_update_table<MODE: ExecutionMode>(
             commit_timestamp,
         )
     })
-}
-
-fn apply_schema_changes(
-    table_config: TableConfiguration,
-    changes: Vec<SchemaOperation>,
-) -> KernelResult<TableConfiguration> {
-    let unsupported_iceberg_compat = [TableFeature::IcebergCompatV2, TableFeature::IcebergCompatV3]
-        .into_iter()
-        .find(|feature| table_config.is_feature_enabled(feature));
-    if let Some(feature) = unsupported_iceberg_compat {
-        return Err(KernelError::unsupported(format!(
-            "Schema changes are not yet supported on tables with {feature} enabled"
-        )));
-    }
-    if table_config.is_feature_enabled(&TableFeature::AllowColumnDefaults) {
-        return Err(KernelError::unsupported(
-            "Schema changes are not yet supported on tables with allowColumnDefaults enabled",
-        ));
-    }
-    if table_config.is_feature_supported(&TableFeature::GeneratedColumns)
-        && table_config.has_generation_expressions()
-    {
-        return Err(KernelError::unsupported(
-            "Schema changes are not yet supported on tables with generated columns",
-        ));
-    }
-    evolve_table_config(&table_config, changes)
 }
 
 #[cfg(test)]
@@ -415,8 +414,11 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::schema::{DataType, StructField, schema_ref};
     use crate::snapshot::Snapshot;
+    use crate::table_configuration::InCommitTimestampEnablement;
     use crate::table_features::TableFeature;
-    use crate::table_properties::{ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3};
+    use crate::table_properties::{
+        ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
+    };
     use crate::transaction::create_table::create_table;
     use crate::transaction::{SchemaOperation, UpdateTableOperation};
     use crate::unit_test_utils::{copy_test_table, load_test_table, test_schema_flat};
@@ -1158,6 +1160,58 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("domainMetadata"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn schema_only_change_derives_protocol_features() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .add_column(StructField::nullable("ts", DataType::TIMESTAMP_NTZ))
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+        assert!(transaction.should_emit_metadata);
+        assert!(transaction.should_emit_protocol);
+        let config = &transaction.effective_table_config;
+        assert!(config.is_feature_supported(&TableFeature::TimestampWithoutTimezone));
+        assert!(config.is_feature_supported(&TableFeature::AppendOnly));
+        assert!(config.is_feature_supported(&TableFeature::Invariants));
+        Ok(())
+    }
+
+    #[test]
+    fn enabling_in_commit_timestamps_commits_recorded_enablement() -> Result<()> {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let snapshot = create_table("memory:///", test_schema_flat(), "test", true)
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
+            .unwrap_post_commit_snapshot();
+        let mut builder =
+            snapshot.update_table(UpdateTableOperation::AlterTable, "test-engine", false);
+        builder
+            .local_state
+            .properties_added
+            .insert(ENABLE_IN_COMMIT_TIMESTAMPS.to_string(), "true".to_string());
+        let transaction = builder.build(&engine, Box::new(FileSystemCommitter::new()))?;
+        assert!(transaction.should_emit_protocol);
+        let committed = transaction.commit(&engine)?.unwrap_post_commit_snapshot();
+
+        let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
+        assert_eq!(reloaded.version(), committed.version());
+        let InCommitTimestampEnablement::Enabled {
+            enablement: Some((version, timestamp)),
+        } = reloaded
+            .table_configuration()
+            .in_commit_timestamp_enablement()?
+        else {
+            panic!("expected recorded enablement metadata");
+        };
+        assert_eq!(version, reloaded.version());
+        assert_eq!(
+            reloaded.reader().get_in_commit_timestamp(&engine)?,
+            Some(timestamp)
+        );
         Ok(())
     }
 

@@ -108,8 +108,12 @@ commit. See [Check constraints](./check_constraints.md) for the acknowledgement.
 | The field name must not already exist (case-insensitive) | Delta column names are unique within a struct. |
 | The field must be nullable | Existing files do not contain the new column. They read back `NULL`, which would violate a `NOT NULL` constraint. |
 | The table must support writes | Tables with unsupported writer features cannot be altered. |
-| The evolved schema must not require protocol features the table does not enable | For example, adding a `TIMESTAMP_NTZ` column to a table without the `timestampNtz` feature fails. |
 | Column mapping tables must be protocol-valid | When column mapping is enabled, Kernel assigns or preserves column-mapping IDs and physical names for the added column and updates `delta.columnMapping.maxColumnId`. |
+
+When the evolved schema needs a table feature that the protocol lacks, Kernel adds it and the
+commit includes a Protocol action. For example, adding a `TIMESTAMP_NTZ` column adds the
+`timestampNtz` feature. Kernel derives `timestampNtz`, `variantType`, and `collations` this way and
+keeps every feature the table already supports.
 
 > [!NOTE]
 > Kernel rejects schema changes at `build()` when `icebergCompatV2`, `icebergCompatV3`, or

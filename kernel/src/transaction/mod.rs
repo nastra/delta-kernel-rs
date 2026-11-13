@@ -25,7 +25,7 @@ use crate::schema::{
     lazy_schema_ref,
 };
 use crate::snapshot::{Snapshot, SnapshotRef};
-use crate::table_configuration::TableConfiguration;
+use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::TableFeature;
 #[cfg(feature = "check-constraints-in-dev")]
 use crate::table_properties::CheckConstraint;
@@ -292,10 +292,11 @@ pub struct Transaction<STATE = UpdateTable, MODE: ExecutionMode = Imperative> {
     // config, this is cloned from the read snapshot; when the config changes (e.g. schema
     // evolution), it is constructed separately with the new schema/protocol.
     effective_table_config: TableConfiguration,
-    // Whether to emit a Protocol action. True for CREATE TABLE, false otherwise.
+    // Whether to emit a Protocol action. True for CREATE TABLE and for updates that add table
+    // features.
     should_emit_protocol: bool,
-    // Whether to emit a Metadata action. True for CREATE TABLE and transactions with staged
-    // schema changes, false otherwise.
+    // Whether to emit a Metadata action. True for CREATE TABLE, transactions with staged schema
+    // changes, and updates that change the table configuration.
     should_emit_metadata: bool,
     committer: Box<dyn Committer>,
     operation: CommitOperation,
@@ -1158,6 +1159,18 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         if self.is_create_table() {
             // For CREATE TABLE there are no prior commits -- use the wall-clock time directly.
             return Ok(Some(self.commit_timestamp));
+        }
+
+        // A transaction that enables ICT records this commit's timestamp as the enablement
+        // timestamp while preparing the metadata, so the commit must use that value.
+        if let InCommitTimestampEnablement::Enabled {
+            enablement: Some((enablement_version, enablement_timestamp)),
+        } = self
+            .effective_table_config
+            .in_commit_timestamp_enablement()?
+            && enablement_version == self.get_commit_version()
+        {
+            return Ok(Some(enablement_timestamp));
         }
 
         // Existing table: enforce monotonicity per the Delta protocol. The timestamp

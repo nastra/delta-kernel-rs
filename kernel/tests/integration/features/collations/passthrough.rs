@@ -330,15 +330,15 @@ async fn arrow_round_trip_schema_can_create_table(
     Ok(())
 }
 
-/// Requires declared features and preserves ALTER annotations (RFC: "Collations Table Feature").
+/// Adds the stable feature only when no collation feature is declared, and preserves ALTER
+/// annotations (RFC: "Collations Table Feature").
 #[rstest]
-#[case::missing_feature(None, false)]
-#[case::stable(Some("collations"), true)]
-#[case::preview(Some("collations-preview"), true)]
+#[case::missing_feature(None)]
+#[case::stable(Some("collations"))]
+#[case::preview(Some("collations-preview"))]
 #[tokio::test]
-async fn alter_requires_existing_feature_without_upgrade(
+async fn alter_adds_collations_feature_only_when_missing(
     #[case] signal: Option<&str>,
-    #[case] supported: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp, path, engine) = test_table_setup()?;
     let mut builder = create_table(&path, schema_ref! { nullable "id": INTEGER }, "test", false);
@@ -355,33 +355,21 @@ async fn alter_requires_existing_feature_without_upgrade(
     }
     let protocol = snapshot.table_configuration().protocol().clone();
     let collated_field = annotated_field("name", DataType::STRING, "name", "test.ASCII_CI");
-    let result = snapshot
+    let updated = snapshot
         .clone()
         .update_table(UpdateTableOperation::AlterTable, "test", false)
         .add_column(collated_field.clone())
-        .build(engine.as_ref(), committer());
-    if supported {
-        let updated = result?
-            .commit(engine.as_ref())?
-            .unwrap_post_commit_snapshot();
-        let reloaded = Snapshot::builder_for(&path).build(engine.as_ref())?;
-        assert_eq!(reloaded.version(), updated.version());
-        assert_eq!(reloaded.table_configuration().protocol(), &protocol);
-        assert_eq!(reloaded.schema().field("name"), Some(&collated_field));
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let reloaded = Snapshot::builder_for(&path).build(engine.as_ref())?;
+    assert_eq!(reloaded.version(), updated.version());
+    assert_eq!(reloaded.schema().field("name"), Some(&collated_field));
+    let reloaded_config = reloaded.table_configuration();
+    if signal.is_some() {
+        assert_eq!(reloaded_config.protocol(), &protocol);
     } else {
-        assert!(
-            result
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("requires the 'collations'")
-        );
-        assert_eq!(
-            Snapshot::builder_for(&path)
-                .build(engine.as_ref())?
-                .version(),
-            0
-        );
+        assert!(reloaded_config.is_feature_supported(&TableFeature::Collations));
     }
     let malformed = StructField::nullable("bad", DataType::INTEGER).with_metadata([(
         ColumnMetadataKey::Collations.as_ref(),

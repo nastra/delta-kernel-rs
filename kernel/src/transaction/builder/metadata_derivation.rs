@@ -27,7 +27,8 @@ use crate::table_properties::{
 };
 use crate::{KernelError, KernelResult};
 
-/// Table features allowed to be enabled via `delta.feature.*=supported` during CREATE TABLE.
+/// Table features that a transaction may add via `delta.feature.*=supported` or enablement
+/// properties.
 ///
 /// Feature signals (`delta.feature.X=supported`) are validated against this list.
 /// Only features in this list can be enabled via feature signals.
@@ -78,8 +79,8 @@ pub(super) const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     TableFeature::IcebergNativeV4Preview,
 ];
 
-/// The single allow-list of `delta.*` properties accepted during CREATE TABLE. Any `delta.*`
-/// key not present here is rejected.
+/// The single allow-list of `delta.*` properties a transaction may set. Any other `delta.*` key
+/// is rejected.
 pub(super) const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     // ColumnMapping mode property: triggers column mapping transform
     COLUMN_MAPPING_MODE,
@@ -263,6 +264,14 @@ pub(super) fn maybe_enable_v2_checkpoint_for_policy(validated: &mut ValidatedTab
 pub(super) fn validate_extract_table_features_and_properties(
     properties: HashMap<String, String>,
 ) -> KernelResult<ValidatedTableProperties> {
+    validate_extract_features_and_properties_for(properties, "CREATE TABLE")
+}
+
+/// Like [`validate_extract_table_features_and_properties`], but names `operation` in errors.
+pub(super) fn validate_extract_features_and_properties_for(
+    properties: HashMap<String, String>,
+    operation: &str,
+) -> KernelResult<ValidatedTableProperties> {
     let mut reader_features = Vec::new();
     let mut writer_features = Vec::new();
 
@@ -294,7 +303,7 @@ pub(super) fn validate_extract_table_features_and_properties(
 
         if !ALLOWED_DELTA_FEATURES.contains(&feature) {
             return Err(KernelError::generic(format!(
-                "Enabling feature '{feature_name}' via '{key}' is not supported during CREATE TABLE"
+                "Enabling feature '{feature_name}' via '{key}' is not supported during {operation}"
             )));
         }
 
@@ -315,14 +324,14 @@ pub(super) fn validate_extract_table_features_and_properties(
     for (key, value) in &properties {
         if strip_check_constraint_prefix(key).is_some() {
             return Err(KernelError::generic(format!(
-                "Setting CHECK constraint property '{key}' is not supported during CREATE TABLE"
+                "Setting CHECK constraint property '{key}' is not supported during {operation}"
             )));
         }
         if key.starts_with(DELTA_PROPERTY_PREFIX)
             && !ALLOWED_DELTA_PROPERTIES.contains(&key.as_str())
         {
             return Err(KernelError::generic(format!(
-                "Setting delta property '{key}' is not supported during CREATE TABLE"
+                "Setting delta property '{key}' is not supported during {operation}"
             )));
         }
         if key == PARQUET_COMPRESSION_CODEC {
