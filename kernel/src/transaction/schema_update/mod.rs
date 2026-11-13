@@ -20,11 +20,14 @@ use crate::schema::{
 };
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    ColumnMappingMode, TableFeature, find_max_column_id_in_schema,
-    physical_to_logical_column_name_and_type, try_assign_flat_column_mapping_info,
-    validate_column_mapping_id,
+    ColumnMappingMode, SET_TABLE_FEATURE_SUPPORTED_PREFIX, TableFeature,
+    find_max_column_id_in_schema, physical_to_logical_column_name_and_type,
+    try_assign_flat_column_mapping_info, validate_column_mapping_id,
 };
-use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
+use crate::table_properties::{
+    COLUMN_MAPPING_MAX_COLUMN_ID, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
+    ENABLE_ICEBERG_COMPAT_V3, ENABLE_TYPE_WIDENING,
+};
 use crate::transaction::schema_evolution::reject_generated_or_identity_metadata;
 use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::{FoldWithOption as _, require};
@@ -42,9 +45,14 @@ mod type_widening;
 ///
 /// The result is not validated against the table protocol; callers derive any required protocol
 /// features and validate the final table configuration.
+///
+/// `properties_added` are the table properties set in the same request. Like Java's
+/// `validateUpdatedSchemaAndGetUpdatedSchema`, which reads the new metadata, they decide whether
+/// type widening is enabled and whether only Iceberg V2 widenings are allowed.
 pub(crate) fn evolve_metadata_to_schema(
     table_config: &TableConfiguration,
     schema: &StructType,
+    properties_added: &HashMap<String, String>,
 ) -> KernelResult<(Metadata, SchemaRef)> {
     let column_mapping_mode = table_config.column_mapping_mode();
     // Without column mapping, fields have no stable identity across renames and drops.
@@ -103,7 +111,7 @@ pub(crate) fn evolve_metadata_to_schema(
     let schema = type_widening::apply_type_changes(
         &current_fields,
         &schema,
-        allowed_type_widening(table_config),
+        allowed_type_widening(table_config, properties_added),
     )?;
     let diff = SchemaDiff::new(&current_schema, &schema)
         .map_err(|e| KernelError::schema(format!("Invalid schema update: {e}")))?;
@@ -140,24 +148,41 @@ pub(crate) fn evolve_metadata_to_schema(
     Ok((metadata, schema))
 }
 
-/// Returns the type changes `table_config` permits.
+/// Returns the type changes the table permits once `properties_added` are applied.
 ///
-/// Reads the configuration before the transaction; a request that also changes the type-widening
-/// or icebergCompat properties would need the final configuration instead.
-fn allowed_type_widening(table_config: &TableConfiguration) -> AllowedTypeWidening {
-    let enabled = [
-        TableFeature::TypeWidening,
-        TableFeature::TypeWideningPreview,
-    ]
-    .iter()
-    .any(|feature| table_config.is_feature_enabled(feature));
+/// Type widening is enabled by `delta.enableTypeWidening`, as in Java. The Iceberg V2 subset
+/// applies while `icebergCompatV1` or `icebergCompatV2` is supported, as the protocol's type
+/// widening writer requirements state, or while `icebergCompatV3` is enabled, as its RFC states.
+fn allowed_type_widening(
+    table_config: &TableConfiguration,
+    properties_added: &HashMap<String, String>,
+) -> AllowedTypeWidening {
+    // The value from the request, or else the table's.
+    let is_true = |key: &str| match properties_added.get(key) {
+        Some(value) => value == "true",
+        None => {
+            table_config
+                .metadata()
+                .configuration()
+                .get(key)
+                .map(String::as_str)
+                == Some("true")
+        }
+    };
+    let signals_support = |feature: &TableFeature| {
+        properties_added
+            .get(&format!("{SET_TABLE_FEATURE_SUPPORTED_PREFIX}{feature}"))
+            .is_some()
+    };
+    let enabled = is_true(ENABLE_TYPE_WIDENING);
     let iceberg_compat = [
-        TableFeature::IcebergCompatV1,
-        TableFeature::IcebergCompatV2,
-        TableFeature::IcebergCompatV3,
+        (TableFeature::IcebergCompatV1, ENABLE_ICEBERG_COMPAT_V1),
+        (TableFeature::IcebergCompatV2, ENABLE_ICEBERG_COMPAT_V2),
     ]
     .iter()
-    .any(|feature| table_config.is_feature_supported(feature));
+    .any(|(feature, key)| {
+        table_config.is_feature_supported(feature) || signals_support(feature) || is_true(key)
+    }) || is_true(ENABLE_ICEBERG_COMPAT_V3);
     match (enabled, iceberg_compat) {
         (false, _) => AllowedTypeWidening::None,
         (true, false) => AllowedTypeWidening::Delta,

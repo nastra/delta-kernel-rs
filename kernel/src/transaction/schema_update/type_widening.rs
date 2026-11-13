@@ -44,8 +44,8 @@ pub(super) enum AllowedTypeWidening {
     None,
     /// Every widening the Delta protocol supports.
     Delta,
-    /// The Iceberg V2 subset, required while an `icebergCompat` feature is supported, even if it
-    /// is not enabled.
+    /// The Iceberg V2 subset, required while `icebergCompatV1` or `icebergCompatV2` is supported,
+    /// even if it is not enabled, or while `icebergCompatV3` is enabled.
     IcebergV2,
 }
 
@@ -207,7 +207,8 @@ impl TypeChangeRecorder<'_> {
         }) {
             return Err(KernelError::schema(format!(
                 "Cannot change the type of existing field '{path}' from {} to {}: tables that \
-                 support icebergCompat only allow type changes that Iceberg V2 supports",
+                 support icebergCompatV1 or V2, or enable icebergCompatV3, only allow type \
+                 changes that Iceberg V2 supports",
                 change.from_type, change.to_type
             )));
         }

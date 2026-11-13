@@ -1321,6 +1321,56 @@ mod tests {
         Ok(())
     }
 
+    #[rstest]
+    fn type_widening_enabled_in_the_same_request_allows_widening(
+        #[values(false, true)] enable_in_request: bool,
+    ) -> Result<()> {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let schema = Arc::new(StructType::try_new([StructField::nullable(
+            "i",
+            DataType::INTEGER,
+        )])?);
+        let snapshot = create_table("memory:///", schema, "test", true)
+            .with_table_properties([(COLUMN_MAPPING_MODE, "name")])
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
+            .unwrap_post_commit_snapshot();
+        let mut widened = snapshot.schema().field("i").unwrap().clone();
+        widened.data_type = DataType::LONG;
+        let mut builder = snapshot
+            .clone()
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_updated_schema(Arc::new(StructType::try_new([widened])?));
+        if enable_in_request {
+            builder
+                .local_state
+                .properties_added
+                .insert("delta.enableTypeWidening".to_string(), "true".to_string());
+        }
+        let result = builder.build(&engine, Box::new(FileSystemCommitter::new()));
+        if !enable_in_request {
+            let error = result.unwrap_err();
+            assert!(
+                error.to_string().contains("type widening is not enabled"),
+                "{error}"
+            );
+            return Ok(());
+        }
+        result?.commit(&engine)?.unwrap_committed();
+
+        let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
+        let config = reloaded.table_configuration();
+        assert!(config.is_feature_enabled(&TableFeature::TypeWidening));
+        let field = reloaded.schema().field("i").unwrap().clone();
+        assert_eq!(field.data_type(), &DataType::LONG);
+        assert!(
+            field
+                .get_config_value(&ColumnMetadataKey::TypeChanges)
+                .is_some()
+        );
+        Ok(())
+    }
+
     #[test]
     fn unchanged_updated_schema_counts_as_a_request_and_commits() -> Result<()> {
         let (engine, snapshot) = create_clustered_column_mapping_table()?;

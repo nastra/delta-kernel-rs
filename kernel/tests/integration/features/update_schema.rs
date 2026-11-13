@@ -1098,29 +1098,39 @@ async fn updated_schema_widens_partition_columns_only_when_values_stay_readable(
 #[case::integer_to_long(DataType::LONG, None)]
 #[case::integer_to_double(
     DataType::DOUBLE,
-    Some("tables that support icebergCompat only allow type changes that Iceberg V2 supports")
+    Some("only allow type changes that Iceberg V2 supports")
 )]
 #[case::integer_to_decimal(
     DataType::decimal(12, 0).unwrap(),
-    Some("tables that support icebergCompat only allow type changes that Iceberg V2 supports")
+    Some("only allow type changes that Iceberg V2 supports")
 )]
 #[tokio::test]
 async fn updated_schema_restricts_widening_while_iceberg_compat_is_supported(
     #[case] to: DataType,
     #[case] expected_error: Option<&str>,
+    #[values("icebergCompatV2", "icebergCompatV3")] compat: &str,
 ) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let signal = format!("delta.feature.{compat}");
+    let mut properties = vec![
+        ("delta.columnMapping.mode", "name"),
+        TYPE_WIDENING,
+        (signal.as_str(), "supported"),
+    ];
+    // Kernel requires row tracking whenever icebergCompatV3 is supported.
+    if compat == "icebergCompatV3" {
+        properties.push(("delta.enableRowTracking", "true"));
+    }
     let snapshot = create(
         &table_path,
         engine.as_ref(),
         widening_schema(),
-        &[
-            ("delta.columnMapping.mode", "name"),
-            TYPE_WIDENING,
-            ("delta.feature.icebergCompatV2", "supported"),
-        ],
+        &properties,
         None,
     )?;
+    // The protocol restricts widening while icebergCompatV1 or V2 is supported; the V3 RFC only
+    // while icebergCompatV3 is enabled.
+    let expected_error = expected_error.filter(|_| compat != "icebergCompatV3");
     let updated = with_fields(retype(&snapshot.schema(), "i", to));
     let result = update_schema(&snapshot, engine.as_ref(), updated);
     match expected_error {
