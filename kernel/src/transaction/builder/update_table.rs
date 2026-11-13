@@ -1387,6 +1387,35 @@ mod tests {
     }
 
     #[test]
+    fn updated_schema_with_a_case_insensitive_duplicate_is_rejected() -> Result<()> {
+        let (engine, snapshot) = create_clustered_column_mapping_table()?;
+        let schema = snapshot.schema();
+        // `StructType::try_new` rejects this; a schema built without validation must still fail.
+        let duplicate = StructType::new_unchecked([
+            schema.field("id").unwrap().clone(),
+            schema.field("name").unwrap().clone(),
+            StructField::nullable("NAME", DataType::STRING),
+        ]);
+        let error = snapshot
+            .clone()
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_updated_schema(Arc::new(duplicate))
+            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Duplicate field name (case-insensitive): 'NAME'"),
+            "{error}"
+        );
+
+        let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
+        assert_eq!(reloaded.version(), snapshot.version());
+        assert_eq!(reloaded.schema(), snapshot.schema());
+        Ok(())
+    }
+
+    #[test]
     fn unchanged_updated_schema_counts_as_a_request_and_commits() -> Result<()> {
         let (engine, snapshot) = create_clustered_column_mapping_table()?;
         let transaction = snapshot

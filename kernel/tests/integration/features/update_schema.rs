@@ -389,6 +389,10 @@ type SchemaEdit = fn(&StructType) -> Vec<StructField>;
     )),
     "Cannot add non-nullable field 'c' under 'new'"
 )]
+#[case::add_field_with_newline_in_name(
+    |s: &StructType| appended(s, StructField::nullable("bad\nname", DataType::STRING)),
+    "contains a newline character"
+)]
 #[case::add_with_default(
     |s: &StructType| appended(s, StructField::nullable("new", DataType::STRING)
             .add_metadata([("CURRENT_DEFAULT", MetadataValue::String("'x'".into()))])),
@@ -599,6 +603,32 @@ async fn updated_schema_rejects_dropping_or_renaming_partition_columns(
         engine.as_ref(),
         updated,
         "Cannot drop or rename partition column 'part'",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn updated_schema_rejects_change_data_feed_reserved_names() -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create(
+        &table_path,
+        engine.as_ref(),
+        flat_schema(),
+        &[
+            ("delta.columnMapping.mode", "name"),
+            ("delta.enableChangeDataFeed", "true"),
+        ],
+        None,
+    )?;
+    let updated = with_fields(appended(
+        &snapshot.schema(),
+        StructField::nullable("_change_type", DataType::STRING),
+    ));
+    assert_update_rejected(
+        &snapshot,
+        engine.as_ref(),
+        updated,
+        "is reserved for Change Data Feed",
     );
     Ok(())
 }
