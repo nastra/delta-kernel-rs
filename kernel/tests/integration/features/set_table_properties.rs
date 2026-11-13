@@ -304,6 +304,25 @@ async fn reasserting_row_tracking_keeps_materialized_column_names() -> delta_ker
     Ok(())
 }
 
+/// An ALTER TABLE that only reasserts current values is a stable no-op: it commits a version with
+/// unchanged metadata and protocol.
+#[tokio::test]
+async fn reasserting_only_existing_values_commits_unchanged_metadata() -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let existing = [(ENABLE_ROW_TRACKING, "true"), (CHECKPOINT_POLICY, "v2")];
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &existing)?;
+    let read_config = snapshot.table_configuration().clone();
+
+    let reloaded = set_properties(snapshot, &table_path, engine.as_ref(), &existing)?;
+
+    assert_eq!(reloaded.version(), 1);
+    let config = reloaded.table_configuration();
+    assert_eq!(config.metadata(), read_config.metadata());
+    assert_eq!(config.protocol(), read_config.protocol());
+    Ok(())
+}
+
 #[tokio::test]
 async fn disabling_type_widening_keeps_the_feature() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
