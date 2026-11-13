@@ -216,8 +216,9 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// the schema has no columns, tightens nullability, changes a field's type, moves a field to a
     /// different parent struct, drops or renames a partition column or a column listed in
     /// `delta.dataSkippingStatsColumns`, drops a clustering column, renames a collated field, adds
-    /// a non-nullable field or a field with a default value, or changes protocol-defined field
-    /// metadata such as generation expressions, invariants, or defaults. It cannot be combined with
+    /// a non-nullable field (at any nesting depth), a field with a default value, or a field with
+    /// generation or identity metadata, or changes protocol-defined field metadata such as
+    /// generation expressions, invariants, or defaults. It cannot be combined with
     /// [`add_column`](Self::add_column), [`add_column_at`](Self::add_column_at), or
     /// [`set_nullable`](Self::set_nullable) in the same transaction.
     ///
