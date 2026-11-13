@@ -224,20 +224,28 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// `delta.columnMapping.nested.ids` to the array elements and map keys and values of new
     /// fields, and the new schema must satisfy that version's type and type-change rules.
     ///
+    /// The `CURRENT_DEFAULT` of an existing field, including a nested one, may be set, changed, or
+    /// removed when the table supports `allowColumnDefaults` and has `delta.enableIcebergCompatV3`
+    /// enabled. Each default must be a literal of the field's type: a quoted string or binary, a
+    /// number that fits the type, an ISO date, an ISO timestamp with an offset, or an ISO
+    /// `timestamp_ntz` without one. Byte and non-primitive fields cannot have defaults. A schema
+    /// with defaults does not add the `allowColumnDefaults` feature, and a table with that feature
+    /// but without icebergCompatV3 rejects every schema update.
+    ///
     /// [`build`](Self::build) rejects the update if the table does not use column mapping, or if
     /// the schema has no columns, tightens nullability, makes any other type change or alters
     /// `delta.typeChanges` or `delta.columnMapping.nested.ids`, moves a field to a different parent
     /// struct, drops or renames a partition column or a column listed in
     /// `delta.dataSkippingStatsColumns`, drops a clustering column, renames a collated field, adds
     /// a non-nullable field (at any nesting depth), a field with a default value, or a field with
-    /// generation or identity metadata, or changes protocol-defined field metadata such as
-    /// generation expressions, invariants, or defaults. It cannot be combined with
-    /// [`add_column`](Self::add_column), [`add_column_at`](Self::add_column_at), or
+    /// generation or identity metadata, has a default the table does not allow, or changes other
+    /// protocol-defined field metadata such as generation expressions or invariants. It cannot be
+    /// combined with [`add_column`](Self::add_column), [`add_column_at`](Self::add_column_at), or
     /// [`set_nullable`](Self::set_nullable) in the same transaction.
     ///
-    /// Unlike Delta Kernel Java, `build()` also rejects any schema update on a table with
-    /// `allowColumnDefaults` enabled or with generated columns. Kernel cannot yet maintain the
-    /// default values or generation expressions of those tables when their schema changes.
+    /// Unlike Delta Kernel Java, `build()` also rejects a new field with a default value, because
+    /// existing data files do not contain the field, and any schema update on a table with
+    /// generated columns, whose generation expressions Kernel cannot yet maintain.
     pub fn with_updated_schema(mut self, schema: SchemaRef) -> Self {
         self.local_state.updated_schema = Some(schema);
         self
@@ -280,9 +288,11 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// - Conflicting application ids or domain metadata, or reserved or unsupported domains.
     /// - Connector commit information that does not contain exactly one row.
     ///
-    /// Schema changes are rejected when `allowColumnDefaults` is enabled or when the table has
-    /// generated columns. This applies to standalone ALTER TABLE transactions and schema evolution
-    /// during data-changing writes.
+    /// Schema changes are rejected when the table has generated columns. Schema operations are
+    /// also rejected when `allowColumnDefaults` is enabled; see
+    /// [`with_updated_schema`](Self::with_updated_schema) for its rules on such tables. This
+    /// applies to standalone ALTER TABLE transactions and schema evolution during data-changing
+    /// writes.
     pub fn build(
         self,
         engine: &dyn Engine,
@@ -1899,32 +1909,6 @@ mod tests {
         assert_eq!(reloaded.version(), snapshot.version() + 1);
         assert!(reloaded.schema().field("added").is_some());
         assert!(reloaded.table_configuration().is_feature_enabled(&feature));
-        Ok(())
-    }
-
-    #[rstest]
-    #[case::column_defaults(TableFeature::AllowColumnDefaults, "allowColumnDefaults enabled")]
-    fn updated_schema_is_rejected_on_tables_kernel_cannot_evolve_yet(
-        #[case] feature: TableFeature,
-        #[case] expected: &str,
-    ) -> Result<()> {
-        let (engine, snapshot, _tempdir) = create_schema_validation_table(Some(&feature), true);
-        let error = snapshot
-            .clone()
-            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
-            .with_updated_schema(snapshot.schema())
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
-            .unwrap_err();
-        assert!(matches!(error, KernelError::Unsupported(_)), "{error}");
-        assert!(
-            error.to_string().contains(&format!(
-                "Schema changes are not yet supported on tables with {expected}"
-            )),
-            "{error}"
-        );
-
-        let reloaded = Snapshot::builder_for(snapshot.table_root()).build(engine.as_ref())?;
-        assert_eq!(reloaded.version(), snapshot.version());
         Ok(())
     }
 

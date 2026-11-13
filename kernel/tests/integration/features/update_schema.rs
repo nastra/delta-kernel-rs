@@ -23,7 +23,8 @@ use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{Engine, KernelError, SnapshotRef};
 use rstest::rstest;
 use test_utils::{
-    assert_result_error_with_message, read_scan, test_table_setup, write_batch_to_table,
+    assert_result_error_with_message, read_actions_from_commit, read_scan, test_table_setup,
+    write_batch_to_table,
 };
 
 fn flat_schema() -> SchemaRef {
@@ -426,7 +427,7 @@ type SchemaEdit = fn(&StructType) -> Vec<StructField>;
 #[case::add_with_default(
     |s: &StructType| appended(s, StructField::nullable("new", DataType::STRING)
             .add_metadata([("CURRENT_DEFAULT", MetadataValue::String("'x'".into()))])),
-    "with a default value"
+    "the table does not support the allowColumnDefaults table feature"
 )]
 #[case::add_with_generation_expression(
     |s: &StructType| appended(s, StructField::nullable("new", DataType::STRING).add_metadata([(
@@ -441,7 +442,7 @@ type SchemaEdit = fn(&StructType) -> Vec<StructField>;
         field(s, "name").add_metadata([("CURRENT_DEFAULT", MetadataValue::String("'x'".into()))]),
         field(s, "zip"),
     ],
-    "Cannot change metadata 'CURRENT_DEFAULT' of existing field 'name'"
+    "the table does not support the allowColumnDefaults table feature"
 )]
 #[case::change_protocol_metadata(
     |s: &StructType| vec![
@@ -1868,6 +1869,266 @@ async fn updated_schema_rejects_types_iceberg_compat_does_not_support(
         engine.as_ref(),
         with_fields(appended(&snapshot.schema(), added)),
         &format!("{compat} does not support type at column: unsupported"),
+    );
+    Ok(())
+}
+
+// === Column defaults ===
+
+/// A schema with an existing field of each type family Kernel validates defaults for.
+fn defaults_schema() -> SchemaRef {
+    let address = StructType::try_new([
+        StructField::nullable("city", DataType::STRING),
+        StructField::nullable("zip", DataType::INTEGER),
+    ])
+    .unwrap();
+    Arc::new(
+        StructType::try_new([
+            StructField::nullable("name", DataType::STRING),
+            StructField::nullable("address", address),
+            StructField::nullable("i", DataType::INTEGER),
+            StructField::nullable("d", DataType::DOUBLE),
+            StructField::nullable("dec", DataType::decimal(10, 5).unwrap()),
+            StructField::nullable("dt", DataType::DATE),
+            StructField::nullable("ts", DataType::TIMESTAMP),
+            StructField::nullable("ntz", DataType::TIMESTAMP_NTZ),
+            StructField::nullable("b", DataType::BYTE),
+            StructField::nullable("arr", ArrayType::new(DataType::INTEGER, true)),
+        ])
+        .unwrap(),
+    )
+}
+
+/// Creates a column-mapped table with `defaults_schema` and adds the `allowColumnDefaults` feature
+/// in a hand-written protocol commit, because `create_table` cannot enable that feature.
+fn create_column_defaults_table(
+    table_path: &str,
+    engine: &dyn Engine,
+    iceberg_compat_v3: bool,
+) -> delta_kernel::Result<SnapshotRef> {
+    let properties = if iceberg_compat_v3 {
+        iceberg_compat_properties("icebergCompatV3")
+    } else {
+        vec![("delta.columnMapping.mode", "name")]
+    };
+    create(table_path, engine, defaults_schema(), &properties, None)?;
+    let table_url = url::Url::from_directory_path(table_path).unwrap();
+    let mut protocol = read_actions_from_commit(&table_url, 0, "protocol")?.remove(0);
+    protocol["writerFeatures"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!("allowColumnDefaults"));
+    std::fs::write(
+        std::path::Path::new(table_path).join("_delta_log/00000000000000000001.json"),
+        format!("{}\n", serde_json::json!({ "protocol": protocol })),
+    )
+    .map_err(delta_kernel::KernelError::from)?;
+    let snapshot = Snapshot::builder_for(table_path).build(engine)?;
+    assert!(
+        snapshot
+            .table_configuration()
+            .is_feature_supported(&TableFeature::AllowColumnDefaults)
+    );
+    Ok(snapshot)
+}
+
+/// Returns `field` with its default set to `value`, or removed when `value` is `None`.
+fn with_default(field: StructField, value: Option<&str>) -> StructField {
+    let mut field = field;
+    let key = ColumnMetadataKey::CurrentDefault.as_ref();
+    field.metadata.remove(key);
+    match value {
+        Some(value) => field.add_metadata([(key, MetadataValue::String(value.into()))]),
+        None => field,
+    }
+}
+
+/// Returns `schema` with the defaults of the top-level `name` and nested `address.zip` fields set
+/// to `name_default` and `zip_default`.
+fn with_name_and_zip_defaults(
+    schema: &StructType,
+    name_default: Option<&str>,
+    zip_default: Option<&str>,
+) -> StructType {
+    with_fields(schema.fields().map(|field| match field.name().as_str() {
+        "name" => with_default(field.clone(), name_default),
+        "address" => {
+            let DataType::Struct(address) = field.data_type() else {
+                panic!("address must be a struct");
+            };
+            let address = with_fields(address.fields().map(|nested| {
+                if nested.name() == "zip" {
+                    with_default(nested.clone(), zip_default)
+                } else {
+                    nested.clone()
+                }
+            }));
+            StructField {
+                data_type: address.into(),
+                ..field.clone()
+            }
+        }
+        _ => field.clone(),
+    }))
+}
+
+fn default_sql(field: &StructField) -> Option<String> {
+    field
+        .column_default()
+        .unwrap()
+        .map(|default| default.raw_sql().to_string())
+}
+
+/// Returns the defaults of `name` and `address.zip` in the reloaded table.
+fn reloaded_name_and_zip_defaults(
+    table_path: &str,
+    engine: &dyn Engine,
+) -> (Option<String>, Option<String>) {
+    let schema = Snapshot::builder_for(table_path)
+        .build(engine)
+        .unwrap()
+        .schema();
+    let DataType::Struct(address) = field(&schema, "address").data_type().clone() else {
+        panic!("address must be a struct");
+    };
+    (
+        default_sql(&field(&schema, "name")),
+        default_sql(&field(&address, "zip")),
+    )
+}
+
+#[tokio::test]
+async fn updated_schema_sets_changes_and_removes_top_level_and_nested_defaults()
+-> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let mut snapshot = create_column_defaults_table(&table_path, engine.as_ref(), true)?;
+    let protocol = snapshot.table_configuration().protocol().clone();
+    for (name_default, zip_default) in [
+        (Some("'pending'"), Some("10115")),
+        (Some("\"done\""), Some("'-7'")),
+        (None, None),
+    ] {
+        let schema = with_name_and_zip_defaults(&snapshot.schema(), name_default, zip_default);
+        snapshot = update_schema(&snapshot, engine.as_ref(), schema)?;
+        assert_eq!(
+            reloaded_name_and_zip_defaults(&table_path, engine.as_ref()),
+            (
+                name_default.map(str::to_string),
+                zip_default.map(str::to_string)
+            )
+        );
+        assert_eq!(snapshot.table_configuration().protocol(), &protocol);
+    }
+    Ok(())
+}
+
+#[rstest]
+#[case::string_not_quoted("name", "CURRENT_TIMESTAMP()", "Only literal values")]
+#[case::integer_fraction("i", "313.55", "Only literal values")]
+#[case::double_text("d", "Good boy", "Only literal values")]
+#[case::decimal_precision("dec", "234243243243243234.234", "Only literal values")]
+#[case::decimal_scale("dec", "1.234567", "Only literal values")]
+#[case::date_format("dt", "2022/01/05", "Only literal values")]
+#[case::timestamp_without_time("ts", "2025-01-01", "Only literal values")]
+#[case::timestamp_ntz_with_offset("ntz", "2025-01-01T00:00:00+02:00", "Only literal values")]
+#[case::non_literal_expression("ts", "current_timestamp()", "Only literal values")]
+#[case::null("i", "NULL", "Only literal values")]
+#[case::unsupported_byte("b", "1", "does not support default values for data type byte")]
+#[case::unsupported_array(
+    "arr",
+    "array(1)",
+    "does not support default values for data type array<integer>"
+)]
+#[tokio::test]
+async fn updated_schema_rejects_invalid_defaults(
+    #[case] column: &str,
+    #[case] value: &str,
+    #[case] expected: &str,
+) -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_column_defaults_table(&table_path, engine.as_ref(), true)?;
+    let schema = snapshot.schema();
+    let updated = with_fields(schema.fields().map(|field| {
+        if field.name() == column {
+            with_default(field.clone(), Some(value))
+        } else {
+            field.clone()
+        }
+    }));
+    assert_update_rejected(&snapshot, engine.as_ref(), updated, expected);
+    Ok(())
+}
+
+#[tokio::test]
+async fn updated_schema_rejects_a_default_on_a_new_field() -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_column_defaults_table(&table_path, engine.as_ref(), true)?;
+    let added = with_default(StructField::nullable("new", DataType::STRING), Some("'x'"));
+    assert_update_rejected(
+        &snapshot,
+        engine.as_ref(),
+        with_fields(appended(&snapshot.schema(), added)),
+        "Cannot add field 'new' under 'new' with a default value",
+    );
+    Ok(())
+}
+
+/// Defaults do not enable `allowColumnDefaults`, so a table without the feature rejects them.
+#[rstest]
+#[case::column_mapping(&[("delta.columnMapping.mode", "name")])]
+#[case::iceberg_compat_v3(&[
+    ("delta.columnMapping.mode", "name"),
+    ("delta.enableIcebergCompatV3", "true"),
+    ("delta.enableRowTracking", "true"),
+])]
+#[tokio::test]
+async fn updated_schema_rejects_defaults_without_allow_column_defaults(
+    #[case] properties: &[(&str, &str)],
+) -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create(
+        &table_path,
+        engine.as_ref(),
+        defaults_schema(),
+        properties,
+        None,
+    )?;
+    let updated = with_name_and_zip_defaults(&snapshot.schema(), Some("'x'"), None);
+    assert_update_rejected(
+        &snapshot,
+        engine.as_ref(),
+        updated,
+        "the table does not support the allowColumnDefaults table feature",
+    );
+    assert!(
+        !snapshot
+            .table_configuration()
+            .is_feature_supported(&TableFeature::AllowColumnDefaults)
+    );
+    Ok(())
+}
+
+/// Like Java, Kernel rejects any schema update on an `allowColumnDefaults` table without
+/// icebergCompatV3, even one that does not touch defaults.
+#[rstest]
+#[case::set_default(Some("'x'"))]
+#[case::rename_only(None)]
+#[tokio::test]
+async fn updated_schema_requires_iceberg_compat_v3_with_allow_column_defaults(
+    #[case] name_default: Option<&str>,
+) -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_column_defaults_table(&table_path, engine.as_ref(), false)?;
+    let schema = with_name_and_zip_defaults(&snapshot.schema(), name_default, None);
+    let updated = with_fields(schema.fields().map(|field| match field.name().as_str() {
+        "i" => field.with_name("renamed"),
+        _ => field.clone(),
+    }));
+    assert_update_rejected(
+        &snapshot,
+        engine.as_ref(),
+        updated,
+        "allowColumnDefaults table feature only when icebergCompatV3 is enabled",
     );
     Ok(())
 }

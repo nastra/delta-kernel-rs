@@ -131,7 +131,7 @@ pub(super) fn prepare_update_table_metadata(
             evolve_metadata(read_config, changes)?
         }
         (None, Some(schema)) => {
-            ensure_schema_changes_supported(read_config)?;
+            ensure_no_generated_columns(read_config)?;
             evolve_metadata_to_schema(read_config, &schema, &properties_added)?
         }
         (None, None) => (read_config.metadata().clone(), read_config.logical_schema()),
@@ -297,13 +297,18 @@ fn is_already_supported(table_config: &TableConfiguration, feature: &TableFeatur
         || preview.is_some_and(|preview| table_config.is_feature_supported(&preview))
 }
 
-/// Rejects tables whose schema Kernel cannot yet evolve.
+/// Rejects tables whose schema Kernel cannot yet evolve with schema operations. A complete
+/// replacement schema validates column defaults itself; see [`evolve_metadata_to_schema`].
 fn ensure_schema_changes_supported(table_config: &TableConfiguration) -> KernelResult<()> {
     if table_config.is_feature_enabled(&TableFeature::AllowColumnDefaults) {
         return Err(KernelError::unsupported(
             "Schema changes are not yet supported on tables with allowColumnDefaults enabled",
         ));
     }
+    ensure_no_generated_columns(table_config)
+}
+
+fn ensure_no_generated_columns(table_config: &TableConfiguration) -> KernelResult<()> {
     if table_config.is_feature_supported(&TableFeature::GeneratedColumns)
         && table_config.has_generation_expressions()
     {
