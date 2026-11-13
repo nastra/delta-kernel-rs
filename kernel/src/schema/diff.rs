@@ -4,9 +4,6 @@
 //! using field IDs as the primary mechanism for identifying fields across schema versions.
 //! Supports nested field comparison within structs, arrays, and maps.
 
-// This module is not used outside the diff subsystem; suppress unused-code warnings.
-#![allow(dead_code)]
-
 use std::collections::{HashMap, HashSet};
 
 use super::{
@@ -71,8 +68,6 @@ pub(crate) enum FieldChangeType {
 /// Errors that can occur during schema diffing
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SchemaDiffError {
-    #[error("Schema diffing is not yet implemented")]
-    Unsupported,
     #[error("Field at path '{path}' is missing column mapping ID")]
     MissingFieldId { path: ColumnName },
     #[error("Duplicate field ID {id} found at paths '{path1}' and '{path2}'")]
@@ -111,6 +106,8 @@ impl SchemaDiff {
     }
 
     /// Returns true if there are no differences between the schemas
+    // This and the helpers after it are used only by the unit tests so far.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn is_empty(&self) -> bool {
         self.added_fields.is_empty()
             && self.removed_fields.is_empty()
@@ -118,26 +115,20 @@ impl SchemaDiff {
     }
 
     /// Returns the total number of changes
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn change_count(&self) -> usize {
         self.added_fields.len() + self.removed_fields.len() + self.updated_fields.len()
     }
 
     /// Returns true if there are any breaking changes (removed fields, type changes, or tightened
     /// nullability)
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn has_breaking_changes(&self) -> bool {
         self.breaking_changes
     }
 
-    /// Get all changes (both top-level and nested)
-    pub(crate) fn all_changes(&self) -> (&[FieldChange], &[FieldChange], &[FieldUpdate]) {
-        (
-            &self.added_fields,
-            &self.removed_fields,
-            &self.updated_fields,
-        )
-    }
-
     /// Get all changes at the top level only (fields with path length of 1)
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn top_level_changes(
         &self,
     ) -> (Vec<&FieldChange>, Vec<&FieldChange>, Vec<&FieldUpdate>) {
@@ -160,6 +151,7 @@ impl SchemaDiff {
     }
 
     /// Get all changes at nested levels only (fields with path length > 1)
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn nested_changes(
         &self,
     ) -> (Vec<&FieldChange>, Vec<&FieldChange>, Vec<&FieldUpdate>) {
