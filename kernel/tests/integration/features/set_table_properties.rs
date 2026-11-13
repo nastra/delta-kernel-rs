@@ -106,6 +106,12 @@ async fn set_properties_patches_configuration_and_canonicalizes_delta_keys()
     "must be between -1 and 2147483647"
 )]
 #[case::malformed_enum(&[], &[(CHECKPOINT_POLICY, "v3")], "Invalid value")]
+#[case::column_mapping_mode_in_other_case(
+    &[],
+    &[("delta.columnMapping.mode", "NAME")],
+    "Invalid value"
+)]
+#[case::interval_without_prefix(&[], &[("delta.logRetentionDuration", "2 weeks")], "Invalid value")]
 #[case::unknown_delta_key(&[], &[("delta.unknownProperty", "x")], "not supported")]
 #[case::unknown_delta_key_case_variant(&[], &[("Delta.unknownProperty", "x")], "not supported")]
 #[case::unknown_feature_in_other_case(

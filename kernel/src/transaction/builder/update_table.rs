@@ -191,13 +191,19 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// Sets table properties, overwriting existing values for the supplied keys.
     ///
     /// Properties not supplied keep their current values. Each call replaces the properties
-    /// supplied by any previous call. Application properties (keys outside the
-    /// `delta.` namespace) are stored as given. Recognized `delta.*` keys are matched
-    /// case-insensitively and stored with their canonical case, and their values must parse; other
-    /// `delta.*` keys are rejected, including Kernel-managed ones such as
+    /// supplied by any previous call, so a later call, even with an empty map, drops the
+    /// properties of earlier calls: merge them into one map and call once. Application properties
+    /// (keys outside the `delta.` namespace) are stored as given. Recognized `delta.*` keys are
+    /// matched case-insensitively and stored with their canonical case, and their values must
+    /// parse; other `delta.*` keys are rejected, including Kernel-managed ones such as
     /// `delta.columnMapping.maxColumnId` and ones Delta Kernel Java does not let a writer set, such
     /// as `delta.setTransactionRetentionDuration`. `delta.feature.<name>=supported` adds a
     /// supported feature to the protocol.
+    ///
+    /// Values must use the forms Kernel parses when it reads a table: lowercase `true`/`false`,
+    /// lowercase column mapping modes such as `name`, and intervals with the `interval` prefix
+    /// such as `interval 2 weeks`. `delta.checkpointInterval` and
+    /// `delta.dataSkippingNumIndexedCols` are limited to the 32-bit range Delta Kernel Java reads.
     ///
     /// Setting a property changes only table metadata and, when the configuration requires a
     /// feature the protocol lacks, the protocol. It does not rewrite or backfill data files or
