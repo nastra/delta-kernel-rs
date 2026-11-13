@@ -4,7 +4,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{Array, AsArray as _, Int32Array, StringArray};
-use delta_kernel::arrow::datatypes::Int32Type;
+use delta_kernel::arrow::datatypes::{Int32Type, Schema as ArrowSchema};
+use delta_kernel::arrow::json::ReaderBuilder;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
@@ -224,6 +225,11 @@ async fn updated_schema_changes_nested_fields_preserving_identity() -> delta_ker
         &[("delta.columnMapping.mode", "name")],
         None,
     )?;
+    let batch = batch_from_json(
+        &snapshot,
+        r#"{"id": 1, "address": {"city": "Oslo", "zip": "0150"}, "tags": [{"label": "x", "weight": 3}], "part": "p"}"#,
+    );
+    let snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
     let old_schema = snapshot.schema();
     let old_address = field(&old_schema, "address");
     let DataType::Struct(old_address_type) = old_address.data_type() else {
@@ -283,7 +289,29 @@ async fn updated_schema_changes_nested_fields_preserving_identity() -> delta_ker
     };
     assert_same_identity(&field(old_tag_type, "weight"), &field(new_tag, "score"));
     assert!(field(new_tag, "score").is_nullable());
+
+    // The renamed nested fields still read the values written under their old names.
+    let batches = read_scan(&reloaded.scan_builder().build()?, engine.clone())?;
+    let batch = &batches[0];
+    let tags = batch.column(1).as_list::<i32>().value(0);
+    let tag = tags.as_struct();
+    assert_eq!(tag.column(0).as_string::<i32>().value(0), "x");
+    assert_eq!(tag.column(1).as_primitive::<Int32Type>().value(0), 3);
+    let address = batch.column(2).as_struct();
+    assert!(address.column(0).is_null(0), "the added street is null");
+    assert_eq!(address.column(1).as_string::<i32>().value(0), "Oslo");
     Ok(())
+}
+
+/// Decodes `rows` (one JSON object per line) into a batch with the table's Arrow schema.
+fn batch_from_json(snapshot: &Snapshot, rows: &str) -> RecordBatch {
+    let schema: ArrowSchema = snapshot.schema().as_ref().try_into_arrow().unwrap();
+    ReaderBuilder::new(Arc::new(schema))
+        .build(std::io::Cursor::new(rows))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
 }
 
 #[tokio::test]
