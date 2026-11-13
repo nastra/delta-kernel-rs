@@ -29,11 +29,12 @@ use crate::table_features::{
 };
 use crate::table_properties::{
     CHECKPOINT_INTERVAL, COLUMN_MAPPING_MAX_COLUMN_ID, DATA_SKIPPING_NUM_INDEXED_COLS,
-    DELTA_PROPERTY_PREFIX, ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3,
-    ENABLE_ICEBERG_NATIVE_V4, ENABLE_IN_COMMIT_TIMESTAMPS,
+    DELETED_FILE_RETENTION_DURATION, DELTA_PROPERTY_PREFIX, ENABLE_ICEBERG_COMPAT_V2,
+    ENABLE_ICEBERG_COMPAT_V3, ENABLE_ICEBERG_NATIVE_V4, ENABLE_IN_COMMIT_TIMESTAMPS,
     IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP, IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
-    MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
-    PARQUET_FORMAT_VERSION, SET_TRANSACTION_RETENTION_DURATION, TableProperties,
+    LOG_RETENTION_DURATION, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
+    MATERIALIZED_ROW_ID_COLUMN_NAME, PARQUET_FORMAT_VERSION, SET_TRANSACTION_RETENTION_DURATION,
+    TableProperties,
 };
 use crate::transaction::schema_evolution::{SchemaOperation, evolve_metadata};
 use crate::transforms::{SchemaTransform, transform_output_type};
@@ -127,6 +128,7 @@ pub(super) fn prepare_update_table_metadata(
         )));
     }
     validate_java_int_ranges(&properties_added)?;
+    validate_single_unit_intervals(&properties_added)?;
     validate_property_removals(&properties_added, &property_keys_removed)?;
 
     // Schema changes preserve the column-mapping identities of surviving fields and assign new
@@ -349,6 +351,23 @@ fn validate_java_int_ranges(properties_added: &HashMap<String, String>) -> Kerne
             return Err(KernelError::generic(format!(
                 "Invalid value '{value}' for table property '{key}': must be between {min} and {}",
                 i32::MAX
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Rejects interval properties with more than one unit, such as `interval 1 day 12 hours`.
+/// Kernel's interval parser reads only the first unit, so it would read a shorter retention than
+/// Java and Spark do.
+fn validate_single_unit_intervals(properties_added: &HashMap<String, String>) -> KernelResult<()> {
+    for key in [LOG_RETENTION_DURATION, DELETED_FILE_RETENTION_DURATION] {
+        if let Some(value) = properties_added.get(key)
+            && value.split_whitespace().count() != 3
+        {
+            return Err(KernelError::generic(format!(
+                "Invalid value '{value}' for table property '{key}': use one unit, such as \
+                 'interval 2 weeks'"
             )));
         }
     }

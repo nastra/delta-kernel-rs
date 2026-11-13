@@ -201,8 +201,8 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// supported feature to the protocol.
     ///
     /// Values must use the forms Kernel parses when it reads a table: lowercase `true`/`false`,
-    /// lowercase column mapping modes such as `name`, and intervals with the `interval` prefix
-    /// such as `interval 2 weeks`. `delta.checkpointInterval` and
+    /// lowercase column mapping modes such as `name`, and intervals with the `interval` prefix and
+    /// one unit, such as `interval 2 weeks`. `delta.checkpointInterval` and
     /// `delta.dataSkippingNumIndexedCols` are limited to the 32-bit range Delta Kernel Java reads.
     ///
     /// Setting a property changes only table metadata and, when the configuration requires a
