@@ -1235,6 +1235,18 @@ mod tests {
         Ok(())
     }
 
+    /// Asserts that the table at `memory:///` still has the version and configuration of
+    /// `snapshot`.
+    fn assert_table_unchanged(engine: &dyn Engine, snapshot: &SnapshotRef) -> Result<()> {
+        let reloaded = Snapshot::builder_for("memory:///").build(engine)?;
+        assert_eq!(reloaded.version(), snapshot.version());
+        assert_eq!(
+            reloaded.table_configuration().metadata(),
+            snapshot.table_configuration().metadata()
+        );
+        Ok(())
+    }
+
     fn create_table_with_user_properties(engine: &dyn Engine) -> Result<SnapshotRef> {
         Ok(create_table("memory:///", test_schema_flat(), "test", true)
             .with_table_properties([
@@ -1303,6 +1315,7 @@ mod tests {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
         let snapshot = create_table_with_user_properties(&engine)?;
         let error = snapshot
+            .clone()
             .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
             .with_table_properties_removed(["app.key", key])
             .build(&engine, Box::new(FileSystemCommitter::new()))
@@ -1314,7 +1327,7 @@ mod tests {
             )),
             "{error}"
         );
-        Ok(())
+        assert_table_unchanged(&engine, &snapshot)
     }
 
     #[test]
@@ -1365,6 +1378,7 @@ mod tests {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
         let snapshot = create_table_with_user_properties(&engine)?;
         let mut builder = snapshot
+            .clone()
             .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
             .with_table_properties_removed([removed]);
         builder
@@ -1375,7 +1389,9 @@ mod tests {
         match expected_error {
             Some(expected) => {
                 let error = result.unwrap_err();
+                assert!(matches!(error, KernelError::Generic(_)), "{error}");
                 assert!(error.to_string().contains(expected), "{error}");
+                assert_table_unchanged(&engine, &snapshot)?;
             }
             None => {
                 let committed = result?.commit(&engine)?.unwrap_post_commit_snapshot();
