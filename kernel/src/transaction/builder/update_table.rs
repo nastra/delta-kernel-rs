@@ -1314,6 +1314,56 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_updated_schema_counts_as_a_request_and_commits() -> Result<()> {
+        let (engine, snapshot) = create_clustered_column_mapping_table()?;
+        let transaction = snapshot
+            .clone()
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_updated_schema(snapshot.schema())
+            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+        assert!(transaction.has_metadata_request);
+        transaction.commit(&engine)?.unwrap_committed();
+
+        let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
+        assert_eq!(reloaded.version(), snapshot.version() + 1);
+        assert_eq!(reloaded.schema(), snapshot.schema());
+        Ok(())
+    }
+
+    #[test]
+    fn updated_schema_with_column_mapping_enablement_is_rejected() -> Result<()> {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let snapshot = create_table("memory:///", test_schema_flat(), "test", true)
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
+            .unwrap_post_commit_snapshot();
+        let mut builder = snapshot
+            .clone()
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_updated_schema(snapshot.schema());
+        builder
+            .local_state
+            .properties_added
+            .insert(COLUMN_MAPPING_MODE.to_string(), "name".to_string());
+        let error = builder
+            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        // The complete-schema path requires column mapping on the read table, so it rejects the
+        // request before the rule against combining a mode change with schema changes runs.
+        assert!(matches!(error, KernelError::Unsupported(_)), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("requires column mapping to be enabled"),
+            "{error}"
+        );
+
+        let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
+        assert_eq!(reloaded.version(), snapshot.version());
+        Ok(())
+    }
+
+    #[test]
     fn updated_schema_rename_keeps_clustering_column() -> Result<()> {
         let (engine, snapshot) = create_clustered_column_mapping_table()?;
         let schema = snapshot.schema();
