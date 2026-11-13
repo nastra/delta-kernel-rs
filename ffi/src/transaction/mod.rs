@@ -4467,6 +4467,113 @@ mod tests {
         Ok(())
     }
 
+    /// Applies `columns` (or skips the setter when `None`) in an ALTER TABLE through FFI and
+    /// returns the reloaded snapshot.
+    fn alter_clustering_via_ffi(
+        store: Arc<DynObjectStore>,
+        table_url: &Url,
+        test_engine: &dyn delta_kernel::Engine,
+        columns: Option<Vec<Vec<&str>>>,
+    ) -> delta_kernel::Result<delta_kernel::SnapshotRef> {
+        let engine = engine_handle_for_store(store);
+        let snapshot_handle: Handle<SharedSnapshot> = Snapshot::builder_for(table_url.clone())
+            .build(test_engine)?
+            .into();
+        let mut builder = ok_or_panic(unsafe {
+            new_update_table_txn_builder(
+                snapshot_handle.shallow_copy(),
+                KernelUpdateTableOperation::AlterTable,
+                ffi_str("test-engine/1.0"),
+                false,
+                engine.shallow_copy(),
+            )
+        });
+        match columns {
+            Some(columns) => {
+                let paths: Vec<Vec<KernelStringSlice>> = columns
+                    .iter()
+                    .map(|path| path.iter().map(|segment| ffi_str(segment)).collect())
+                    .collect();
+                let names: Vec<FfiColumnName> = paths
+                    .iter()
+                    .map(|path| FfiColumnName {
+                        path: unsafe { FfiStringArray::new_unsafe(path) },
+                    })
+                    .collect();
+                // An empty array is passed with a null pointer, as the FFI slice contract allows.
+                let names = if names.is_empty() {
+                    FfiColumnNameArray {
+                        ptr: std::ptr::null(),
+                        len: 0,
+                    }
+                } else {
+                    unsafe { FfiColumnNameArray::new_unsafe(&names) }
+                };
+                builder = ok_or_panic(unsafe {
+                    update_table_txn_builder_with_clustering_columns(
+                        builder,
+                        names,
+                        engine.shallow_copy(),
+                    )
+                });
+            }
+            None => {
+                let fields = vec![StructField::nullable("added", DataType::LONG)];
+                let field = EngineSchema {
+                    schema: &fields as *const Vec<StructField> as *mut c_void,
+                    visitor: visit_test_schema,
+                };
+                builder = ok_or_panic(unsafe {
+                    update_table_txn_builder_add_column(builder, &field, engine.shallow_copy())
+                });
+            }
+        }
+        let txn =
+            ok_or_panic(unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
+        unsafe {
+            free_committed_transaction(committed);
+            free_snapshot(snapshot_handle);
+            free_engine(engine);
+        }
+        Snapshot::builder_for(table_url.clone()).build(test_engine)
+    }
+
+    #[rstest]
+    #[case::omitted_keeps_columns(None, Some(vec![ColumnName::new(["id"])]))]
+    #[case::empty_clears_columns(Some(vec![]), Some(vec![]))]
+    #[case::dotted_nested_path(
+        Some(vec![vec!["parent", "child.with.dot"]]),
+        Some(vec![ColumnName::new(["parent", "child.with.dot"])])
+    )]
+    #[tokio::test]
+    async fn test_update_table_txn_builder_with_clustering_columns(
+        #[case] columns: Option<Vec<Vec<&str>>>,
+        #[case] expected: Option<Vec<ColumnName>>,
+    ) -> delta_kernel::Result<()> {
+        let (store, test_engine, table_url) =
+            test_utils::engine_store_setup("update_clustering", None);
+        let schema = schema_ref! {
+            nullable "id": INTEGER,
+            nullable "parent": { nullable "child.with.dot": STRING },
+        };
+        create_table(&table_url, schema, "test-engine/1.0", false)
+            .with_data_layout(DataLayout::clustered(["id"]))
+            .build(&test_engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&test_engine)?
+            .unwrap_committed();
+
+        let snapshot = alter_clustering_via_ffi(store, &table_url, &test_engine, columns)?;
+        assert_eq!(snapshot.version(), 1);
+        assert_eq!(
+            snapshot
+                .reader()
+                .get_physical_clustering_columns(&test_engine)?,
+            expected
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_create_table_with_custom_committer() -> KernelResult<()> {
         let (store, _test_engine, table_url) =

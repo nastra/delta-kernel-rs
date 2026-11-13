@@ -10,6 +10,7 @@ use super::state::TransactionBuilderState;
 use super::update_metadata::{
     PreparedUpdateTableMetadata, UpdateTableMetadataRequest, prepare_update_table_metadata,
 };
+use crate::clustering::create_clustering_domain_metadata;
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::schema::StructField;
@@ -70,6 +71,8 @@ pub struct UpdateTableBuilderState {
     // these yet.
     properties_added: HashMap<String, String>,
     property_keys_removed: HashSet<String>,
+
+    clustering_columns: Option<Vec<ColumnName>>,
     domain_metadata_removals: Vec<String>,
     is_blind_append: bool,
 }
@@ -102,6 +105,7 @@ impl TransactionBuilder<UpdateTable> {
                 schema_changes: None,
                 properties_added: HashMap::new(),
                 property_keys_removed: HashSet::new(),
+                clustering_columns: None,
                 domain_metadata_removals: Vec::new(),
                 is_blind_append: false,
             },
@@ -190,6 +194,27 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         self
     }
 
+    /// Replaces the table's clustering columns with `columns`, in order.
+    ///
+    /// Each column is a logical path, possibly nested, matched case-insensitively against the
+    /// schema that results from this transaction's schema changes. The commit records the physical
+    /// paths in the `delta.clustering` domain metadata. An empty list clears the clustering
+    /// columns but keeps the `clustering` table feature. On a table without clustering, any call,
+    /// including one with an empty list, adds the `clustering` and `domainMetadata` features.
+    /// Without this call, the transaction keeps the current clustering columns. Repeated calls
+    /// replace earlier ones.
+    ///
+    /// Changing clustering columns affects only how future writes cluster data; it does not
+    /// rewrite existing files. It never adds or drops schema fields: every column must already
+    /// exist in the resulting schema.
+    ///
+    /// [`build`](Self::build) rejects partitioned tables, columns that do not resolve, duplicate
+    /// columns, and columns whose type does not support min/max statistics.
+    pub fn with_clustering_columns(mut self, columns: Vec<ColumnName>) -> Self {
+        self.local_state.clustering_columns = Some(columns);
+        self
+    }
+
     /// Adds a user-controlled domain metadata removal to the transaction.
     ///
     /// If the domain exists, commit emits a tombstone that preserves its previous configuration.
@@ -250,6 +275,7 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
             if self.local_state.schema_changes.is_none()
                 && self.local_state.properties_added.is_empty()
                 && self.local_state.property_keys_removed.is_empty()
+                && self.local_state.clustering_columns.is_none()
             {
                 return Err(KernelError::invalid_transaction_state(
                     "ALTER TABLE requires at least one schema change",
@@ -318,6 +344,7 @@ fn try_new_update_table<MODE: ExecutionMode>(
         schema_changes,
         properties_added,
         property_keys_removed,
+        clustering_columns,
         domain_metadata_removals,
         is_blind_append,
     } = local_state;
@@ -334,11 +361,6 @@ fn try_new_update_table<MODE: ExecutionMode>(
     // TODO(#3240): Validate that delta.enableRowTracking=true has the required protocol support
     // and materialized column-name properties. Materialized names must be distinct and must not
     // collide with physical data columns.
-
-    // Read clustering columns from snapshot (returns None if clustering not enabled)
-    let clustering_columns = read_snapshot
-        .reader()
-        .get_physical_clustering_columns(engine)?;
 
     let commit_timestamp = current_time_ms()?;
 
@@ -364,16 +386,33 @@ fn try_new_update_table<MODE: ExecutionMode>(
         table_config: effective_table_config,
         should_emit_metadata,
         should_emit_protocol,
+        physical_clustering_columns,
     } = prepare_update_table_metadata(
         &read_snapshot,
         UpdateTableMetadataRequest {
             schema_changes,
             properties_added,
             property_keys_removed,
+            clustering_columns,
         },
         commit_timestamp,
         engine,
     )?;
+    // Writes in this transaction collect statistics for the clustering columns it commits.
+    let (system_domain_metadata_additions, physical_clustering_columns) =
+        match physical_clustering_columns {
+            Some(columns) => (
+                vec![create_clustering_domain_metadata(&columns)],
+                Some(columns),
+            ),
+            // `None` for an unclustered table.
+            None => (
+                Vec::new(),
+                read_snapshot
+                    .reader()
+                    .get_physical_clustering_columns(engine)?,
+            ),
+        };
 
     Ok(Transaction {
         read_snapshot_opt: Some(read_snapshot),
@@ -381,7 +420,8 @@ fn try_new_update_table<MODE: ExecutionMode>(
         should_emit_protocol,
         user_domain_removals: domain_metadata_removals,
         is_blind_append,
-        physical_clustering_columns: clustering_columns,
+        system_domain_metadata_additions,
+        physical_clustering_columns,
         ..Transaction::new(
             common_state,
             effective_table_config,
@@ -404,6 +444,7 @@ mod tests {
     use crate::arrow::array::{ArrayRef, Int32Array, StringArray};
     use crate::arrow::datatypes::Schema as ArrowSchema;
     use crate::arrow::record_batch::RecordBatch;
+    use crate::clustering::create_clustering_domain_metadata;
     use crate::committer::FileSystemCommitter;
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
@@ -420,6 +461,7 @@ mod tests {
         ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
     };
     use crate::transaction::create_table::create_table;
+    use crate::transaction::data_layout::DataLayout;
     use crate::transaction::{SchemaOperation, UpdateTableOperation};
     use crate::unit_test_utils::{copy_test_table, load_test_table, test_schema_flat};
     use crate::{Engine, KernelError, Result, SnapshotRef};
@@ -1177,6 +1219,46 @@ mod tests {
         assert!(config.is_feature_supported(&TableFeature::TimestampWithoutTimezone));
         assert!(config.is_feature_supported(&TableFeature::AppendOnly));
         assert!(config.is_feature_supported(&TableFeature::Invariants));
+        Ok(())
+    }
+
+    #[rstest]
+    fn clustering_change_uses_last_columns_and_emits_only_needed_actions(
+        #[values(false, true)] initially_clustered: bool,
+    ) -> Result<()> {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let layout = if initially_clustered {
+            DataLayout::clustered(["id"])
+        } else {
+            DataLayout::None
+        };
+        let snapshot = create_table("memory:///", test_schema_flat(), "test", true)
+            .with_data_layout(layout)
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
+            .unwrap_post_commit_snapshot();
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_clustering_columns(vec![column_name!("id")])
+            .with_clustering_columns(vec![column_name!("name")])
+            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+
+        let expected = vec![column_name!("name")];
+        assert_eq!(
+            transaction.physical_clustering_columns,
+            Some(expected.clone())
+        );
+        let [domain_metadata] = transaction.system_domain_metadata_additions.as_slice() else {
+            panic!("expected exactly one system domain metadata action");
+        };
+        let expected_domain_metadata = create_clustering_domain_metadata(&expected);
+        assert_eq!(domain_metadata.domain(), expected_domain_metadata.domain());
+        assert_eq!(
+            domain_metadata.configuration(),
+            expected_domain_metadata.configuration()
+        );
+        assert_eq!(transaction.should_emit_protocol, !initially_clustered);
+        assert!(!transaction.should_emit_metadata);
         Ok(())
     }
 

@@ -4,6 +4,9 @@
 //! read snapshot, derives the table features and properties that the final schema and configuration
 //! require, and validates the result. It mirrors Delta Kernel Java's
 //! `TransactionMetadataFactory.buildUpdateTableMetadata`.
+//!
+//! Requested clustering columns are resolved against the final schema, so they may name fields
+//! that schema changes in the same request add.
 
 use std::collections::{HashMap, HashSet};
 
@@ -14,13 +17,15 @@ use super::metadata_derivation::{
     validate_extract_features_and_properties_for,
 };
 use crate::actions::{Metadata, Protocol};
+use crate::clustering::resolve_physical_clustering_columns;
+use crate::expressions::ColumnName;
 use crate::schema::SchemaRef;
 use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     ColumnMappingMode, LEGACY_WRITER_FEATURES, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
     TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature,
-    ensure_domain_metadata_dependency, extract_enabled_reader_features,
+    add_feature_to_lists, ensure_domain_metadata_dependency, extract_enabled_reader_features,
 };
 use crate::table_properties::{
     COLUMN_MAPPING_MAX_COLUMN_ID, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
@@ -51,14 +56,18 @@ pub(super) struct UpdateTableMetadataRequest {
     pub(super) properties_added: HashMap<String, String>,
     /// Table property keys to unset.
     pub(super) property_keys_removed: HashSet<String>,
+    /// Logical clustering columns that replace the current ones. An empty list clears them.
+    pub(super) clustering_columns: Option<Vec<ColumnName>>,
 }
 
 impl UpdateTableMetadataRequest {
-    /// Returns `true` if the request changes neither the schema nor the configuration.
+    /// Returns `true` if the request changes neither the schema, the configuration, nor the
+    /// clustering columns.
     pub(super) fn is_empty(&self) -> bool {
         self.schema_changes.is_none()
             && self.properties_added.is_empty()
             && self.property_keys_removed.is_empty()
+            && self.clustering_columns.is_none()
     }
 }
 
@@ -68,6 +77,9 @@ pub(super) struct PreparedUpdateTableMetadata {
     pub(super) table_config: TableConfiguration,
     pub(super) should_emit_metadata: bool,
     pub(super) should_emit_protocol: bool,
+    /// Physical clustering columns to record in the `delta.clustering` domain, or `None` to keep
+    /// the current domain.
+    pub(super) physical_clustering_columns: Option<Vec<ColumnName>>,
 }
 
 /// Merges `request` with the read snapshot and derives the protocol and metadata to commit.
@@ -78,9 +90,13 @@ pub(super) struct PreparedUpdateTableMetadata {
 /// protocol. When the transaction enables in-commit timestamps, the enablement version and
 /// timestamp are recorded for the commit at `read_snapshot.version() + 1` and `commit_timestamp`.
 ///
+/// Requested clustering columns replace the current ones in order; an empty list clears them. Any
+/// clustering request adds the `clustering` feature (and its `domainMetadata` dependency) if the
+/// protocol does not support it, and never removes it.
+///
 /// Rejected transitions on existing tables: changing the column mapping mode, enabling or
-/// disabling row tracking, enabling or disabling `icebergCompatV3`, and disabling in-commit
-/// timestamps on a catalog-managed table.
+/// disabling row tracking, enabling or disabling `icebergCompatV3`, disabling in-commit
+/// timestamps on a catalog-managed table, and clustering a partitioned table.
 pub(super) fn prepare_update_table_metadata(
     read_snapshot: &Snapshot,
     request: UpdateTableMetadataRequest,
@@ -93,14 +109,19 @@ pub(super) fn prepare_update_table_metadata(
             table_config: read_config.clone(),
             should_emit_metadata: false,
             should_emit_protocol: false,
+            physical_clustering_columns: None,
         });
     }
     let UpdateTableMetadataRequest {
         schema_changes,
         properties_added,
         property_keys_removed,
+        clustering_columns,
     } = request;
     validate_property_removals(&properties_added, &property_keys_removed)?;
+    if let Some(columns) = &clustering_columns {
+        validate_clustering_not_partitioned(read_config, columns)?;
+    }
 
     // Schema changes preserve the column-mapping identities of surviving fields and assign new
     // identities (and `maxColumnId`) to added fields. The evolved schema is validated against the
@@ -118,6 +139,19 @@ pub(super) fn prepare_update_table_metadata(
     configuration.extend(requested.properties.drain());
     configuration.retain(|key, _| !property_keys_removed.contains(key));
     validate_transitions(read_config, &configuration)?;
+    // The column mapping mode cannot change, so the read mode resolves the final schema.
+    let physical_clustering_columns = clustering_columns
+        .map(|columns| {
+            if columns.is_empty() {
+                return Ok(columns);
+            }
+            resolve_physical_clustering_columns(
+                &schema,
+                &columns,
+                read_config.column_mapping_mode(),
+            )
+        })
+        .transpose()?;
     let explicit_ict = properties_added
         .get(ENABLE_IN_COMMIT_TIMESTAMPS)
         .map(String::as_str);
@@ -137,6 +171,13 @@ pub(super) fn prepare_update_table_metadata(
         configuration.insert(ENABLE_IN_COMMIT_TIMESTAMPS.to_string(), "true".to_string());
     }
     requested.properties = configuration;
+    if physical_clustering_columns.is_some() {
+        add_feature_to_lists(
+            TableFeature::ClusteredTable,
+            &mut requested.reader_features,
+            &mut requested.writer_features,
+        );
+    }
 
     maybe_enable_variant_type(&schema, &mut requested);
     maybe_enable_timestamp_ntz(&schema, &mut requested);
@@ -214,6 +255,7 @@ pub(super) fn prepare_update_table_metadata(
         table_config,
         should_emit_metadata,
         should_emit_protocol,
+        physical_clustering_columns,
     })
 }
 
@@ -284,6 +326,25 @@ fn validate_property_removals(
         )));
     }
     Ok(())
+}
+
+/// Rejects clustering requests, including an empty list, on a partitioned table.
+fn validate_clustering_not_partitioned(
+    table_config: &TableConfiguration,
+    clustering_columns: &[ColumnName],
+) -> KernelResult<()> {
+    let partition_columns = table_config.metadata().partition_columns();
+    if partition_columns.is_empty() {
+        return Ok(());
+    }
+    let clustering_columns: Vec<_> = clustering_columns.iter().map(ToString::to_string).collect();
+    Err(KernelError::generic(format!(
+        "Cannot enable clustering on a partitioned table '{}'. Existing partition columns: [{}], \
+         clustering columns: [{}]",
+        table_config.table_root(),
+        partition_columns.join(", "),
+        clustering_columns.join(", ")
+    )))
 }
 
 /// Rejects configuration transitions that Kernel does not support on existing tables.

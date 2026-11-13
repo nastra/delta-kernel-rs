@@ -14,7 +14,11 @@ use serde::{Deserialize, Serialize};
 use crate::actions::DomainMetadata;
 use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::is_skipping_eligible_datatype;
-use crate::schema::{DataType, StructType, is_null_count_only_file_sub_field};
+use crate::schema::{
+    DataType, StructType, is_null_count_only_file_sub_field,
+    normalize_column_names_to_schema_casing,
+};
+use crate::table_features::{ColumnMappingMode, get_any_level_column_physical_name};
 use crate::{KernelError, KernelResult};
 
 /// Domain metadata structure for clustering columns.
@@ -120,6 +124,24 @@ pub(crate) fn validate_clustering_columns(
         }
     }
     Ok(())
+}
+
+/// Resolves logical clustering columns against `schema` and returns their physical paths.
+///
+/// Names match the schema case-insensitively and are then validated by
+/// [`validate_clustering_columns`], so an empty list is rejected. The returned paths keep the
+/// input order and are the values stored in the `delta.clustering` domain.
+pub(crate) fn resolve_physical_clustering_columns(
+    schema: &StructType,
+    logical_columns: &[ColumnName],
+    column_mapping_mode: ColumnMappingMode,
+) -> KernelResult<Vec<ColumnName>> {
+    let normalized = normalize_column_names_to_schema_casing(schema, logical_columns);
+    validate_clustering_columns(schema, &normalized)?;
+    normalized
+        .iter()
+        .map(|column| get_any_level_column_physical_name(schema, column, column_mapping_mode))
+        .collect()
 }
 
 /// Creates domain metadata for clustering configuration.

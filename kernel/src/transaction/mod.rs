@@ -1090,7 +1090,8 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         match (self.is_create_table(), &self.operation) {
             (true, CommitOperation::CreateTable) => Ok(()),
             (false, CommitOperation::UpdateTable(UpdateTableOperation::AlterTable))
-                if !self.should_emit_metadata =>
+                if !self.should_emit_metadata
+                    && self.system_domain_metadata_additions.is_empty() =>
             {
                 Err(KernelError::invalid_transaction_state(
                     "ALTER TABLE requires at least one schema change",

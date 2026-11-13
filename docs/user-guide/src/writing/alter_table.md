@@ -135,8 +135,8 @@ let result = snapshot
     .commit(&engine)?;
 ```
 
-Building an `UpdateTableOperation::AlterTable` transaction without adding a schema operation returns an
-error. The unified builder performs this check at runtime because other operations may combine
+Building an `UpdateTableOperation::AlterTable` transaction without a schema operation or clustering
+change returns an error. The unified builder performs this check at runtime because other operations may combine
 schema evolution with data-file actions.
 
 ## Evolving a schema while writing
@@ -156,6 +156,25 @@ let write_state = transaction.write_state()?;
 let write_context = write_state.write_context_builder().build()?;
 // Write files using the evolved schema, add their metadata, and commit.
 ```
+
+## Changing clustering columns
+
+Call `with_clustering_columns()` to replace a table's clustering columns. A standalone change uses
+`UpdateTableOperation::AlterTable` and needs no schema operation. The commit records the new
+columns in the `delta.clustering` domain metadata; Kernel does not recluster existing files.
+
+```rust,ignore
+let result = snapshot
+    .update_table(UpdateTableOperation::AlterTable, "my-app/1.0", /* data_change */ false)
+    .with_clustering_columns(vec![column_name!("city"), column_name!("name")])
+    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .commit(&engine)?;
+```
+
+An empty list clears the clustering columns, and calling the method on an unclustered table enables
+clustering. Partitioned tables cannot be clustered. See the
+[`with_clustering_columns` rustdoc](https://docs.rs/delta_kernel/latest/delta_kernel/transaction/type.UpdateTableTransactionBuilder.html)
+for validation rules.
 
 ## What's next
 
