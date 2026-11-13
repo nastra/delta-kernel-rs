@@ -136,10 +136,22 @@ async fn set_properties_rejects_invalid_requests(
     )?;
 
     let result = snapshot
+        .clone()
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .with_table_properties_added(properties.to_vec())
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
     assert_result_error_with_message(result, error_contains);
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(reloaded.version(), 0);
+    assert_eq!(
+        reloaded.table_configuration().metadata(),
+        snapshot.table_configuration().metadata()
+    );
+    assert_eq!(
+        reloaded.table_configuration().protocol(),
+        snapshot.table_configuration().protocol()
+    );
     Ok(())
 }
 
