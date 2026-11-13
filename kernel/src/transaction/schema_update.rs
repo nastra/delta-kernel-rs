@@ -365,20 +365,25 @@ fn is_protocol_metadata_key(key: &str) -> bool {
     key.starts_with("delta.") || key.parse::<ColumnMetadataKey>().is_ok()
 }
 
-/// Rejects dropping or renaming a partition column. Partition columns are recorded by logical name
-/// in the metadata, so a rename would orphan the partition values of existing files.
+/// Rejects dropping or renaming a partition column, including a rename that only changes case.
+/// Partition columns are recorded by logical name in the metadata, and Kernel resolves them by
+/// exact name, so a rename would orphan the partition values of existing files.
 fn validate_partition_columns_unchanged(
     metadata: &Metadata,
     current_schema: &StructType,
     schema: &StructType,
 ) -> KernelResult<()> {
     for column in metadata.partition_columns() {
-        let id = current_schema
-            .field(column)
-            .and_then(StructField::column_mapping_id);
+        let Some(id) = current_schema
+            .fields()
+            .find(|field| field.name().eq_ignore_ascii_case(column))
+            .and_then(StructField::column_mapping_id)
+        else {
+            continue;
+        };
         let kept = schema
             .fields()
-            .any(|field| field.column_mapping_id() == id && field.name() == column);
+            .any(|field| field.column_mapping_id() == Some(id) && field.name() == column);
         require!(
             kept,
             KernelError::schema(format!("Cannot drop or rename partition column '{column}'"))

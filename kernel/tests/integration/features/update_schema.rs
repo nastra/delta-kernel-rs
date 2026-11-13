@@ -549,6 +549,12 @@ async fn updated_schema_requires_column_mapping(
     field(s, "tags"),
     field(s, "part").with_name("partition"),
 ])]
+#[case::case_only_rename(|s: &StructType| vec![
+    field(s, "id"),
+    field(s, "address"),
+    field(s, "tags"),
+    field(s, "part").with_name("PART"),
+])]
 #[tokio::test]
 async fn updated_schema_rejects_dropping_or_renaming_partition_columns(
     #[case] edit: SchemaEdit,
