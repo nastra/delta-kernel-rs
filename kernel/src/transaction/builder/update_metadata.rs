@@ -1268,6 +1268,93 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::feature_signal(&[("delta.feature.allowColumnDefaults", "supported")], true)]
+    #[case::other_property(&[("delta.enableChangeDataFeed", "true")], false)]
+    fn allow_column_defaults_is_never_derived(
+        #[case] requested: &[(&str, &str)],
+        #[case] rejected: bool,
+    ) {
+        let (engine, snapshot) = create_test_table(&[]);
+        let mut request = properties_request(requested);
+        request.schema_changes = Some(vec![SchemaOperation::add_column(
+            None,
+            StructField::nullable("added", DataType::STRING),
+        )]);
+        let result = prepare(engine.as_ref(), &snapshot, request);
+        if rejected {
+            let error = result.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Enabling feature 'allowColumnDefaults'"),
+                "{error}"
+            );
+        } else {
+            let config = result.unwrap().table_config;
+            assert!(!config.is_feature_supported(&TableFeature::AllowColumnDefaults));
+        }
+    }
+
+    #[test]
+    fn legacy_column_mapping_protocol_upgrade_retains_implied_features() {
+        let (engine, snapshot) = create_test_table(&[(COLUMN_MAPPING_MODE, "name")]);
+        // A (2, 5) protocol implies columnMapping without listing table features.
+        let read_config = snapshot.table_configuration();
+        let legacy = TableConfiguration::try_new(
+            read_config.metadata().clone(),
+            Protocol::try_new(2, 5, None::<Vec<String>>, None::<Vec<String>>).unwrap(),
+            read_config.table_root().clone(),
+            read_config.version(),
+        )
+        .unwrap();
+        assert!(legacy.is_feature_supported(&TableFeature::ColumnMapping));
+        let snapshot = with_table_config(&snapshot, legacy);
+
+        let prepared = prepare(
+            engine.as_ref(),
+            &snapshot,
+            add_column_request(StructField::nullable("ts", DataType::TIMESTAMP_NTZ)),
+        )
+        .unwrap();
+
+        assert!(prepared.should_emit_protocol);
+        let config = &prepared.table_config;
+        assert_eq!(config.column_mapping_mode(), ColumnMappingMode::Name);
+        for feature in [
+            TableFeature::ColumnMapping,
+            TableFeature::AppendOnly,
+            TableFeature::Invariants,
+            TableFeature::CheckConstraints,
+            TableFeature::ChangeDataFeed,
+            TableFeature::GeneratedColumns,
+            TableFeature::TimestampWithoutTimezone,
+        ] {
+            assert!(
+                config.is_feature_supported(&feature),
+                "{feature} was dropped"
+            );
+        }
+        let protocol = config.protocol();
+        assert!(
+            protocol
+                .reader_features()
+                .is_some_and(|features| features.contains(&TableFeature::ColumnMapping))
+        );
+    }
+
+    #[test]
+    fn enabling_iceberg_compat_v2_without_column_mapping_is_rejected() {
+        let (engine, snapshot) = create_test_table(&[]);
+        let error = prepare(
+            engine.as_ref(),
+            &snapshot,
+            properties_request(&[(ENABLE_ICEBERG_COMPAT_V2, "true")]),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("columnMapping"), "{error}");
+    }
+
     #[test]
     fn enabling_in_commit_timestamps_records_enablement() {
         let (engine, snapshot) = create_test_table(&[]);
