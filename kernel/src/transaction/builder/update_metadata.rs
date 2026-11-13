@@ -20,11 +20,12 @@ use crate::schema::{ColumnMetadataKey, MetadataValue, SchemaRef, StructField, St
 use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    ColumnMappingMode, LEGACY_WRITER_FEATURES, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
-    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature,
+    ColumnMappingMode, IcebergCompatValidationContext, LEGACY_WRITER_FEATURES,
+    SET_TABLE_FEATURE_SUPPORTED_PREFIX, TABLE_FEATURES_MIN_READER_VERSION,
+    TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature, V2_VALIDATOR, V3_VALIDATOR,
     assign_column_mapping_metadata, drop_column_mapping_metadata,
     ensure_domain_metadata_dependency, extract_enabled_reader_features,
-    get_column_mapping_mode_from_properties,
+    get_column_mapping_mode_from_properties, validate_iceberg_compat_if_needed,
 };
 use crate::table_properties::{
     COLUMN_MAPPING_MAX_COLUMN_ID, ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3,
@@ -222,11 +223,20 @@ pub(super) fn prepare_update_table_metadata(
     }
 
     validate_row_tracking_column_names(&table_config)?;
-    if should_emit_protocol {
-        table_config.ensure_write_supported()?;
-    }
     let should_emit_metadata =
         has_schema_changes || table_config.metadata() != read_config.metadata();
+    // A metadata-only change can break a feature requirement without changing the protocol, so
+    // the final configuration is validated whenever either action is emitted.
+    if should_emit_metadata || should_emit_protocol {
+        table_config.ensure_write_supported()?;
+        for validator in [&V2_VALIDATOR, &V3_VALIDATOR] {
+            validate_iceberg_compat_if_needed(
+                &table_config,
+                validator,
+                IcebergCompatValidationContext::Write,
+            )?;
+        }
+    }
     Ok(PreparedUpdateTableMetadata {
         table_config,
         should_emit_metadata,
@@ -869,6 +879,26 @@ mod tests {
                 .contains("Cannot update the column mapping mode and perform schema changes"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn metadata_only_change_violating_feature_requirement_is_rejected() {
+        let (engine, snapshot) = create_test_table(&[
+            (ENABLE_ICEBERG_COMPAT_V2, "true"),
+            ("delta.feature.deletionVectors", "supported"),
+        ]);
+        assert!(
+            snapshot
+                .table_configuration()
+                .is_feature_supported(&TableFeature::DeletionVectors)
+        );
+        let error = prepare(
+            engine.as_ref(),
+            &snapshot,
+            properties_request(&[("delta.enableDeletionVectors", "true")]),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("deletionVectors"), "{error}");
     }
 
     #[test]
