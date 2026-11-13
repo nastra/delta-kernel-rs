@@ -1426,6 +1426,9 @@ mod tests {
                 error.to_string().contains("type widening is not enabled"),
                 "{error}"
             );
+            let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
+            assert_eq!(reloaded.version(), snapshot.version());
+            assert_eq!(reloaded.schema(), snapshot.schema());
             return Ok(());
         }
         result?.commit(&engine)?.unwrap_committed();

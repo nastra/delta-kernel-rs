@@ -1081,7 +1081,7 @@ async fn updated_schema_rejects_unsupported_type_changes(
         None,
     )?;
     let updated = with_fields(edit(&snapshot.schema()));
-    assert_result_error_with_message(update_schema(&snapshot, engine.as_ref(), updated), expected);
+    assert_update_rejected(&snapshot, engine.as_ref(), updated, expected);
     Ok(())
 }
 
@@ -1167,7 +1167,10 @@ async fn updated_schema_widens_partition_columns_only_when_values_stay_readable(
     let updated = with_fields(retype(&snapshot.schema(), "p", to.clone()));
     let result = update_schema(&snapshot, engine.as_ref(), updated);
     match expected_error {
-        Some(expected) => assert_result_error_with_message(result, expected),
+        Some(expected) => {
+            assert_result_error_with_message(result, expected);
+            assert_nothing_committed(&snapshot, engine.as_ref());
+        }
         None => {
             let committed = result?;
             let batches = read_scan(&committed.scan_builder().build()?, engine.clone())?;
@@ -1222,7 +1225,10 @@ async fn updated_schema_restricts_widening_while_iceberg_compat_is_supported(
     let updated = with_fields(retype(&snapshot.schema(), "i", to));
     let result = update_schema(&snapshot, engine.as_ref(), updated);
     match expected_error {
-        Some(expected) => assert_result_error_with_message(result, expected),
+        Some(expected) => {
+            assert_result_error_with_message(result, expected);
+            assert_nothing_committed(&snapshot, engine.as_ref());
+        }
         None => {
             result?;
         }
