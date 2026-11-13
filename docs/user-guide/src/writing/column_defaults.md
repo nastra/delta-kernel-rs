@@ -294,9 +294,13 @@ isn't required.
 
 ### Can I create, change, or remove defaults through Kernel?
 
-Kernel's public create-table API can't enable column defaults. `ALTER TABLE` and transaction schema
-changes are also rejected on tables with `allowColumnDefaults` enabled, even if the requested change
-doesn't modify a default. Use another supporting Delta writer for these operations.
+Kernel's public create-table API can't enable column defaults. On a table that supports
+`allowColumnDefaults` and enables icebergCompatV3, `with_updated_schema()` can set, change, or
+remove the literal default of an existing column, including a nested one, by editing its
+`CURRENT_DEFAULT` metadata. It rejects a default on a new column, and `add_column()` and
+`set_nullable()` are rejected on tables with `allowColumnDefaults` enabled. For the literal rules,
+see the [`with_updated_schema` rustdoc](https://docs.rs/delta_kernel/latest/delta_kernel/transaction/type.UpdateTableTransactionBuilder.html).
+Use another supporting Delta writer for the other operations.
 
 ### What about nested defaults?
 
