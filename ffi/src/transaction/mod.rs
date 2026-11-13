@@ -135,7 +135,8 @@ mod tests {
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
     use delta_kernel::parquet::file::properties::WriterProperties;
     use delta_kernel::schema::{
-        ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType, schema_ref,
+        ColumnMetadataKey, DataType, MetadataKey, MetadataValue, SchemaRef, StructField,
+        StructType, schema_ref,
     };
     use delta_kernel::table_features::TableFeature;
     use delta_kernel::transaction::create_table::create_table;
@@ -175,10 +176,12 @@ mod tests {
     use super::*;
     use crate::engine_funcs::{free_expression_evaluator, new_expression_evaluator};
     use crate::expressions::free_kernel_expression;
+    use crate::scan::{CMetadataMap, CMetadataValueKind};
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema_visitor::visit_field_geometry;
     use crate::schema_visitor::{
-        visit_field_integer, visit_field_long, visit_field_string, visit_field_struct,
+        EngineMetadata, visit_field_integer, visit_field_long, visit_field_string,
+        visit_field_struct, visit_metadata_value,
     };
     use crate::{
         KernelStringSlice, NullableCvoid, OptionalValue, Url, free_engine, free_schema,
@@ -2004,8 +2007,9 @@ mod tests {
     }
 
     /// Schema visitor callback for tests: encodes the schema stored in the `schema` pointer
-    /// (which points to a `Vec<StructField>`) into the kernel's `KernelSchemaVisitorState`.
-    /// Only supports primitive fields (no nested structs/arrays/maps) -- sufficient for tests.
+    /// (which points to a `Vec<StructField>`) into the kernel's `KernelSchemaVisitorState`,
+    /// including field metadata. Only supports primitive fields (no nested structs/arrays/maps) --
+    /// sufficient for tests.
     extern "C" fn visit_test_schema(
         schema_ptr: *mut c_void,
         state: &mut KernelSchemaVisitorState,
@@ -2016,27 +2020,36 @@ mod tests {
             .map(|field| {
                 let name = field.name.as_str();
                 let nullable = field.nullable;
+                let metadata = EngineMetadata {
+                    metadata: &field.metadata as *const _ as *mut c_void,
+                    visitor: visit_test_field_metadata,
+                };
+                let metadata: *const EngineMetadata = if field.metadata.is_empty() {
+                    std::ptr::null()
+                } else {
+                    &metadata
+                };
                 unsafe {
                     ok_or_panic(match field.data_type {
                         DataType::INTEGER => visit_field_integer(
                             state,
                             kernel_string_slice!(name),
                             nullable,
-                            std::ptr::null(),
+                            metadata,
                             &TEST_ERROR_ALLOCATORS,
                         ),
                         DataType::STRING => visit_field_string(
                             state,
                             kernel_string_slice!(name),
                             nullable,
-                            std::ptr::null(),
+                            metadata,
                             &TEST_ERROR_ALLOCATORS,
                         ),
                         DataType::LONG => visit_field_long(
                             state,
                             kernel_string_slice!(name),
                             nullable,
-                            std::ptr::null(),
+                            metadata,
                             &TEST_ERROR_ALLOCATORS,
                         ),
                         _ => panic!("Unsupported test field type: {:?}", field.data_type),
@@ -2056,6 +2069,37 @@ mod tests {
                 &TEST_ERROR_ALLOCATORS,
             ))
         }
+    }
+
+    /// Metadata visitor for [`visit_test_schema`]: `metadata` points to a field's metadata map.
+    extern "C" fn visit_test_field_metadata(
+        metadata: *mut c_void,
+        state: &mut CMetadataMap,
+    ) -> bool {
+        let metadata = unsafe { &*(metadata as *const HashMap<MetadataKey, MetadataValue>) };
+        for (key, value) in metadata {
+            let (kind, text) = match value {
+                MetadataValue::Number(n) => (CMetadataValueKind::MetadataNumber, n.to_string()),
+                MetadataValue::String(s) => (CMetadataValueKind::MetadataString, s.clone()),
+                MetadataValue::Boolean(b) => (CMetadataValueKind::MetadataBoolean, b.to_string()),
+                other => (
+                    CMetadataValueKind::MetadataJson,
+                    serde_json::to_string(other).unwrap(),
+                ),
+            };
+            let key = key.as_str();
+            let text = text.as_str();
+            ok_or_panic(unsafe {
+                visit_metadata_value(
+                    state,
+                    kernel_string_slice!(key),
+                    kind,
+                    kernel_string_slice!(text),
+                    &TEST_ERROR_ALLOCATORS,
+                )
+            });
+        }
+        true
     }
 
     extern "C" fn visit_invalid_schema_not_struct(
@@ -2913,6 +2957,78 @@ mod tests {
         unsafe {
             free_snapshot(snapshot);
             free_engine(update_engine);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_table_with_updated_schema_renames_and_adds_columns() -> delta_kernel::Result<()>
+    {
+        let (store, test_engine, table_url) =
+            test_utils::engine_store_setup("test_update_with_updated_schema", None);
+        let engine = engine_handle_for_store(Arc::clone(&store));
+        create_table(
+            &table_url,
+            schema_ref! { nullable "id": INTEGER, nullable "name": STRING },
+            "test-engine/1.0",
+            false,
+        )
+        .with_table_properties([("delta.columnMapping.mode", "name")])
+        .build(&test_engine, Box::new(FileSystemCommitter::new()))?
+        .commit(&test_engine)?
+        .unwrap_committed();
+        let before = Snapshot::builder_for(table_url.as_str()).build(&test_engine)?;
+        let before_schema = before.schema();
+        let fields = vec![
+            before_schema.field("name").unwrap().with_name("full_name"),
+            before_schema.field("id").unwrap().clone(),
+            StructField::nullable("added", DataType::LONG),
+        ];
+        let schema = EngineSchema {
+            schema: &fields as *const Vec<StructField> as *mut c_void,
+            visitor: visit_test_schema,
+        };
+
+        let snapshot =
+            unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+        let builder = unsafe {
+            ok_or_panic(new_update_table_txn_builder(
+                snapshot.shallow_copy(),
+                KernelUpdateTableOperation::AlterTable,
+                ffi_str("test-engine/1.0"),
+                false,
+                engine.shallow_copy(),
+            ))
+        };
+        let builder = ok_or_panic(unsafe {
+            update_table_txn_builder_with_updated_schema(builder, &schema, engine.shallow_copy())
+        });
+        let txn =
+            ok_or_panic(unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
+        assert_eq!(unsafe { version_and_free(committed) }, 1);
+
+        let after = Snapshot::builder_for(table_url.as_str()).build(&test_engine)?;
+        let after_schema = after.schema();
+        let names: Vec<_> = after_schema
+            .fields()
+            .map(|field| field.name().as_str())
+            .collect();
+        assert_eq!(names, ["full_name", "id", "added"]);
+        assert_eq!(
+            after_schema.field("full_name").unwrap().metadata(),
+            before_schema.field("name").unwrap().metadata()
+        );
+        assert!(
+            after_schema
+                .field("added")
+                .unwrap()
+                .column_mapping_id()
+                .is_some()
+        );
+        unsafe {
+            free_snapshot(snapshot);
+            free_engine(engine);
         }
         Ok(())
     }

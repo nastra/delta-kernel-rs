@@ -70,6 +70,7 @@ mod manifest_commit_state;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 mod root_manifest_file;
 pub(crate) mod schema_evolution;
+mod schema_update;
 #[internal_api]
 #[cfg_attr(not(feature = "internal-api"), allow(unused_imports))]
 pub(crate) use schema_evolution::SchemaOperation;

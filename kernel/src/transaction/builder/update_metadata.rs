@@ -15,7 +15,7 @@ use super::metadata_derivation::{
     maybe_enable_timestamp_ntz, maybe_enable_v2_checkpoint_for_policy, maybe_enable_variant_type,
     validate_extract_features_and_properties_for,
 };
-use crate::actions::{Metadata, Protocol};
+use crate::actions::Protocol;
 use crate::schema::{ColumnMetadataKey, MetadataValue, SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
@@ -34,6 +34,7 @@ use crate::table_properties::{
     MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME, TableProperties,
 };
 use crate::transaction::schema_evolution::{SchemaOperation, evolve_metadata};
+use crate::transaction::schema_update::evolve_metadata_to_schema;
 use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::{Engine, KernelError, KernelResult};
 
@@ -48,6 +49,9 @@ const UPDATE_TABLE: &str = "UPDATE TABLE";
 pub(super) struct UpdateTableMetadataRequest {
     /// Schema changes applied in order to the snapshot schema.
     pub(super) schema_changes: Option<Vec<SchemaOperation>>,
+    /// Complete schema that replaces the snapshot schema. Mutually exclusive with
+    /// `schema_changes`.
+    pub(super) updated_schema: Option<SchemaRef>,
     /// Table properties to set. May contain `delta.feature.<name>=supported` signals.
     pub(super) properties_added: HashMap<String, String>,
     /// Table property keys to unset.
@@ -58,6 +62,7 @@ impl UpdateTableMetadataRequest {
     /// Returns `true` if the request changes neither the schema nor the configuration.
     pub(super) fn is_empty(&self) -> bool {
         self.schema_changes.is_none()
+            && self.updated_schema.is_none()
             && self.properties_added.is_empty()
             && self.property_keys_removed.is_empty()
     }
@@ -103,6 +108,7 @@ pub(super) fn prepare_update_table_metadata(
     }
     let UpdateTableMetadataRequest {
         schema_changes,
+        updated_schema,
         properties_added,
         property_keys_removed,
     } = request;
@@ -112,10 +118,22 @@ pub(super) fn prepare_update_table_metadata(
     // Schema changes preserve the column-mapping identities of surviving fields and assign new
     // identities (and `maxColumnId`) to added fields. The evolved schema is validated against the
     // final protocol below, after deriving the features it requires.
-    let has_schema_changes = schema_changes.is_some();
-    let (mut evolved_metadata, mut schema) = match schema_changes {
-        Some(changes) => apply_schema_changes(read_config, changes)?,
-        None => (read_config.metadata().clone(), read_config.logical_schema()),
+    let has_schema_changes = schema_changes.is_some() || updated_schema.is_some();
+    let (mut evolved_metadata, mut schema) = match (schema_changes, updated_schema) {
+        (Some(_), Some(_)) => {
+            return Err(KernelError::internal_error(
+                "schema operations and a complete updated schema cannot be combined",
+            ));
+        }
+        (Some(changes), None) => {
+            ensure_schema_changes_supported(read_config)?;
+            evolve_metadata(read_config, changes)?
+        }
+        (None, Some(schema)) => {
+            ensure_schema_changes_supported(read_config)?;
+            evolve_metadata_to_schema(read_config, &schema)?
+        }
+        (None, None) => (read_config.metadata().clone(), read_config.logical_schema()),
     };
 
     // Kernel-managed keys are rejected by the property allow-list.
@@ -283,11 +301,8 @@ fn is_already_supported(table_config: &TableConfiguration, feature: &TableFeatur
         || preview.is_some_and(|preview| table_config.is_feature_supported(&preview))
 }
 
-/// Applies `changes` to the table schema, rejecting tables whose schema Kernel cannot yet evolve.
-fn apply_schema_changes(
-    table_config: &TableConfiguration,
-    changes: Vec<SchemaOperation>,
-) -> KernelResult<(Metadata, SchemaRef)> {
+/// Rejects tables whose schema Kernel cannot yet evolve.
+fn ensure_schema_changes_supported(table_config: &TableConfiguration) -> KernelResult<()> {
     let unsupported_iceberg_compat = [TableFeature::IcebergCompatV2, TableFeature::IcebergCompatV3]
         .into_iter()
         .find(|feature| table_config.is_feature_enabled(feature));
@@ -308,7 +323,7 @@ fn apply_schema_changes(
             "Schema changes are not yet supported on tables with generated columns",
         ));
     }
-    evolve_metadata(table_config, changes)
+    Ok(())
 }
 
 fn validate_property_removals(

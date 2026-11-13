@@ -4,9 +4,6 @@
 //! using field IDs as the primary mechanism for identifying fields across schema versions.
 //! Supports nested field comparison within structs, arrays, and maps.
 
-// This module is not used outside the diff subsystem; suppress unused-code warnings.
-#![allow(dead_code)]
-
 use std::collections::{HashMap, HashSet};
 
 use super::{
@@ -71,8 +68,6 @@ pub(crate) enum FieldChangeType {
 /// Errors that can occur during schema diffing
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SchemaDiffError {
-    #[error("Schema diffing is not yet implemented")]
-    Unsupported,
     #[error("Field at path '{path}' is missing column mapping ID")]
     MissingFieldId { path: ColumnName },
     #[error("Duplicate field ID {id} found at paths '{path1}' and '{path2}'")]
@@ -94,6 +89,14 @@ pub(crate) enum SchemaDiffError {
         before: String,
         after: String,
     },
+    #[error(
+        "Field with ID {field_id} moved from '{before}' to '{after}'. Fields cannot move to a different parent."
+    )]
+    FieldMoved {
+        field_id: i64,
+        before: ColumnName,
+        after: ColumnName,
+    },
 }
 
 impl SchemaDiff {
@@ -103,6 +106,8 @@ impl SchemaDiff {
     }
 
     /// Returns true if there are no differences between the schemas
+    // This and the helpers after it are used only by the unit tests so far.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn is_empty(&self) -> bool {
         self.added_fields.is_empty()
             && self.removed_fields.is_empty()
@@ -110,26 +115,20 @@ impl SchemaDiff {
     }
 
     /// Returns the total number of changes
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn change_count(&self) -> usize {
         self.added_fields.len() + self.removed_fields.len() + self.updated_fields.len()
     }
 
     /// Returns true if there are any breaking changes (removed fields, type changes, or tightened
     /// nullability)
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn has_breaking_changes(&self) -> bool {
         self.breaking_changes
     }
 
-    /// Get all changes (both top-level and nested)
-    pub(crate) fn all_changes(&self) -> (&[FieldChange], &[FieldChange], &[FieldUpdate]) {
-        (
-            &self.added_fields,
-            &self.removed_fields,
-            &self.updated_fields,
-        )
-    }
-
     /// Get all changes at the top level only (fields with path length of 1)
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn top_level_changes(
         &self,
     ) -> (Vec<&FieldChange>, Vec<&FieldChange>, Vec<&FieldUpdate>) {
@@ -152,6 +151,7 @@ impl SchemaDiff {
     }
 
     /// Get all changes at nested levels only (fields with path length > 1)
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn nested_changes(
         &self,
     ) -> (Vec<&FieldChange>, Vec<&FieldChange>, Vec<&FieldUpdate>) {
@@ -180,6 +180,15 @@ struct FieldWithPath {
     field: StructField,
     path: ColumnName,
     field_id: i64,
+    parent: Option<ParentLocation>,
+}
+
+/// Where a nested field lives: the ID of the nearest enclosing struct field and the array/map
+/// segments (`element`, `key`, `value`) between that field and this field's struct.
+#[derive(Debug, Clone, PartialEq)]
+struct ParentLocation {
+    field_id: i64,
+    container_path: Vec<&'static str>,
 }
 
 /// Computes the difference between two schemas using field IDs for identification
@@ -209,9 +218,9 @@ fn compute_schema_diff(
     // Collect all fields with their paths from both schemas
     let root = ColumnName::default();
     let mut before_fields = Vec::new();
-    collect_all_fields_with_paths(before, &root, &mut before_fields)?;
+    collect_all_fields_with_paths(before, &root, None, &mut before_fields)?;
     let mut after_fields = Vec::new();
-    collect_all_fields_with_paths(after, &root, &mut after_fields)?;
+    collect_all_fields_with_paths(after, &root, None, &mut after_fields)?;
 
     // Build maps by field ID
     let before_by_id = build_field_map_by_id(&before_fields)?;
@@ -268,6 +277,17 @@ fn compute_schema_diff(
 
     // Check for updates in common fields
     let mut updated_fields = Vec::new();
+    for &id in &common_ids {
+        let before_field_with_path = &before_by_id[&id];
+        let after_field_with_path = &after_by_id[&id];
+        if before_field_with_path.parent != after_field_with_path.parent {
+            return Err(SchemaDiffError::FieldMoved {
+                field_id: id,
+                before: before_field_with_path.path.clone(),
+                after: after_field_with_path.path.clone(),
+            });
+        }
+    }
     for id in common_ids {
         let before_field_with_path = &before_by_id[&id];
         let after_field_with_path = &after_by_id[&id];
@@ -275,24 +295,15 @@ fn compute_schema_diff(
         // Invariant: A field in common_ids must have existed in both schemas, which means
         // its parent path must also have existed in both schemas. Therefore, neither an
         // added nor removed ancestor should be a parent of an updated field.
+        // A common field cannot have an added ancestor: it would have moved into the added
+        // field, which the parent check above rejects.
         #[cfg(debug_assertions)]
         {
             let added_paths: HashSet<ColumnName> =
                 added_fields.iter().map(|f| f.path.clone()).collect();
-            let removed_paths: HashSet<ColumnName> =
-                removed_fields.iter().map(|f| f.path.clone()).collect();
-
             debug_assert!(
                 !has_added_ancestor(&after_field_with_path.path, &added_paths),
-                "Field with ID {} at path '{}' is in common_ids but has an added ancestor. \
-                 This violates the invariant that common fields must have existed in both schemas.",
-                id,
-                after_field_with_path.path
-            );
-            debug_assert!(
-                !has_added_ancestor(&after_field_with_path.path, &removed_paths),
-                "Field with ID {} at path '{}' is in common_ids but has a removed ancestor. \
-                 This violates the invariant that common fields must have existed in both schemas.",
+                "Field with ID {} at path '{}' is in common_ids but has an added ancestor.",
                 id,
                 after_field_with_path.path
             );
@@ -444,15 +455,22 @@ fn validate_physical_name(
 ///
 /// This helper function handles deep nesting like `array<array<struct<...>>>` or
 /// `map<array<struct<...>>, array<struct<...>>>` by recursing through container layers.
+/// `parent` locates `data_type` relative to its nearest enclosing struct field.
 fn collect_fields_from_datatype(
     data_type: &DataType,
     parent_path: &ColumnName,
+    parent: ParentLocation,
     out: &mut Vec<FieldWithPath>,
 ) -> Result<(), SchemaDiffError> {
+    let in_container = |segment: &'static str| {
+        let mut location = parent.clone();
+        location.container_path.push(segment);
+        location
+    };
     match data_type {
         DataType::Struct(struct_type) => {
             // Collect fields from this struct
-            collect_all_fields_with_paths(struct_type, parent_path, out)?;
+            collect_all_fields_with_paths(struct_type, parent_path, Some(parent), out)?;
         }
         DataType::Array(array_type) => {
             // TODO: Add IcebergCompatV2 support - check that array nested field IDs remain stable
@@ -462,7 +480,12 @@ fn collect_fields_from_datatype(
 
             // For arrays, we use "element" as the path segment and recurse into element type
             let element_path = joined_column_name!(parent_path, "element");
-            collect_fields_from_datatype(array_type.element_type(), &element_path, out)?;
+            collect_fields_from_datatype(
+                array_type.element_type(),
+                &element_path,
+                in_container("element"),
+                out,
+            )?;
         }
         DataType::Map(map_type) => {
             // TODO: Add IcebergCompatV2 support - check that map nested field IDs remain stable
@@ -472,10 +495,15 @@ fn collect_fields_from_datatype(
 
             // For maps, we use "key" and "value" as path segments and recurse into both types
             let key_path = joined_column_name!(parent_path, "key");
-            collect_fields_from_datatype(map_type.key_type(), &key_path, out)?;
+            collect_fields_from_datatype(map_type.key_type(), &key_path, in_container("key"), out)?;
 
             let value_path = joined_column_name!(parent_path, "value");
-            collect_fields_from_datatype(map_type.value_type(), &value_path, out)?;
+            collect_fields_from_datatype(
+                map_type.value_type(),
+                &value_path,
+                in_container("value"),
+                out,
+            )?;
         }
         _ => {
             // Primitive types don't have nested fields
@@ -489,6 +517,7 @@ fn collect_fields_from_datatype(
 fn collect_all_fields_with_paths(
     schema: &StructType,
     parent_path: &ColumnName,
+    parent: Option<ParentLocation>,
     out: &mut Vec<FieldWithPath>,
 ) -> Result<(), SchemaDiffError> {
     for field in schema.fields() {
@@ -501,10 +530,15 @@ fn collect_all_fields_with_paths(
             field: field.clone(),
             path: field_path.clone(),
             field_id,
+            parent: parent.clone(),
         });
 
         // Recursively collect nested struct fields from the field's data type
-        collect_fields_from_datatype(field.data_type(), &field_path, out)?;
+        let location = ParentLocation {
+            field_id,
+            container_path: Vec::new(),
+        };
+        collect_fields_from_datatype(field.data_type(), &field_path, location, out)?;
     }
 
     Ok(())
@@ -1081,6 +1115,82 @@ mod tests {
         assert_eq!(nested_removed.len(), 1);
         assert_eq!(nested_removed[0].path, column_name!("user.address.city"));
         assert_eq!(nested_updated.len(), 0);
+    }
+
+    /// `m: map<struct, struct>` whose field `x` (id 3) sits in the key or, next to `y` (id 4), in
+    /// the value.
+    fn map_with_inner_field_in(key: bool) -> StructType {
+        let x = create_field_with_id("x", DataType::STRING, true, 3);
+        let y = create_field_with_id("y", DataType::STRING, true, 4);
+        let (key_type, value_type) = if key {
+            (schema! { (x) }, schema! { (y) })
+        } else {
+            (
+                schema! { (create_field_with_id("z", DataType::STRING, true, 5)) },
+                schema! { (y), (x) },
+            )
+        };
+        schema! {
+            (create_field_with_id("m", MapType::new(key_type, value_type, true), true, 1)),
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::into_new_parent(
+        schema! { (create_field_with_id("x", DataType::STRING, true, 3)) },
+        schema! {
+            (create_field_with_id(
+                "s",
+                schema! { (create_field_with_id("x", DataType::STRING, true, 3)) },
+                true,
+                2,
+            )),
+        },
+        "moved from 'x' to 's.x'"
+    )]
+    #[case::between_map_key_and_value(
+        map_with_inner_field_in(true),
+        map_with_inner_field_in(false),
+        "moved from 'm.key.x' to 'm.value.x'"
+    )]
+    fn test_field_moved_to_another_parent_is_rejected(
+        #[case] before: StructType,
+        #[case] after: StructType,
+        #[case] expected: &str,
+    ) {
+        let error = SchemaDiff::new(&before, &after).unwrap_err();
+        assert!(matches!(
+            error,
+            SchemaDiffError::FieldMoved { field_id: 3, .. }
+        ));
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+
+    #[test]
+    fn test_reordered_and_renamed_fields_are_not_moves() {
+        let before = schema! {
+            (create_field_with_id("a", DataType::STRING, true, 1)),
+            (create_field_with_id(
+                "s",
+                schema! { (create_field_with_id("x", DataType::STRING, true, 3)) },
+                true,
+                2,
+            )),
+        };
+        let after = schema! {
+            (create_field_with_id(
+                "t",
+                schema! { (create_field_with_id("y", DataType::STRING, true, 3)) },
+                true,
+                2,
+            )),
+            (create_field_with_id("a", DataType::STRING, true, 1)),
+        };
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+        assert_eq!(
+            updated_paths(&diff),
+            HashSet::from([column_name!("t"), column_name!("t.y")])
+        );
     }
 
     #[test]
