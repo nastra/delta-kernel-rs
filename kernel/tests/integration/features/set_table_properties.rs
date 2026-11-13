@@ -112,6 +112,26 @@ async fn set_properties_patches_configuration_and_canonicalizes_delta_keys()
     "Invalid value"
 )]
 #[case::interval_without_prefix(&[], &[("delta.logRetentionDuration", "2 weeks")], "Invalid value")]
+#[case::nanosecond_interval(
+    &[],
+    &[("delta.logRetentionDuration", "interval 5 nanoseconds")],
+    "does not support this unit"
+)]
+#[case::day_count_beyond_java_int(
+    &[],
+    &[("delta.deletedFileRetentionDuration", "interval 3000000000 days")],
+    "out of the range"
+)]
+#[case::week_count_beyond_java_int(
+    &[],
+    &[("delta.deletedFileRetentionDuration", "interval 400000000 weeks")],
+    "out of the range"
+)]
+#[case::overflowing_week_count(
+    &[],
+    &[("delta.logRetentionDuration", "interval 100000000000000 weeks")],
+    "Invalid value"
+)]
 #[case::interval_with_two_units(
     &[],
     &[("delta.deletedFileRetentionDuration", "interval 1 day 12 hours")],

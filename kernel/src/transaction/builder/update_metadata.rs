@@ -128,7 +128,7 @@ pub(super) fn prepare_update_table_metadata(
         )));
     }
     validate_java_int_ranges(&properties_added)?;
-    validate_single_unit_intervals(&properties_added)?;
+    validate_retention_intervals(&properties_added)?;
     validate_property_removals(&properties_added, &property_keys_removed)?;
 
     // Schema changes preserve the column-mapping identities of surviving fields and assign new
@@ -357,18 +357,48 @@ fn validate_java_int_ranges(properties_added: &HashMap<String, String>) -> Kerne
     Ok(())
 }
 
-/// Rejects interval properties with more than one unit, such as `interval 1 day 12 hours`.
-/// Kernel's interval parser reads only the first unit, so it would read a shorter retention than
-/// Java and Spark do.
-fn validate_single_unit_intervals(properties_added: &HashMap<String, String>) -> KernelResult<()> {
+/// Rejects retention intervals that Kernel and Delta Kernel Java would read differently, or that
+/// Java rejects.
+///
+/// Kernel's interval parser reads only the first unit, so `interval 1 day 12 hours` would read as
+/// a shorter retention than Java and Spark read. Java's `IntervalParserUtils` has no nanosecond
+/// unit, keeps the day count (weeks included) in an `int`, and the other units in a `long` count
+/// of microseconds, so larger values fail there.
+fn validate_retention_intervals(properties_added: &HashMap<String, String>) -> KernelResult<()> {
+    const MICROS_PER_SECOND: i64 = 1_000_000;
+    const MICROS_PER_DAY: i64 = 86_400 * MICROS_PER_SECOND;
     for key in [LOG_RETENTION_DURATION, DELETED_FILE_RETENTION_DURATION] {
-        if let Some(value) = properties_added.get(key)
-            && value.split_whitespace().count() != 3
-        {
-            return Err(KernelError::generic(format!(
-                "Invalid value '{value}' for table property '{key}': use one unit, such as \
-                 'interval 2 weeks'"
-            )));
+        let Some(value) = properties_added.get(key) else {
+            continue;
+        };
+        let invalid = |reason: &str| {
+            Err(KernelError::generic(format!(
+                "Invalid value '{value}' for table property '{key}': {reason}"
+            )))
+        };
+        let [_, count, unit] = value.split_whitespace().collect::<Vec<_>>()[..] else {
+            return invalid("use one unit, such as 'interval 2 weeks'");
+        };
+        // The snapshot parser has already accepted the prefix and a non-negative count.
+        let Ok(count) = count.parse::<i64>() else {
+            return invalid("the count must be an integer");
+        };
+        let days = |days: Option<i64>| {
+            days.and_then(|days| i32::try_from(days).ok())
+                .and_then(|days| i64::from(days).checked_mul(MICROS_PER_DAY))
+        };
+        let micros = match unit.strip_suffix('s').unwrap_or(unit) {
+            "week" => days(count.checked_mul(7)),
+            "day" => days(Some(count)),
+            "hour" => count.checked_mul(3_600 * MICROS_PER_SECOND),
+            "minute" => count.checked_mul(60 * MICROS_PER_SECOND),
+            "second" => count.checked_mul(MICROS_PER_SECOND),
+            "millisecond" => count.checked_mul(1_000),
+            "microsecond" => Some(count),
+            _ => return invalid("Delta Kernel Java does not support this unit"),
+        };
+        if micros.is_none() {
+            return invalid("the duration is out of the range Delta Kernel Java supports");
         }
     }
     Ok(())
@@ -1409,6 +1439,35 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("columnMapping"), "{error}");
+    }
+
+    #[rstest]
+    fn retention_intervals_java_supports_are_accepted(
+        #[values(LOG_RETENTION_DURATION, DELETED_FILE_RETENTION_DURATION)] key: &str,
+        #[values(
+            "interval 2 weeks",
+            "interval 1 week",
+            "interval 30 days",
+            "interval 168 hours",
+            "interval 90 minutes",
+            "interval 45 seconds",
+            "interval 500 milliseconds",
+            "interval 1 microsecond",
+            "interval 106751991 days"
+        )]
+        value: &str,
+    ) {
+        let (engine, snapshot) = create_test_table(&[]);
+        let prepared = prepare(
+            engine.as_ref(),
+            &snapshot,
+            properties_request(&[(key, value)]),
+        )
+        .unwrap();
+        assert_eq!(
+            configuration_value(&prepared.table_config, key),
+            Some(value)
+        );
     }
 
     #[rstest]
