@@ -193,9 +193,8 @@ pub(crate) fn apply_schema_operations(
                              is not set in table properties",
                         )
                     })?;
-                    // ALTER TABLE doesn't support icebergCompatV3 yet, so the new field never
-                    // gets `delta.columnMapping.nested.ids` here. Tracking issue:
-                    // <https://github.com/delta-io/delta-kernel-rs/issues/2492>
+                    // IcebergCompat nested ids are assigned to the final schema by
+                    // `prepare_update_table_metadata`.
                     try_assign_flat_column_mapping_info(&field, id)?
                 } else {
                     // `evolve_metadata` strips column-mapping annotations introduced into a

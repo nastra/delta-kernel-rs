@@ -219,13 +219,17 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// decimal or `timestamp_ntz`, because Kernel cannot parse their existing partition values as
     /// the new type.
     ///
+    /// When `icebergCompatV2` or `icebergCompatV3` is enabled, Kernel assigns
+    /// `delta.columnMapping.nested.ids` to the array elements and map keys and values of new
+    /// fields, and the new schema must satisfy that version's type and type-change rules.
+    ///
     /// [`build`](Self::build) rejects the update if the table does not use column mapping, or if
-    /// it tightens nullability, makes any other type change or alters `delta.typeChanges`, moves
-    /// a field to a different parent struct, drops or renames a partition column or a column
-    /// listed in
-    /// `delta.dataSkippingStatsColumns`, drops a clustering column, renames a collated field, adds
-    /// a non-nullable field or a field with a default value, or changes protocol-defined field
-    /// metadata such as generation expressions, invariants, or defaults. It cannot be combined with
+    /// it tightens nullability, makes any other type change or alters `delta.typeChanges` or
+    /// `delta.columnMapping.nested.ids`, moves a field to a different parent struct, drops or
+    /// renames a partition column or a column listed in `delta.dataSkippingStatsColumns`, drops a
+    /// clustering column, renames a collated field, adds a non-nullable field or a field with a
+    /// default value, or changes protocol-defined field metadata such as generation expressions,
+    /// invariants, or defaults. It cannot be combined with
     /// [`add_column`](Self::add_column), [`add_column_at`](Self::add_column_at), or
     /// [`set_nullable`](Self::set_nullable) in the same transaction.
     pub fn with_updated_schema(mut self, schema: SchemaRef) -> Self {
@@ -880,12 +884,9 @@ mod tests {
             1
         );
         let result = builder.build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
-        if let Some(feature) = feature.filter(|_| feature_enabled) {
-            assert!(
-                snapshot
-                    .table_configuration()
-                    .is_feature_supported(&feature)
-            );
+        if let Some(feature) = feature
+            .filter(|feature| feature_enabled && *feature == TableFeature::AllowColumnDefaults)
+        {
             assert!(snapshot.table_configuration().is_feature_enabled(&feature));
             let error = result.unwrap_err();
             let expected =

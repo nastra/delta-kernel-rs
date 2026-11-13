@@ -1266,3 +1266,317 @@ async fn updated_schema_keeps_type_change_history_through_a_rename() -> delta_ke
     );
     Ok(())
 }
+
+// === IcebergCompat ===
+
+/// Table properties that enable `compat` (`icebergCompatV2` or `icebergCompatV3`).
+fn iceberg_compat_properties(compat: &str) -> Vec<(&'static str, &'static str)> {
+    let mut properties = vec![("delta.columnMapping.mode", "name")];
+    match compat {
+        "icebergCompatV2" => properties.push(("delta.enableIcebergCompatV2", "true")),
+        "icebergCompatV3" => properties.extend([
+            ("delta.enableIcebergCompatV3", "true"),
+            ("delta.enableRowTracking", "true"),
+        ]),
+        _ => panic!("unexpected IcebergCompat version {compat}"),
+    }
+    properties
+}
+
+fn create_iceberg_compat_table(
+    table_path: &str,
+    engine: &dyn Engine,
+    compat: &str,
+) -> delta_kernel::Result<SnapshotRef> {
+    create(
+        table_path,
+        engine,
+        container_schema(),
+        &iceberg_compat_properties(compat),
+        None,
+    )
+}
+
+fn nested_ids(field: &StructField) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    match field.get_config_value(&ColumnMetadataKey::ColumnMappingNestedIds)? {
+        MetadataValue::Other(serde_json::Value::Object(ids)) => Some(ids),
+        other => panic!("unexpected nested ids {other:?}"),
+    }
+}
+
+/// Returns the nested ids of `field` as (path relative to its physical name, id) pairs.
+fn relative_nested_ids(field: &StructField) -> Vec<(String, i64)> {
+    let MetadataValue::String(physical_name) = physical_name(field) else {
+        panic!("physical name of '{}' is not a string", field.name());
+    };
+    let mut ids: Vec<_> = nested_ids(field)
+        .into_iter()
+        .flatten()
+        .map(|(path, id)| {
+            let path = path.strip_prefix(physical_name.as_str()).unwrap();
+            (path.to_string(), id.as_i64().unwrap())
+        })
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Returns every column-mapping id and nested id in `schema`.
+fn all_column_ids(schema: &StructType) -> Vec<i64> {
+    fn collect_in_type(data_type: &DataType, ids: &mut Vec<i64>) {
+        match data_type {
+            DataType::Struct(inner) => ids.extend(all_column_ids(inner)),
+            DataType::Array(array) => collect_in_type(array.element_type(), ids),
+            DataType::Map(map) => {
+                collect_in_type(map.key_type(), ids);
+                collect_in_type(map.value_type(), ids);
+            }
+            _ => {}
+        }
+    }
+    let mut ids = Vec::new();
+    for field in schema.fields() {
+        ids.extend(field.column_mapping_id());
+        ids.extend(
+            nested_ids(field)
+                .into_iter()
+                .flatten()
+                .map(|(_, id)| id.as_i64().unwrap()),
+        );
+        collect_in_type(field.data_type(), &mut ids);
+    }
+    ids
+}
+
+#[rstest]
+#[tokio::test]
+async fn updated_schema_assigns_nested_ids_on_iceberg_compat_tables(
+    #[values("icebergCompatV2", "icebergCompatV3")] compat: &str,
+) -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_iceberg_compat_table(&table_path, engine.as_ref(), compat)?;
+    let old_schema = snapshot.schema();
+    let old_max_id = max_column_id(&snapshot);
+    assert_eq!(
+        all_column_ids(&old_schema).into_iter().max(),
+        Some(old_max_id)
+    );
+
+    // Add a field to the struct in the existing `tags` array.
+    let mut tags = field(&old_schema, "tags");
+    let DataType::Array(tags_type) = tags.data_type().clone() else {
+        unreachable!()
+    };
+    let DataType::Struct(tag) = tags_type.element_type().clone() else {
+        unreachable!()
+    };
+    let tag = with_fields(appended(
+        &tag,
+        StructField::nullable("weight", DataType::INTEGER),
+    ));
+    tags.data_type = ArrayType::new(tag, true).into();
+    let address = with_fields([
+        StructField::nullable("city", DataType::STRING),
+        StructField::nullable("codes", ArrayType::new(DataType::STRING, true)),
+    ]);
+    let props = MapType::new(
+        DataType::STRING,
+        ArrayType::new(DataType::INTEGER, true),
+        true,
+    );
+    let updated = with_fields([
+        tags,
+        field(&old_schema, "scores"),
+        field(&old_schema, "attrs"),
+        StructField::nullable("name", DataType::STRING),
+        StructField::nullable("address", address),
+        StructField::nullable("events", ArrayType::new(DataType::LONG, true)),
+        StructField::nullable("props", props),
+    ]);
+    update_schema(&snapshot, engine.as_ref(), updated)?;
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let schema = reloaded.schema();
+    for name in ["tags", "scores", "attrs"] {
+        assert_eq!(
+            nested_ids(&field(&schema, name)),
+            nested_ids(&field(&old_schema, name)),
+            "nested ids of existing field '{name}'"
+        );
+    }
+    let new_slot_ids = |field: &StructField| {
+        let ids = relative_nested_ids(field);
+        assert!(ids.iter().all(|(_, id)| *id > old_max_id), "{ids:?}");
+        ids.into_iter().map(|(path, _)| path).collect::<Vec<_>>()
+    };
+    assert_eq!(new_slot_ids(&field(&schema, "events")), [".element"]);
+    assert_eq!(
+        new_slot_ids(&field(&schema, "props")),
+        [".key", ".value", ".value.element"]
+    );
+    let DataType::Struct(address) = field(&schema, "address").data_type().clone() else {
+        unreachable!()
+    };
+    assert_eq!(nested_ids(&field(&schema, "address")), None);
+    assert_eq!(new_slot_ids(&field(&address, "codes")), [".element"]);
+    assert_eq!(nested_ids(&field(&schema, "name")), None);
+
+    let ids = all_column_ids(&schema);
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(unique.len(), ids.len(), "duplicate ids in {ids:?}");
+    assert_eq!(ids.into_iter().max(), Some(max_column_id(&reloaded)));
+    assert!(
+        reloaded
+            .table_configuration()
+            .is_feature_enabled(&compat.parse::<TableFeature>().unwrap())
+    );
+    if compat == "icebergCompatV3" {
+        // Row tracking stays enabled with the same materialized column names.
+        let (before, after) = (snapshot.table_properties(), reloaded.table_properties());
+        assert_eq!(after.enable_row_tracking, Some(true));
+        assert!(before.materialized_row_id_column_name.is_some());
+        assert_eq!(
+            after.materialized_row_id_column_name,
+            before.materialized_row_id_column_name
+        );
+        assert_eq!(
+            after.materialized_row_commit_version_column_name,
+            before.materialized_row_commit_version_column_name
+        );
+    }
+    // The reloaded table accepts further writes.
+    reloaded
+        .update_table(UpdateTableOperation::Write, "test-engine", true)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    Ok(())
+}
+
+#[rstest]
+#[tokio::test]
+async fn updated_schema_keeps_nested_ids_through_rename_drop_and_reorder(
+    #[values("icebergCompatV2", "icebergCompatV3")] compat: &str,
+) -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_iceberg_compat_table(&table_path, engine.as_ref(), compat)?;
+    let old_schema = snapshot.schema();
+    let updated = with_fields([
+        field(&old_schema, "attrs").with_name("attributes"),
+        field(&old_schema, "tags"),
+    ]);
+    let committed = update_schema(&snapshot, engine.as_ref(), updated)?;
+
+    let schema = committed.schema();
+    assert_eq!(
+        nested_ids(&field(&schema, "attributes")),
+        nested_ids(&field(&old_schema, "attrs"))
+    );
+    assert_eq!(
+        nested_ids(&field(&schema, "tags")),
+        nested_ids(&field(&old_schema, "tags"))
+    );
+    assert_eq!(max_column_id(&committed), max_column_id(&snapshot));
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(reloaded.schema(), schema);
+    Ok(())
+}
+
+fn with_nested_ids(field: StructField, ids: serde_json::Value) -> StructField {
+    field.add_metadata([(
+        ColumnMetadataKey::ColumnMappingNestedIds.as_ref(),
+        MetadataValue::Other(ids),
+    )])
+}
+
+#[rstest]
+#[case::change_id(|s: &StructType| {
+    let attrs = field(s, "attrs");
+    let mut ids = nested_ids(&attrs).unwrap().clone();
+    let key = ids.keys().next().unwrap().clone();
+    ids.insert(key, 1000.into());
+    retype_with(s, "attrs", with_nested_ids(attrs, ids.into()))
+})]
+#[case::remove(|s: &StructType| {
+    let mut scores = field(s, "scores");
+    scores.metadata.remove(ColumnMetadataKey::ColumnMappingNestedIds.as_ref());
+    retype_with(s, "scores", scores)
+})]
+#[case::add_entry(|s: &StructType| {
+    let MetadataValue::String(name) = physical_name(&field(s, "tags")).clone() else {
+        unreachable!()
+    };
+    let tags = field(s, "tags");
+    let mut ids = nested_ids(&tags).unwrap().clone();
+    ids.insert(format!("{name}.extra"), 1000.into());
+    retype_with(s, "tags", with_nested_ids(tags, ids.into()))
+})]
+#[tokio::test]
+async fn updated_schema_rejects_changing_nested_ids(
+    #[case] edit: SchemaEdit,
+    #[values("icebergCompatV2", "icebergCompatV3")] compat: &str,
+) -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_iceberg_compat_table(&table_path, engine.as_ref(), compat)?;
+    let updated = with_fields(edit(&snapshot.schema()));
+    assert_update_rejected(
+        &snapshot,
+        engine.as_ref(),
+        updated,
+        "Cannot change `delta.columnMapping.nested.ids` of existing field",
+    );
+    Ok(())
+}
+
+/// Returns the fields of `schema` with the field named `name` replaced by `replacement`.
+fn retype_with(schema: &StructType, name: &str, replacement: StructField) -> Vec<StructField> {
+    schema
+        .fields()
+        .map(|f| {
+            if f.name() == name {
+                replacement.clone()
+            } else {
+                f.clone()
+            }
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn updated_schema_rejects_nested_ids_on_a_new_field() -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_iceberg_compat_table(&table_path, engine.as_ref(), "icebergCompatV2")?;
+    let added = with_nested_ids(
+        StructField::nullable("events", ArrayType::new(DataType::LONG, true)),
+        serde_json::json!({ "events.element": 1000 }),
+    );
+    assert_update_rejected(
+        &snapshot,
+        engine.as_ref(),
+        with_fields(appended(&snapshot.schema(), added)),
+        "pre-populated `delta.columnMapping.nested.ids` metadata",
+    );
+    Ok(())
+}
+
+#[rstest]
+#[case::v2_variant("icebergCompatV2", DataType::unshredded_variant())]
+#[case::v2_variant_in_array(
+    "icebergCompatV2",
+    ArrayType::new(DataType::unshredded_variant(), true).into()
+)]
+#[case::v3_void("icebergCompatV3", DataType::VOID)]
+#[tokio::test]
+async fn updated_schema_rejects_types_iceberg_compat_does_not_support(
+    #[case] compat: &str,
+    #[case] data_type: DataType,
+) -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_iceberg_compat_table(&table_path, engine.as_ref(), compat)?;
+    let added = StructField::nullable("unsupported", data_type);
+    assert_update_rejected(
+        &snapshot,
+        engine.as_ref(),
+        with_fields(appended(&snapshot.schema(), added)),
+        &format!("{compat} does not support type at column: unsupported"),
+    );
+    Ok(())
+}

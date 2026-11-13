@@ -86,7 +86,8 @@ pub(super) struct PreparedUpdateTableMetadata {
 ///
 /// Enabling column mapping mode `name` on a table without column mapping assigns ids to the
 /// existing fields and uses their current names as physical names, since existing data files were
-/// written with those names.
+/// written with those names. With `icebergCompatV2` or `icebergCompatV3` enabled, array and map
+/// slots without `delta.columnMapping.nested.ids` entries get them.
 ///
 /// Rejected transitions on existing tables: column mapping mode changes other than `none` ->
 /// `name`, a column mapping mode change combined with schema changes, enabling or disabling row
@@ -143,6 +144,7 @@ pub(super) fn prepare_update_table_metadata(
     configuration.extend(requested.properties.drain());
     configuration.retain(|key, _| !property_keys_removed.contains(key));
     validate_transitions(read_config, &configuration, has_schema_changes)?;
+    let evolved_schema = schema.clone();
     let new_mode = get_column_mapping_mode_from_properties(&configuration)?;
     let enables_column_mapping =
         get_column_mapping_mode_from_properties(read_config.metadata().configuration())?
@@ -151,21 +153,15 @@ pub(super) fn prepare_update_table_metadata(
         schema = assign_column_mapping_to_existing_fields(&schema, &mut configuration)?;
     }
     // Like Java's `rewriteFieldIdsForIceberg`, IcebergCompat requires ids for the array element and
-    // map key/value slots of a column-mapped schema.
-    let iceberg_compat_enabled = |configuration: &HashMap<String, String>| {
-        [ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3]
-            .iter()
-            .any(|key| configuration.get(*key).map(String::as_str) == Some("true"))
-    };
-    let enables_iceberg_compat = iceberg_compat_enabled(&configuration)
-        && !iceberg_compat_enabled(read_config.metadata().configuration());
-    if new_mode != ColumnMappingMode::None
-        && iceberg_compat_enabled(&configuration)
-        && (enables_column_mapping || enables_iceberg_compat)
-    {
+    // map key/value slots of a column-mapped schema. Slots that already have an id keep it, so this
+    // only assigns ids to slots that are new or that a non-conforming writer left without one.
+    let iceberg_compat_enabled = [ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3]
+        .iter()
+        .any(|key| configuration.get(*key).map(String::as_str) == Some("true"));
+    if new_mode != ColumnMappingMode::None && iceberg_compat_enabled {
         schema = assign_iceberg_compat_nested_ids(&schema, &mut configuration)?;
     }
-    if enables_column_mapping || enables_iceberg_compat {
+    if schema != evolved_schema {
         evolved_metadata = evolved_metadata.with_schema(schema.clone())?;
     }
     let explicit_ict = properties_added
@@ -303,14 +299,6 @@ fn is_already_supported(table_config: &TableConfiguration, feature: &TableFeatur
 
 /// Rejects tables whose schema Kernel cannot yet evolve.
 fn ensure_schema_changes_supported(table_config: &TableConfiguration) -> KernelResult<()> {
-    let unsupported_iceberg_compat = [TableFeature::IcebergCompatV2, TableFeature::IcebergCompatV3]
-        .into_iter()
-        .find(|feature| table_config.is_feature_enabled(feature));
-    if let Some(feature) = unsupported_iceberg_compat {
-        return Err(KernelError::unsupported(format!(
-            "Schema changes are not yet supported on tables with {feature} enabled"
-        )));
-    }
     if table_config.is_feature_enabled(&TableFeature::AllowColumnDefaults) {
         return Err(KernelError::unsupported(
             "Schema changes are not yet supported on tables with allowColumnDefaults enabled",
@@ -1207,6 +1195,79 @@ mod tests {
                 .column_mapping_max_column_id,
             Some(9)
         );
+    }
+
+    #[rstest]
+    fn property_update_assigns_missing_nested_ids_on_iceberg_compat_table(
+        #[values(false, true)] missing: bool,
+    ) {
+        let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let schema = Arc::new(
+            StructType::try_new([StructField::nullable(
+                "tags",
+                ArrayType::new(DataType::STRING, true),
+            )])
+            .unwrap(),
+        );
+        let snapshot = create_table("memory:///", schema, "test", true)
+            .with_table_properties([(ENABLE_ICEBERG_COMPAT_V2, "true")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap()
+            .commit(engine.as_ref())
+            .unwrap()
+            .unwrap_post_commit_snapshot();
+        let created_schema = snapshot.schema();
+        let created_max_id = snapshot
+            .table_properties()
+            .column_mapping_max_column_id
+            .unwrap();
+        // A non-conforming writer can leave a slot without a nested id.
+        let snapshot = if missing {
+            let read_config = snapshot.table_configuration();
+            let mut tags = created_schema.field("tags").unwrap().clone();
+            tags.metadata
+                .remove(ColumnMetadataKey::ColumnMappingNestedIds.as_ref());
+            let stripped = Arc::new(StructType::try_new([tags]).unwrap());
+            let metadata = read_config
+                .metadata()
+                .clone()
+                .with_schema(stripped.clone())
+                .unwrap();
+            let read_config =
+                TableConfiguration::try_new_with_schema(read_config, metadata, stripped).unwrap();
+            with_table_config(&snapshot, read_config)
+        } else {
+            with_table_config(&snapshot, snapshot.table_configuration().clone())
+        };
+
+        let prepared = prepare(
+            engine.as_ref(),
+            &snapshot,
+            properties_request(&[("user.key", "value")]),
+        )
+        .unwrap();
+
+        let schema = prepared.table_config.logical_schema();
+        let tags = schema.field("tags").unwrap();
+        let Some(MetadataValue::Other(serde_json::Value::Object(ids))) =
+            tags.get_config_value(&ColumnMetadataKey::ColumnMappingNestedIds)
+        else {
+            panic!("tags must have nested ids: {tags:?}");
+        };
+        let ids: Vec<_> = ids.values().map(|id| id.as_i64().unwrap()).collect();
+        let max_id = prepared
+            .table_config
+            .table_properties()
+            .column_mapping_max_column_id
+            .unwrap();
+        if missing {
+            // `maxColumnId` still covers the removed id, so the slot gets a fresh one.
+            assert_eq!(ids, [created_max_id + 1]);
+            assert_eq!(max_id, created_max_id + 1);
+        } else {
+            assert_eq!(schema, created_schema);
+            assert_eq!(max_id, created_max_id);
+        }
     }
 
     #[test]

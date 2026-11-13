@@ -1678,12 +1678,10 @@ async fn add_column_strip_is_none_mode_only(
 }
 
 #[rstest]
-#[case::v2("delta.enableIcebergCompatV2", "icebergCompatV2")]
-#[case::v3("delta.enableIcebergCompatV3", "icebergCompatV3")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn schema_changes_blocked_when_iceberg_compat_enabled(
-    #[case] enablement_property: &str,
-    #[case] feature_name: &str,
+async fn add_column_assigns_nested_ids_when_iceberg_compat_enabled(
+    #[values("delta.enableIcebergCompatV2", "delta.enableIcebergCompatV3")]
+    enablement_property: &str,
     #[values(
         UpdateTableOperation::Write,
         UpdateTableOperation::AlterTable,
@@ -1698,24 +1696,82 @@ async fn schema_changes_blocked_when_iceberg_compat_enabled(
         engine.as_ref(),
         &[(enablement_property, "true")],
     )?;
+    let old_max_id = snapshot
+        .table_properties()
+        .column_mapping_max_column_id
+        .unwrap();
 
-    let msg = snapshot
+    let committed = snapshot
         .update_table(
             operation.clone(),
             "test-engine",
             operation != UpdateTableOperation::AlterTable,
         )
-        .add_column(StructField::nullable("new_col", DataType::STRING))
-        .build(engine.as_ref(), committer())
-        .unwrap_err()
-        .to_string();
-    assert!(
-        msg.contains(&format!(
-            "Schema changes are not yet supported on tables with {feature_name} enabled"
-        )),
-        "unexpected error: {msg}",
-    );
+        .add_column(StructField::nullable(
+            "tags",
+            ArrayType::new(DataType::STRING, true),
+        ))
+        .add_column(StructField::nullable(
+            "attrs",
+            MapType::new(DataType::STRING, DataType::INTEGER, true),
+        ))
+        .add_column(StructField::nullable(
+            "s",
+            schema! { nullable "a": INTEGER },
+        ))
+        .add_column_at(
+            column_name!("s"),
+            StructField::nullable("scores", ArrayType::new(DataType::LONG, true)),
+        )
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
 
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(reloaded.schema(), committed.schema());
+    let schema = reloaded.schema();
+    let DataType::Struct(s) = schema.field("s").unwrap().data_type().clone() else {
+        panic!("'s' must be a struct");
+    };
+    let mut slot_ids = Vec::new();
+    for (field, slots) in [
+        (schema.field("tags").unwrap(), &[".element"][..]),
+        (schema.field("attrs").unwrap(), &[".key", ".value"][..]),
+        (s.field("scores").unwrap(), &[".element"][..]),
+    ] {
+        let Some(MetadataValue::String(physical_name)) =
+            field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
+        else {
+            panic!("'{}' must have a physical name", field.name());
+        };
+        let Some(MetadataValue::Other(serde_json::Value::Object(ids))) =
+            field.get_config_value(&ColumnMetadataKey::ColumnMappingNestedIds)
+        else {
+            panic!("'{}' must have nested ids", field.name());
+        };
+        let mut paths: Vec<_> = ids.keys().cloned().collect();
+        paths.sort();
+        let expected: Vec<_> = slots
+            .iter()
+            .map(|slot| format!("{physical_name}{slot}"))
+            .collect();
+        assert_eq!(paths, expected);
+        slot_ids.extend(ids.values().map(|id| id.as_i64().unwrap()));
+    }
+    let new_max_id = reloaded
+        .table_properties()
+        .column_mapping_max_column_id
+        .unwrap();
+    assert!(
+        slot_ids
+            .iter()
+            .all(|id| *id > old_max_id && *id <= new_max_id)
+    );
+    assert_eq!(
+        slot_ids.iter().collect::<HashSet<_>>().len(),
+        slot_ids.len()
+    );
+    assert_eq!(slot_ids.into_iter().max(), Some(new_max_id));
     Ok(())
 }
 

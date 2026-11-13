@@ -518,9 +518,6 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
 ///
 /// Spec: <https://github.com/delta-io/delta/blob/master/protocol_rfcs/iceberg-compat-v3.md>
 ///
-/// TODO(#2492): Implement the schema-evolution requirements for IcebergCompatV3.
-/// TODO: Support ALTER TABLE on tables with IcebergCompatV3 enabled.
-///
 /// Requirements to enforce when the corresponding write paths are supported:
 /// - Geo types: when supported, they must not be usable as partition columns on IcebergCompatV3
 ///   tables.
