@@ -4,8 +4,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{Array, AsArray as _, Int32Array, StringArray};
-use delta_kernel::arrow::datatypes::Int32Type;
+use delta_kernel::arrow::datatypes::{Float64Type, Int32Type, Int64Type, Schema as ArrowSchema};
+use delta_kernel::arrow::json::ReaderBuilder;
 use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::arrow::util::display::array_value_to_string;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::Scalar;
@@ -896,9 +898,7 @@ async fn updated_schema_widens_types_and_records_type_changes() -> delta_kernel:
         ])))
     );
     let batches = read_scan(&reloaded.scan_builder().build()?, engine.clone())?;
-    let ids = batches[0]
-        .column(0)
-        .as_primitive::<delta_kernel::arrow::datatypes::Int64Type>();
+    let ids = batches[0].column(0).as_primitive::<Int64Type>();
     assert_eq!(ids.values(), &[1, 2]);
     Ok(())
 }
@@ -913,6 +913,11 @@ async fn updated_schema_records_nested_and_container_type_changes() -> delta_ker
         &[("delta.columnMapping.mode", "name"), TYPE_WIDENING],
         None,
     )?;
+    let batch = batch_from_json(
+        &snapshot,
+        r#"{"i": 1, "s": "a", "scores": [1, 2], "address": {"zip": 7}}"#,
+    );
+    let snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
     let old_schema = snapshot.schema();
     let mut address = field(&old_schema, "address");
     let DataType::Struct(address_type) = address.data_type().clone() else {
@@ -950,7 +955,68 @@ async fn updated_schema_records_nested_and_container_type_changes() -> delta_ker
     );
     assert_eq!(type_changes(&field(&schema, "address")), None);
     assert_eq!(type_changes(&field(&schema, "i")), None);
+
+    // Values written before the widening read back as the wider types.
+    let batches = read_scan(&committed.scan_builder().build()?, engine.clone())?;
+    let scores = batches[0].column(2).as_list::<i32>().value(0);
+    assert_eq!(scores.as_primitive::<Float64Type>().values(), &[1.0, 2.0]);
+    let address = batches[0].column(3).as_struct();
+    assert_eq!(address.column(0).as_primitive::<Int32Type>().value(0), 7);
     Ok(())
+}
+
+#[tokio::test]
+async fn updated_schema_widens_map_keys_and_values() -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create(
+        &table_path,
+        engine.as_ref(),
+        Arc::new(StructType::try_new([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("m", MapType::new(DataType::INTEGER, DataType::FLOAT, true)),
+        ])?),
+        &[("delta.columnMapping.mode", "name"), TYPE_WIDENING],
+        None,
+    )?;
+    let batch = batch_from_json(&snapshot, r#"{"id": 1, "m": {"3": 1.5}}"#);
+    let snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
+    let old_schema = snapshot.schema();
+    let updated = with_fields([
+        field(&old_schema, "id"),
+        StructField {
+            data_type: MapType::new(DataType::LONG, DataType::DOUBLE, true).into(),
+            ..field(&old_schema, "m")
+        },
+    ]);
+    update_schema(&snapshot, engine.as_ref(), updated)?;
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(
+        type_changes(&field(&reloaded.schema(), "m")),
+        Some(&MetadataValue::Other(serde_json::json!([
+            { "fromType": "integer", "toType": "long", "fieldPath": "key" },
+            { "fromType": "float", "toType": "double", "fieldPath": "value" }
+        ])))
+    );
+    let batches = read_scan(&reloaded.scan_builder().build()?, engine.clone())?;
+    let entries = batches[0].column(1).as_map().value(0);
+    assert_eq!(entries.column(0).as_primitive::<Int64Type>().values(), &[3]);
+    assert_eq!(
+        entries.column(1).as_primitive::<Float64Type>().values(),
+        &[1.5]
+    );
+    Ok(())
+}
+
+/// Decodes `rows` (one JSON object per line) into a batch with the table's Arrow schema.
+fn batch_from_json(snapshot: &Snapshot, rows: &str) -> RecordBatch {
+    let schema: ArrowSchema = snapshot.schema().as_ref().try_into_arrow().unwrap();
+    ReaderBuilder::new(Arc::new(schema))
+        .build(std::io::Cursor::new(rows))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
 }
 
 #[tokio::test]
@@ -1100,44 +1166,45 @@ fn retype(schema: &StructType, name: &str, data_type: DataType) -> Vec<StructFie
 }
 
 #[rstest]
-#[case::integer_to_long(DataType::INTEGER, Scalar::Integer(7), DataType::LONG, None)]
-#[case::integer_to_double(DataType::INTEGER, Scalar::Integer(7), DataType::DOUBLE, None)]
+#[case::integer_to_long(DataType::INTEGER, Scalar::Integer(7), DataType::LONG, Ok("7"))]
+#[case::integer_to_double(DataType::INTEGER, Scalar::Integer(7), DataType::DOUBLE, Ok("7.0"))]
 #[case::integer_to_decimal_same_scale(
     DataType::INTEGER,
     Scalar::Integer(7),
     DataType::decimal(12, 0).unwrap(),
-    None
+    Ok("7")
 )]
 #[case::decimal_precision(
     DataType::decimal(5, 2).unwrap(),
     Scalar::decimal(150, 5, 2).unwrap(),
     DataType::decimal(10, 2).unwrap(),
-    None
+    Ok("1.50")
 )]
 #[case::integer_to_decimal(
     DataType::INTEGER,
     Scalar::Integer(7),
     DataType::decimal(12, 2).unwrap(),
-    Some("Cannot change the type of partition column 'p' from integer to decimal(12,2)")
+    Err("Cannot change the type of partition column 'p' from integer to decimal(12,2)")
 )]
 #[case::decimal_scale(
     DataType::decimal(5, 2).unwrap(),
     Scalar::decimal(150, 5, 2).unwrap(),
     DataType::decimal(8, 4).unwrap(),
-    Some("Cannot change the type of partition column 'p' from decimal(5,2) to decimal(8,4)")
+    Err("Cannot change the type of partition column 'p' from decimal(5,2) to decimal(8,4)")
 )]
 #[case::date_to_timestamp_ntz(
     DataType::DATE,
     Scalar::Date(18000),
     DataType::TIMESTAMP_NTZ,
-    Some("Cannot change the type of partition column 'p' from date to timestamp_ntz")
+    Err("Cannot change the type of partition column 'p' from date to timestamp_ntz")
 )]
 #[tokio::test]
 async fn updated_schema_widens_partition_columns_only_when_values_stay_readable(
     #[case] from: DataType,
     #[case] value: Scalar,
     #[case] to: DataType,
-    #[case] expected_error: Option<&str>,
+    // The partition value read back after the widening, or the rejection message.
+    #[case] expected: Result<&str, &str>,
 ) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot = create(
@@ -1166,12 +1233,12 @@ async fn updated_schema_widens_partition_columns_only_when_values_stay_readable(
         write_batch_to_table(&snapshot, engine.as_ref(), batch, partition_values).await?;
     let updated = with_fields(retype(&snapshot.schema(), "p", to.clone()));
     let result = update_schema(&snapshot, engine.as_ref(), updated);
-    match expected_error {
-        Some(expected) => {
+    match expected {
+        Err(expected) => {
             assert_result_error_with_message(result, expected);
             assert_nothing_committed(&snapshot, engine.as_ref());
         }
-        None => {
+        Ok(expected_value) => {
             let committed = result?;
             let batches = read_scan(&committed.scan_builder().build()?, engine.clone())?;
             let partition = batches[0].column(1);
@@ -1179,6 +1246,10 @@ async fn updated_schema_widens_partition_columns_only_when_values_stay_readable(
             assert_eq!(
                 partition.data_type(),
                 &(&to).try_into_arrow().map_err(KernelError::from)?
+            );
+            assert_eq!(
+                array_value_to_string(partition, 0).map_err(KernelError::from)?,
+                expected_value
             );
         }
     }
