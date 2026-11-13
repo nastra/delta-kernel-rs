@@ -11,7 +11,6 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
-use itertools::Itertools;
 use url::Url;
 use uuid::Uuid;
 
@@ -24,7 +23,9 @@ use super::metadata_derivation::{
 };
 use super::state::TransactionBuilderState;
 use crate::actions::{DomainMetadata, Metadata, Protocol};
-use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
+#[cfg(test)]
+use crate::clustering::validate_clustering_columns;
+use crate::clustering::{create_clustering_domain_metadata, resolve_physical_clustering_columns};
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
@@ -36,9 +37,8 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     ColumnMappingMode, IcebergCompatValidationContext, TableFeature, V2_VALIDATOR,
     add_feature_to_lists, assign_column_mapping_metadata, ensure_domain_metadata_dependency,
-    find_max_column_id_in_schema, get_any_level_column_physical_name,
-    get_column_mapping_mode_from_properties, strip_stray_column_mapping_metadata,
-    validate_iceberg_compat_if_needed,
+    find_max_column_id_in_schema, get_column_mapping_mode_from_properties,
+    strip_stray_column_mapping_metadata, validate_iceberg_compat_if_needed,
 };
 #[cfg(any(test, feature = "adaptive-metadata-in-dev"))]
 use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
@@ -145,9 +145,10 @@ struct DataLayoutResult {
 
 /// Validates partition columns against the table schema.
 ///
-/// Similar to [`validate_clustering_columns`] (duplicate check, schema lookup), but with
-/// stricter constraints: partition columns must be top-level and primitive-typed, while
-/// clustering columns may be nested and accept all stats-eligible types.
+/// Similar to [`validate_clustering_columns`](crate::clustering::validate_clustering_columns)
+/// (duplicate check, schema lookup), but with stricter constraints: partition columns must be
+/// top-level and primitive-typed, while clustering columns may be nested and accept all
+/// stats-eligible types.
 ///
 /// Partition columns must be:
 /// 1. Top-level columns (nested paths are not supported)
@@ -223,18 +224,11 @@ fn apply_data_layout(
         DataLayout::None => Ok(DataLayoutResult::default()),
 
         DataLayout::Clustered { columns } => {
-            // Normalize clustering column names to match schema casing. This allows users
-            // to specify clustering columns case-insensitively (e.g. schema has columns
-            // "A", "B", "C" and user clusters by "c", "a").
-            let normalized = normalize_column_names_to_schema_casing(effective_schema, columns);
-            validate_clustering_columns(effective_schema, &normalized)?;
-
-            let physical_columns: Vec<ColumnName> = normalized
-                .iter()
-                .map(|c| {
-                    get_any_level_column_physical_name(effective_schema, c, column_mapping_mode)
-                })
-                .try_collect()?;
+            let physical_columns = resolve_physical_clustering_columns(
+                effective_schema,
+                columns,
+                column_mapping_mode,
+            )?;
 
             add_feature_to_lists(
                 TableFeature::ClusteredTable,
