@@ -1,22 +1,25 @@
 //! Builder for transactions against an existing table.
 
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 
 use delta_kernel_derive::internal_api;
 
 use super::TransactionBuilder;
 use super::state::TransactionBuilderState;
+use super::update_metadata::{
+    PreparedUpdateTableMetadata, UpdateTableMetadataRequest, prepare_update_table_metadata,
+};
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
-use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    IcebergCompatValidationContext, Operation, TableFeature, V2_VALIDATOR, V3_VALIDATOR,
+    IcebergCompatValidationContext, Operation, V2_VALIDATOR, V3_VALIDATOR,
     validate_iceberg_compat_if_needed,
 };
 use crate::transaction::domain_metadata::validate_unique_domains;
-use crate::transaction::schema_evolution::{SchemaOperation, evolve_table_config};
+use crate::transaction::schema_evolution::SchemaOperation;
 use crate::transaction::{
     ExecutionMode, Imperative, Transaction, UpdateTable, UpdateTableOperation,
 };
@@ -44,6 +47,10 @@ use crate::{Engine, KernelError, KernelResult};
 /// them. For schema evolution, stage data-file changes on the returned [`Transaction`], using the
 /// evolved schema provided by [`Transaction::write_state`].
 ///
+/// When the evolved schema contains a type or annotation whose table feature the protocol does not
+/// support, such as `timestampNtz`, `variantType`, or `collations`, `build()` adds the feature and
+/// the commit includes a Protocol action. Existing protocol features are always retained.
+///
 /// Set `data_change` when constructing the builder: `true` for logical data changes, or `false`
 /// for metadata-only changes and data-preserving rewrites. `ALTER TABLE` requires `false`, while
 /// blind append requires `true`. [`build`](UpdateTableTransactionBuilder::build) rejects
@@ -59,6 +66,10 @@ pub struct UpdateTableBuilderState {
     snapshot: SnapshotRef,
     operation: UpdateTableOperation,
     schema_changes: Option<Vec<SchemaOperation>>,
+    // Configuration overrides for the shared update preparation path. No public setter populates
+    // these yet.
+    properties_added: HashMap<String, String>,
+    property_keys_removed: HashSet<String>,
     domain_metadata_removals: Vec<String>,
     is_blind_append: bool,
 }
@@ -89,6 +100,8 @@ impl TransactionBuilder<UpdateTable> {
                 snapshot,
                 operation,
                 schema_changes: None,
+                properties_added: HashMap::new(),
+                property_keys_removed: HashSet::new(),
                 domain_metadata_removals: Vec::new(),
                 is_blind_append: false,
             },
@@ -234,9 +247,12 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
             .validate()
             .map_err(KernelError::invalid_transaction_state)?;
         if operation == &UpdateTableOperation::AlterTable {
-            if self.local_state.schema_changes.is_none() {
+            if self.local_state.schema_changes.is_none()
+                && self.local_state.properties_added.is_empty()
+                && self.local_state.property_keys_removed.is_empty()
+            {
                 return Err(KernelError::invalid_transaction_state(
-                    "ALTER TABLE requires at least one schema change",
+                    "ALTER TABLE requires at least one metadata change",
                 ));
             }
             if self.local_state.is_blind_append {
@@ -300,6 +316,8 @@ fn try_new_update_table<MODE: ExecutionMode>(
         snapshot: read_snapshot,
         operation,
         schema_changes,
+        properties_added,
+        property_keys_removed,
         domain_metadata_removals,
         is_blind_append,
     } = local_state;
@@ -314,8 +332,7 @@ fn try_new_update_table<MODE: ExecutionMode>(
     // formulas.
 
     // TODO(#3240): Validate that delta.enableRowTracking=true has the required protocol support
-    // and materialized column-name properties. Materialized names must be distinct and must not
-    // collide with physical data columns.
+    // and that the materialized column names are distinct.
 
     // Read clustering columns from snapshot (returns None if clustering not enabled)
     let clustering_columns = read_snapshot
@@ -330,29 +347,35 @@ fn try_new_update_table<MODE: ExecutionMode>(
         read_version = read_snapshot.version(),
     );
 
-    let effective_table_config = read_snapshot.table_configuration().clone();
-
+    let read_table_config = read_snapshot.table_configuration();
     validate_iceberg_compat_if_needed(
-        &effective_table_config,
+        read_table_config,
         &V2_VALIDATOR,
         IcebergCompatValidationContext::Write,
     )?;
-
     validate_iceberg_compat_if_needed(
-        &effective_table_config,
+        read_table_config,
         &V3_VALIDATOR,
         IcebergCompatValidationContext::Write,
     )?;
 
-    let should_emit_metadata = schema_changes.is_some();
-    let effective_table_config = match schema_changes {
-        Some(changes) => apply_schema_changes(effective_table_config, changes)?,
-        None => effective_table_config,
+    let request = UpdateTableMetadataRequest {
+        schema_changes,
+        properties_added,
+        property_keys_removed,
     };
+    let has_metadata_request = !request.is_empty();
+    let PreparedUpdateTableMetadata {
+        table_config: effective_table_config,
+        should_emit_metadata,
+        should_emit_protocol,
+    } = prepare_update_table_metadata(&read_snapshot, request, commit_timestamp, engine)?;
 
     Ok(Transaction {
         read_snapshot_opt: Some(read_snapshot),
         should_emit_metadata,
+        should_emit_protocol,
+        has_metadata_request,
         user_domain_removals: domain_metadata_removals,
         is_blind_append,
         physical_clustering_columns: clustering_columns,
@@ -365,33 +388,6 @@ fn try_new_update_table<MODE: ExecutionMode>(
             commit_timestamp,
         )
     })
-}
-
-fn apply_schema_changes(
-    table_config: TableConfiguration,
-    changes: Vec<SchemaOperation>,
-) -> KernelResult<TableConfiguration> {
-    let unsupported_iceberg_compat = [TableFeature::IcebergCompatV2, TableFeature::IcebergCompatV3]
-        .into_iter()
-        .find(|feature| table_config.is_feature_enabled(feature));
-    if let Some(feature) = unsupported_iceberg_compat {
-        return Err(KernelError::unsupported(format!(
-            "Schema changes are not yet supported on tables with {feature} enabled"
-        )));
-    }
-    if table_config.is_feature_enabled(&TableFeature::AllowColumnDefaults) {
-        return Err(KernelError::unsupported(
-            "Schema changes are not yet supported on tables with allowColumnDefaults enabled",
-        ));
-    }
-    if table_config.is_feature_supported(&TableFeature::GeneratedColumns)
-        && table_config.has_generation_expressions()
-    {
-        return Err(KernelError::unsupported(
-            "Schema changes are not yet supported on tables with generated columns",
-        ));
-    }
-    evolve_table_config(&table_config, changes)
 }
 
 #[cfg(test)]
@@ -413,10 +409,17 @@ mod tests {
     use crate::expressions::ColumnName;
     use crate::expressions::column_name;
     use crate::object_store::memory::InMemory;
-    use crate::schema::{DataType, StructField, schema_ref};
+    use crate::schema::{
+        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+        schema_ref,
+    };
     use crate::snapshot::Snapshot;
-    use crate::table_features::TableFeature;
-    use crate::table_properties::{ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3};
+    use crate::table_configuration::InCommitTimestampEnablement;
+    use crate::table_features::{ColumnMappingMode, TableFeature};
+    use crate::table_properties::{
+        COLUMN_MAPPING_MODE, ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3,
+        ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
+    };
     use crate::transaction::create_table::create_table;
     use crate::transaction::{SchemaOperation, UpdateTableOperation};
     use crate::unit_test_utils::{copy_test_table, load_test_table, test_schema_flat};
@@ -667,7 +670,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("requires at least one schema change")
+                .contains("requires at least one metadata change")
         );
         Ok(())
     }
@@ -774,7 +777,7 @@ mod tests {
             let error = result.unwrap_err();
             assert!(
                 matches!(&error, KernelError::InvalidTransactionState(message)
-                if message == "ALTER TABLE requires at least one schema change")
+                if message == "ALTER TABLE requires at least one metadata change")
             );
         } else {
             let transaction = result.expect("non-ALTER transactions do not require schema changes");
@@ -1158,6 +1161,331 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("domainMetadata"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn schema_only_change_derives_protocol_features() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .add_column(StructField::nullable("ts", DataType::TIMESTAMP_NTZ))
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+        assert!(transaction.should_emit_metadata);
+        assert!(transaction.should_emit_protocol);
+        let config = &transaction.effective_table_config;
+        assert!(config.is_feature_supported(&TableFeature::TimestampWithoutTimezone));
+        assert!(config.is_feature_supported(&TableFeature::AppendOnly));
+        assert!(config.is_feature_supported(&TableFeature::Invariants));
+        Ok(())
+    }
+
+    #[test]
+    fn enabling_in_commit_timestamps_commits_recorded_enablement() -> Result<()> {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let snapshot = create_table("memory:///", test_schema_flat(), "test", true)
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
+            .unwrap_post_commit_snapshot();
+        let mut builder =
+            snapshot.update_table(UpdateTableOperation::AlterTable, "test-engine", false);
+        builder
+            .local_state
+            .properties_added
+            .insert(ENABLE_IN_COMMIT_TIMESTAMPS.to_string(), "true".to_string());
+        let transaction = builder.build(&engine, Box::new(FileSystemCommitter::new()))?;
+        assert!(transaction.should_emit_protocol);
+        let committed = transaction.commit(&engine)?.unwrap_post_commit_snapshot();
+
+        let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
+        assert_eq!(reloaded.version(), committed.version());
+        let InCommitTimestampEnablement::Enabled {
+            enablement: Some((version, timestamp)),
+        } = reloaded
+            .table_configuration()
+            .in_commit_timestamp_enablement()?
+        else {
+            panic!("expected recorded enablement metadata");
+        };
+        assert_eq!(version, reloaded.version());
+        assert_eq!(
+            reloaded.reader().get_in_commit_timestamp(&engine)?,
+            Some(timestamp)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn enabling_iceberg_compat_v2_with_supported_deletion_vectors_commits_nothing() -> Result<()> {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let snapshot = create_table("memory:///", test_schema_flat(), "test", true)
+            .with_table_properties([
+                (COLUMN_MAPPING_MODE, "name"),
+                ("delta.feature.deletionVectors", "supported"),
+            ])
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
+            .unwrap_post_commit_snapshot();
+        let version = snapshot.version();
+        let mut builder =
+            snapshot.update_table(UpdateTableOperation::AlterTable, "test-engine", false);
+        builder
+            .local_state
+            .properties_added
+            .insert(ENABLE_ICEBERG_COMPAT_V2.to_string(), "true".to_string());
+        let error = builder
+            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("'deletionVectors' is incompatible with 'icebergCompatV2'"),
+            "{error}"
+        );
+
+        let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
+        assert_eq!(reloaded.version(), version);
+        assert!(
+            !reloaded
+                .table_configuration()
+                .is_feature_supported(&TableFeature::IcebergCompatV2)
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::enable_row_tracking(ENABLE_ROW_TRACKING, "true")]
+    #[case::enable_column_mapping_id_mode(COLUMN_MAPPING_MODE, "id")]
+    fn rejected_property_change_commits_nothing(
+        #[case] key: &str,
+        #[case] value: &str,
+    ) -> Result<()> {
+        let (url, _tempdir) = copy_test_table("table-without-dv-small")?;
+        let engine = SyncEngine::new();
+        let snapshot = Snapshot::builder_for(url.as_str()).build(&engine)?;
+        let version = snapshot.version();
+        let mut builder =
+            snapshot.update_table(UpdateTableOperation::AlterTable, "test-engine", false);
+        builder
+            .local_state
+            .properties_added
+            .insert(key.to_string(), value.to_string());
+        let error = builder
+            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(matches!(error, KernelError::Unsupported(_)), "{error}");
+
+        let reloaded = Snapshot::builder_for(url.as_str()).build(&engine)?;
+        assert_eq!(reloaded.version(), version);
+        assert_eq!(
+            reloaded
+                .table_configuration()
+                .metadata()
+                .configuration()
+                .get(key),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn protocol_only_alter_table_commits() -> Result<()> {
+        let (url, _tempdir) = copy_test_table("table-without-dv-small")?;
+        let engine = SyncEngine::new();
+        let snapshot = Snapshot::builder_for(url.as_str()).build(&engine)?;
+        let version = snapshot.version();
+        let mut builder =
+            snapshot.update_table(UpdateTableOperation::AlterTable, "test-engine", false);
+        builder.local_state.properties_added.insert(
+            "delta.feature.domainMetadata".to_string(),
+            "supported".to_string(),
+        );
+        let transaction = builder.build(&engine, Box::new(FileSystemCommitter::new()))?;
+        assert!(!transaction.should_emit_metadata);
+        assert!(transaction.should_emit_protocol);
+        transaction.commit(&engine)?.unwrap_committed();
+
+        let reloaded = Snapshot::builder_for(url.as_str()).build(&engine)?;
+        assert_eq!(reloaded.version(), version + 1);
+        assert!(
+            reloaded
+                .table_configuration()
+                .is_feature_supported(&TableFeature::DomainMetadata)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unchanged_property_alter_table_commits_without_metadata_or_protocol() -> Result<()> {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let snapshot = create_table("memory:///", test_schema_flat(), "test", true)
+            .with_table_properties([("app.key", "value")])
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
+            .unwrap_post_commit_snapshot();
+        let mut builder =
+            snapshot
+                .clone()
+                .update_table(UpdateTableOperation::AlterTable, "test-engine", false);
+        builder
+            .local_state
+            .properties_added
+            .insert("app.key".to_string(), "value".to_string());
+        let transaction = builder.build(&engine, Box::new(FileSystemCommitter::new()))?;
+        assert!(!transaction.should_emit_metadata);
+        assert!(!transaction.should_emit_protocol);
+        transaction.commit(&engine)?.unwrap_committed();
+
+        let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
+        assert_eq!(reloaded.version(), snapshot.version() + 1);
+        let (read_config, config) = (
+            snapshot.table_configuration(),
+            reloaded.table_configuration(),
+        );
+        assert_eq!(config.metadata(), read_config.metadata());
+        assert_eq!(config.protocol(), read_config.protocol());
+        Ok(())
+    }
+
+    #[rstest]
+    fn enabling_iceberg_compat_v2_assigns_nested_field_ids(
+        #[values(false, true)] enable_column_mapping_in_same_request: bool,
+    ) -> Result<()> {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let schema = Arc::new(StructType::try_new([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("tags", ArrayType::new(DataType::STRING, true)),
+            StructField::nullable(
+                "s",
+                StructType::try_new([StructField::nullable(
+                    "arr",
+                    ArrayType::new(DataType::INTEGER, true),
+                )])?,
+            ),
+            StructField::nullable(
+                "m",
+                MapType::new(
+                    DataType::STRING,
+                    StructType::try_new([
+                        StructField::nullable("y", DataType::INTEGER),
+                        StructField::nullable("z", ArrayType::new(DataType::STRING, true)),
+                    ])?,
+                    true,
+                ),
+            ),
+        ])?);
+        let initial_mode = if enable_column_mapping_in_same_request {
+            "none"
+        } else {
+            "name"
+        };
+        let snapshot = create_table("memory:///", schema, "test", true)
+            .with_table_properties([(COLUMN_MAPPING_MODE, initial_mode)])
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
+            .unwrap_post_commit_snapshot();
+
+        let mut builder =
+            snapshot.update_table(UpdateTableOperation::AlterTable, "test-engine", false);
+        let properties = &mut builder.local_state.properties_added;
+        properties.insert(ENABLE_ICEBERG_COMPAT_V2.to_string(), "true".to_string());
+        if enable_column_mapping_in_same_request {
+            properties.insert(COLUMN_MAPPING_MODE.to_string(), "name".to_string());
+        }
+        builder
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
+            .unwrap_committed();
+
+        let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
+        let config = reloaded.table_configuration();
+        assert!(config.is_feature_enabled(&TableFeature::IcebergCompatV2));
+        assert_eq!(config.column_mapping_mode(), ColumnMappingMode::Name);
+        let schema = config.logical_schema();
+        let struct_field = |field: &StructField, name: &str| -> StructField {
+            match field.data_type() {
+                DataType::Struct(inner) => inner.field(name).unwrap().clone(),
+                DataType::Map(map) => match map.value_type() {
+                    DataType::Struct(inner) => inner.field(name).unwrap().clone(),
+                    other => panic!("unexpected map value {other:?}"),
+                },
+                other => panic!("unexpected type {other:?}"),
+            }
+        };
+        let m = schema.field("m").unwrap().clone();
+        let s = schema.field("s").unwrap().clone();
+        let fields = [
+            (schema.field("tags").unwrap().clone(), &["element"][..]),
+            (struct_field(&s, "arr"), &["element"][..]),
+            (m.clone(), &["key", "value"][..]),
+            (struct_field(&m, "z"), &["element"][..]),
+        ];
+        let mut nested_ids = Vec::new();
+        for (field, slots) in &fields {
+            let physical = field.physical_name(ColumnMappingMode::Name);
+            if enable_column_mapping_in_same_request {
+                assert_eq!(physical, field.name());
+            }
+            let Some(MetadataValue::Other(serde_json::Value::Object(ids))) =
+                field.get_config_value(&ColumnMetadataKey::ColumnMappingNestedIds)
+            else {
+                panic!("expected nested ids on '{}'", field.name());
+            };
+            assert_eq!(ids.len(), slots.len(), "{ids:?}");
+            for slot in *slots {
+                nested_ids.push(ids[&format!("{physical}.{slot}")].as_i64().unwrap());
+            }
+        }
+        // Seven struct fields hold ids 1..=7; the five array and map slots follow.
+        nested_ids.sort_unstable();
+        assert_eq!(nested_ids, (8..=12).collect::<Vec<_>>());
+        assert_eq!(
+            config.table_properties().column_mapping_max_column_id,
+            Some(12)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn enabling_column_mapping_name_mode_keeps_existing_data_readable() -> Result<()> {
+        fn read_columns(snapshot: &SnapshotRef, engine: &Arc<SyncEngine>) -> Result<Vec<ArrayRef>> {
+            let mut columns = Vec::new();
+            for data in snapshot
+                .clone()
+                .scan_builder()
+                .build()?
+                .execute(engine.clone())?
+            {
+                let batch = ArrowEngineData::try_from_engine_data(data?)?;
+                columns.extend(batch.record_batch().columns().iter().cloned());
+            }
+            Ok(columns)
+        }
+
+        let (url, _tempdir) = copy_test_table("table-without-dv-small")?;
+        let engine = Arc::new(SyncEngine::new());
+        let snapshot = Snapshot::builder_for(url.as_str()).build(engine.as_ref())?;
+        let columns = read_columns(&snapshot, &engine)?;
+        assert!(!columns.is_empty());
+
+        let mut builder =
+            snapshot.update_table(UpdateTableOperation::AlterTable, "test-engine", false);
+        builder
+            .local_state
+            .properties_added
+            .insert(COLUMN_MAPPING_MODE.to_string(), "name".to_string());
+        builder
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
+            .unwrap_committed();
+
+        let reloaded = Snapshot::builder_for(url.as_str()).build(engine.as_ref())?;
+        assert_eq!(
+            reloaded.table_configuration().column_mapping_mode(),
+            ColumnMappingMode::Name
+        );
+        assert_eq!(read_columns(&reloaded, &engine)?, columns);
         Ok(())
     }
 

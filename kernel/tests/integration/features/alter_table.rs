@@ -16,7 +16,7 @@ use delta_kernel::schema::{
     StructType, schema, schema_ref, try_schema,
 };
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::table_features::ColumnMappingMode;
+use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
 use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
@@ -766,11 +766,6 @@ async fn add_complex_type_column(
     StructField::nullable("NAME", DataType::STRING),
     "already exists"
 )]
-#[case::timestamp_ntz_without_feature(
-    &[],
-    StructField::nullable("ts", DataType::TIMESTAMP_NTZ),
-    "timestampNtz"
-)]
 #[case::non_nullable(&[], StructField::not_null("age", DataType::INTEGER), "non-nullable")]
 #[tokio::test]
 async fn add_column_failures(
@@ -789,6 +784,45 @@ async fn add_column_failures(
     assert!(err.is_err());
     assert!(err.unwrap_err().to_string().contains(error_contains));
 
+    Ok(())
+}
+
+#[rstest]
+#[case::timestamp_ntz(DataType::TIMESTAMP_NTZ, TableFeature::TimestampWithoutTimezone)]
+#[case::variant(DataType::unshredded_variant(), TableFeature::VariantType)]
+#[tokio::test]
+async fn add_column_upgrades_protocol_for_type_feature(
+    #[case] data_type: DataType,
+    #[case] feature: TableFeature,
+) -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+    let read_config = snapshot.table_configuration();
+    assert!(!read_config.is_feature_supported(&feature));
+    let retained: Vec<_> = read_config
+        .protocol()
+        .writer_features()
+        .unwrap_or_default()
+        .to_vec();
+
+    snapshot
+        .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+        .add_column(StructField::nullable("added", data_type.clone()))
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let config = reloaded.table_configuration();
+    assert!(config.is_feature_supported(&feature));
+    for retained_feature in &retained {
+        assert!(config.is_feature_supported(retained_feature));
+    }
+    assert_eq!(
+        reloaded.schema().field("added").unwrap().data_type(),
+        &data_type
+    );
     Ok(())
 }
 

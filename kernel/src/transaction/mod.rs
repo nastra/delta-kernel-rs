@@ -25,7 +25,7 @@ use crate::schema::{
     lazy_schema_ref,
 };
 use crate::snapshot::{Snapshot, SnapshotRef};
-use crate::table_configuration::TableConfiguration;
+use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::TableFeature;
 #[cfg(feature = "check-constraints-in-dev")]
 use crate::table_properties::CheckConstraint;
@@ -292,11 +292,15 @@ pub struct Transaction<STATE = UpdateTable, MODE: ExecutionMode = Imperative> {
     // config, this is cloned from the read snapshot; when the config changes (e.g. schema
     // evolution), it is constructed separately with the new schema/protocol.
     effective_table_config: TableConfiguration,
-    // Whether to emit a Protocol action. True for CREATE TABLE, false otherwise.
+    // Whether to emit a Protocol action. True for CREATE TABLE and for updates that add table
+    // features.
     should_emit_protocol: bool,
-    // Whether to emit a Metadata action. True for CREATE TABLE and transactions with staged
-    // schema changes, false otherwise.
+    // Whether to emit a Metadata action. True for CREATE TABLE, transactions with staged schema
+    // changes, and updates that change the table configuration.
     should_emit_metadata: bool,
+    // Whether an update requested schema or table property changes. ALTER TABLE requires a
+    // request, even one that resolves to no change and commits only commitInfo.
+    has_metadata_request: bool,
     committer: Box<dyn Committer>,
     operation: CommitOperation,
     operation_parameters: Option<HashMap<String, Option<String>>>,
@@ -725,6 +729,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             effective_table_config,
             should_emit_protocol: false,
             should_emit_metadata: false,
+            has_metadata_request: false,
             committer,
             operation,
             operation_parameters: common_state.operation_parameters,
@@ -1089,10 +1094,10 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         match (self.is_create_table(), &self.operation) {
             (true, CommitOperation::CreateTable) => Ok(()),
             (false, CommitOperation::UpdateTable(UpdateTableOperation::AlterTable))
-                if !self.should_emit_metadata =>
+                if !self.has_metadata_request =>
             {
                 Err(KernelError::invalid_transaction_state(
-                    "ALTER TABLE requires at least one schema change",
+                    "ALTER TABLE requires at least one metadata change",
                 ))
             }
             (false, CommitOperation::UpdateTable(UpdateTableOperation::AlterTable))
@@ -1158,6 +1163,18 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         if self.is_create_table() {
             // For CREATE TABLE there are no prior commits -- use the wall-clock time directly.
             return Ok(Some(self.commit_timestamp));
+        }
+
+        // A transaction that enables ICT records this commit's timestamp as the enablement
+        // timestamp while preparing the metadata, so the commit must use that value.
+        if let InCommitTimestampEnablement::Enabled {
+            enablement: Some((enablement_version, enablement_timestamp)),
+        } = self
+            .effective_table_config
+            .in_commit_timestamp_enablement()?
+            && enablement_version == self.get_commit_version()
+        {
+            return Ok(Some(enablement_timestamp));
         }
 
         // Existing table: enforce monotonicity per the Delta protocol. The timestamp
@@ -1677,6 +1694,7 @@ mod tests {
             effective_table_config,
             should_emit_protocol,
             should_emit_metadata,
+            has_metadata_request,
             committer,
             operation,
             operation_parameters,
@@ -1717,6 +1735,7 @@ mod tests {
         assert_eq!(&effective_table_config, snapshot.table_configuration());
         assert!(!should_emit_protocol);
         assert!(!should_emit_metadata);
+        assert!(!has_metadata_request);
         assert!(!committer.is_catalog_committer());
         assert_eq!(operation, UpdateTableOperation::Write.into());
         assert!(operation_parameters.is_none());
@@ -2934,7 +2953,7 @@ mod tests {
     #[case::alter_without_schema_changes(
         false,
         CommitOperation::UpdateTable(UpdateTableOperation::AlterTable),
-        "ALTER TABLE requires at least one schema change"
+        "ALTER TABLE requires at least one metadata change"
     )]
     #[case::empty_custom_operation(
         false,
