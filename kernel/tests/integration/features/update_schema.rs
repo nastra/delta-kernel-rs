@@ -372,6 +372,23 @@ type SchemaEdit = fn(&StructType) -> Vec<StructField>;
     |s: &StructType| appended(s, StructField::not_null("new", DataType::STRING)),
     "Cannot add non-nullable field 'new'"
 )]
+#[case::add_struct_with_non_nullable_child(
+    |s: &StructType| appended(s, StructField::nullable(
+        "new",
+        StructType::try_new([StructField::not_null("c", DataType::INTEGER)]).unwrap(),
+    )),
+    "Cannot add non-nullable field 'c' under 'new'"
+)]
+#[case::add_array_of_struct_with_non_nullable_child(
+    |s: &StructType| appended(s, StructField::nullable(
+        "new",
+        ArrayType::new(
+            StructType::try_new([StructField::not_null("c", DataType::INTEGER)]).unwrap(),
+            true,
+        ),
+    )),
+    "Cannot add non-nullable field 'c' under 'new'"
+)]
 #[case::add_with_default(
     |s: &StructType| appended(s, StructField::nullable("new", DataType::STRING)
             .add_metadata([("CURRENT_DEFAULT", MetadataValue::String("'x'".into()))])),
