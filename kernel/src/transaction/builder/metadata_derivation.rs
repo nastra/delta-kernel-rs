@@ -80,6 +80,21 @@ pub(super) const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     TableFeature::IcebergNativeV4Preview,
 ];
 
+/// Features an update, but not CREATE TABLE, may add through `delta.feature.<name>=supported`.
+/// Delta Kernel Java accepts these signals on update. A feature that Kernel cannot write, such as
+/// `checkpointProtection` without the `checkpoint-protection` feature, is still rejected when the
+/// final configuration is validated, as in Java's `validateKernelCanWriteToTable`.
+pub(super) const UPDATE_ONLY_FEATURE_SIGNALS: &[TableFeature] = &[
+    TableFeature::TimestampWithoutTimezone,
+    TableFeature::CheckpointProtection,
+    // Only the explicit signal adds it: an update never derives allowColumnDefaults.
+    TableFeature::AllowColumnDefaults,
+    TableFeature::TypeWideningPreview,
+    TableFeature::VariantTypePreview,
+    TableFeature::VariantShreddingPreview,
+    TableFeature::CollationsPreview,
+];
+
 /// The single allow-list of `delta.*` properties a transaction may set. Any other `delta.*` key
 /// is rejected.
 pub(super) const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
@@ -391,6 +406,7 @@ pub(super) fn validate_and_normalize_delta_properties(
             let name = &key[SET_TABLE_FEATURE_SUPPORTED_PREFIX.len()..];
             let canonical_name = ALLOWED_DELTA_FEATURES
                 .iter()
+                .chain(UPDATE_ONLY_FEATURE_SIGNALS)
                 .map(ToString::to_string)
                 .find(|feature| feature.eq_ignore_ascii_case(name))
                 .unwrap_or_else(|| name.to_string());

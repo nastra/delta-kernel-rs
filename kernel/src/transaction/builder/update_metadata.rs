@@ -10,7 +10,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::metadata_derivation::{
-    ValidatedTableProperties, maybe_auto_enable_property_driven_features, maybe_enable_collations,
+    UPDATE_ONLY_FEATURE_SIGNALS, ValidatedTableProperties,
+    maybe_auto_enable_property_driven_features, maybe_enable_collations,
     maybe_enable_file_type_preview, maybe_enable_ict_for_catalog_managed,
     maybe_enable_timestamp_ntz, maybe_enable_v2_checkpoint_for_policy, maybe_enable_variant_type,
     validate_and_normalize_delta_properties, validate_extract_features_and_properties_for,
@@ -21,9 +22,10 @@ use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     ColumnMappingMode, IcebergCompatValidationContext, LEGACY_WRITER_FEATURES,
+    SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
     TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature,
-    V2_VALIDATOR, V3_VALIDATOR, assign_column_mapping_metadata, assign_nested_cm_ids,
-    drop_column_mapping_metadata, ensure_domain_metadata_dependency,
+    V2_VALIDATOR, V3_VALIDATOR, add_feature_to_lists, assign_column_mapping_metadata,
+    assign_nested_cm_ids, drop_column_mapping_metadata, ensure_domain_metadata_dependency,
     extract_enabled_reader_features, find_max_column_id_in_schema,
     get_column_mapping_mode_from_properties, validate_iceberg_compat_if_needed,
 };
@@ -141,8 +143,25 @@ pub(super) fn prepare_update_table_metadata(
     };
 
     // Kernel-managed keys are rejected by the property allow-list.
+    let (update_only_features, shared_properties) =
+        split_update_only_feature_signals(properties_added.clone())?;
     let mut requested =
-        validate_extract_features_and_properties_for(properties_added.clone(), UPDATE_TABLE)?;
+        validate_extract_features_and_properties_for(shared_properties, UPDATE_TABLE)?;
+    for feature in update_only_features {
+        // Like Java, variantShredding-preview requires the stable variantType feature.
+        if feature == TableFeature::VariantShreddingPreview {
+            add_feature_to_lists(
+                TableFeature::VariantType,
+                &mut requested.reader_features,
+                &mut requested.writer_features,
+            );
+        }
+        add_feature_to_lists(
+            feature,
+            &mut requested.reader_features,
+            &mut requested.writer_features,
+        );
+    }
     let mut configuration = evolved_metadata.configuration().clone();
     configuration.extend(requested.properties.drain());
     configuration.retain(|key, _| !property_keys_removed.contains(key));
@@ -331,6 +350,27 @@ fn apply_schema_changes(
         ));
     }
     evolve_metadata(table_config, changes)
+}
+
+/// Splits the feature signals in [`UPDATE_ONLY_FEATURE_SIGNALS`] from `properties`, which keeps the
+/// rest for the validation shared with CREATE TABLE.
+fn split_update_only_feature_signals(
+    mut properties: HashMap<String, String>,
+) -> KernelResult<(Vec<TableFeature>, HashMap<String, String>)> {
+    let mut features = Vec::new();
+    for feature in UPDATE_ONLY_FEATURE_SIGNALS {
+        let key = format!("{SET_TABLE_FEATURE_SUPPORTED_PREFIX}{feature}");
+        if let Some(value) = properties.remove(&key) {
+            if value != SET_TABLE_FEATURE_SUPPORTED_VALUE {
+                return Err(KernelError::generic(format!(
+                    "Invalid value '{value}' for '{key}'. Only \
+                     '{SET_TABLE_FEATURE_SUPPORTED_VALUE}' is allowed."
+                )));
+            }
+            features.push(feature.clone());
+        }
+    }
+    Ok((features, properties))
 }
 
 /// Rejects integer properties outside the range Java accepts. Java parses them with
@@ -679,7 +719,6 @@ mod tests {
     use crate::schema::{ArrayType, DataType, MapType};
     use crate::snapshot::SnapshotRef;
     use crate::table_configuration::InCommitTimestampEnablement;
-    use crate::table_features::SET_TABLE_FEATURE_SUPPORTED_PREFIX;
     use crate::table_properties::{CHECKPOINT_POLICY, COLUMN_MAPPING_MODE, ENABLE_ROW_TRACKING};
     use crate::transaction::create_table::create_table;
     use crate::unit_test_utils::{load_test_table, test_schema_flat};
@@ -1353,31 +1392,92 @@ mod tests {
     }
 
     #[rstest]
-    #[case::feature_signal(&[("delta.feature.allowColumnDefaults", "supported")], true)]
-    #[case::other_property(&[("delta.enableChangeDataFeed", "true")], false)]
-    fn allow_column_defaults_is_never_derived(
-        #[case] requested: &[(&str, &str)],
-        #[case] rejected: bool,
+    #[case::timestamp_ntz(TableFeature::TimestampWithoutTimezone, &[])]
+    #[case::type_widening_preview(TableFeature::TypeWideningPreview, &[])]
+    #[case::variant_type_preview(TableFeature::VariantTypePreview, &[])]
+    #[case::variant_shredding_preview(
+        TableFeature::VariantShreddingPreview,
+        &[TableFeature::VariantType]
+    )]
+    #[case::collations_preview(TableFeature::CollationsPreview, &[])]
+    #[case::allow_column_defaults(TableFeature::AllowColumnDefaults, &[])]
+    fn update_only_feature_signals_add_the_feature(
+        #[case] feature: TableFeature,
+        #[case] dependencies: &[TableFeature],
     ) {
         let (engine, snapshot) = create_test_table(&[]);
-        let mut request = properties_request(requested);
+        // Any case of the feature name is accepted.
+        let key = format!("delta.feature.{}", feature.to_string().to_ascii_uppercase());
+        let prepared = prepare(
+            engine.as_ref(),
+            &snapshot,
+            properties_request(&[(&key, "supported")]),
+        )
+        .unwrap();
+        assert!(prepared.should_emit_protocol);
+        for feature in std::iter::once(&feature).chain(dependencies) {
+            assert!(
+                prepared.table_config.is_feature_supported(feature),
+                "{feature} is missing"
+            );
+        }
+        assert!(
+            !prepared
+                .table_config
+                .metadata()
+                .configuration()
+                .keys()
+                .any(|key| key.starts_with(SET_TABLE_FEATURE_SUPPORTED_PREFIX))
+        );
+    }
+
+    #[test]
+    fn checkpoint_protection_signal_requires_kernel_write_support() {
+        let (engine, snapshot) = create_test_table(&[]);
+        let result = prepare(
+            engine.as_ref(),
+            &snapshot,
+            properties_request(&[("delta.feature.checkpointProtection", "supported")]),
+        );
+        if cfg!(feature = "checkpoint-protection") {
+            let config = result.unwrap().table_config;
+            assert!(config.is_feature_supported(&TableFeature::CheckpointProtection));
+        } else {
+            let error = result.unwrap_err();
+            assert!(
+                error.to_string().contains("checkpointProtection"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_only_feature_signal_rejects_values_other_than_supported() {
+        let (engine, snapshot) = create_test_table(&[]);
+        let error = prepare(
+            engine.as_ref(),
+            &snapshot,
+            properties_request(&[("delta.feature.timestampNtz", "enabled")]),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("Only 'supported' is allowed"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn allow_column_defaults_is_never_derived() {
+        let (engine, snapshot) = create_test_table(&[]);
+        let mut request = properties_request(&[("delta.enableChangeDataFeed", "true")]);
         request.schema_changes = Some(vec![SchemaOperation::add_column(
             None,
             StructField::nullable("added", DataType::STRING),
         )]);
-        let result = prepare(engine.as_ref(), &snapshot, request);
-        if rejected {
-            let error = result.unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("Enabling feature 'allowColumnDefaults'"),
-                "{error}"
-            );
-        } else {
-            let config = result.unwrap().table_config;
-            assert!(!config.is_feature_supported(&TableFeature::AllowColumnDefaults));
-        }
+        let config = prepare(engine.as_ref(), &snapshot, request)
+            .unwrap()
+            .table_config;
+        assert!(!config.is_feature_supported(&TableFeature::AllowColumnDefaults));
     }
 
     // Writer version 5 implies checkConstraints, which Kernel writes only with this feature.

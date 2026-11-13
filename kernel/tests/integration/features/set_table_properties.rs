@@ -139,6 +139,11 @@ async fn set_properties_patches_configuration_and_canonicalizes_delta_keys()
 )]
 #[case::unknown_delta_key(&[], &[("delta.unknownProperty", "x")], "not supported")]
 #[case::unknown_delta_key_case_variant(&[], &[("Delta.unknownProperty", "x")], "not supported")]
+#[case::clustering_feature_signal(
+    &[],
+    &[("delta.feature.clustering", "supported")],
+    "Enabling feature 'clustering'"
+)]
 #[case::unknown_feature_in_other_case(
     &[],
     &[("DELTA.FEATURE.noSuchFeature", "supported")],
@@ -230,6 +235,36 @@ async fn feature_signals_match_prefix_and_feature_name_in_any_case(
             .keys()
             .any(|key| key.to_ascii_lowercase().starts_with("delta.feature."))
     );
+    Ok(())
+}
+
+#[rstest]
+#[case::timestamp_ntz("timestampNtz", TableFeature::TimestampWithoutTimezone)]
+#[case::variant_type_preview("variantType-preview", TableFeature::VariantTypePreview)]
+#[tokio::test]
+async fn update_only_feature_signals_commit_the_feature(
+    #[case] name: &str,
+    #[case] feature: TableFeature,
+) -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+    let key = format!("delta.feature.{name}");
+
+    let reloaded = set_properties(
+        snapshot,
+        &table_path,
+        engine.as_ref(),
+        &[(&key, "supported")],
+    )?;
+
+    assert_eq!(reloaded.version(), 1);
+    assert!(
+        reloaded
+            .table_configuration()
+            .is_feature_supported(&feature)
+    );
+    assert_eq!(configuration_value(&reloaded, &key), None);
     Ok(())
 }
 
