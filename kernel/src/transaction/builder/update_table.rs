@@ -208,7 +208,7 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     ///
     /// [`build`](Self::build) rejects malformed values, keys that are also removed, and
     /// transitions Kernel does not support on existing tables, such as changing the column mapping
-    /// mode or enabling or disabling row tracking.
+    /// mode, enabling or disabling row tracking, or upgrading the table to `catalogManaged`.
     pub fn with_table_properties_added<I, K, V>(mut self, properties: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
@@ -402,6 +402,15 @@ fn try_new_update_table<MODE: ExecutionMode>(
         should_emit_metadata,
         should_emit_protocol,
     } = prepare_update_table_metadata(&read_snapshot, request, commit_timestamp, engine)?;
+    // No commit path upgrades an existing table to catalog-managed: the commit would run as an
+    // ordinary catalog-managed write against a table the catalog does not manage yet.
+    if !read_snapshot.table_configuration().is_catalog_managed()
+        && effective_table_config.is_catalog_managed()
+    {
+        return Err(KernelError::unsupported(
+            "Upgrading an existing table to catalogManaged is not supported",
+        ));
+    }
 
     Ok(Transaction {
         read_snapshot_opt: Some(read_snapshot),
@@ -1245,22 +1254,37 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn catalog_managed_feature_signal_enables_in_commit_timestamps() -> Result<()> {
+    #[rstest]
+    fn catalog_managed_upgrade_is_rejected_at_build(
+        #[values(None, Some("true"), Some("false"))] in_commit_timestamps: Option<&str>,
+    ) -> Result<()> {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
         let snapshot = create_table("memory:///", test_schema_flat(), "test", true)
             .build(&engine, Box::new(FileSystemCommitter::new()))?
             .commit(&engine)?
             .unwrap_post_commit_snapshot();
-        let transaction = snapshot
+        let mut properties = vec![("delta.feature.catalogManaged", "supported")];
+        properties.extend(in_commit_timestamps.map(|value| (ENABLE_IN_COMMIT_TIMESTAMPS, value)));
+        let error = snapshot
+            .clone()
             .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
-            .with_table_properties_added([("delta.feature.catalogManaged", "supported")])
-            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+            .with_table_properties_added(properties)
+            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        // Explicitly disabling ICT fails first, with Java's message.
+        let expected = if in_commit_timestamps == Some("false") {
+            "Cannot disable inCommitTimestamp when enabling catalogManaged"
+        } else {
+            "Upgrading an existing table to catalogManaged is not supported"
+        };
+        assert!(error.to_string().contains(expected), "{error}");
 
-        assert!(transaction.should_emit_protocol);
-        let config = &transaction.effective_table_config;
-        assert!(config.is_feature_supported(&TableFeature::CatalogManaged));
-        assert!(config.is_feature_enabled(&TableFeature::InCommitTimestamp));
+        let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
+        assert_eq!(reloaded.version(), snapshot.version());
+        assert_eq!(
+            reloaded.table_configuration().protocol(),
+            snapshot.table_configuration().protocol()
+        );
         Ok(())
     }
 
