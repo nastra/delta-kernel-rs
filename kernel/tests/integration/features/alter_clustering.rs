@@ -273,6 +273,11 @@ async fn invalid_clustering_columns_are_rejected(
 #[tokio::test]
 async fn clustering_a_partitioned_table_is_rejected(
     #[case] requested: Vec<ColumnName>,
+    #[values(
+        (UpdateTableOperation::AlterTable, false),
+        (UpdateTableOperation::Write, true)
+    )]
+    operation: (UpdateTableOperation, bool),
 ) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let created = create(
@@ -282,10 +287,23 @@ async fn clustering_a_partitioned_table_is_rejected(
         "none",
     )?;
 
+    let (operation, data_change) = operation;
     let result = Arc::clone(&created)
-        .update_table(UpdateTableOperation::Write, "test-engine", true)
+        .update_table(operation, "test-engine", data_change)
         .with_clustering_columns(requested)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
     assert_result_error_with_message(result, "Cannot enable clustering on a partitioned table");
+
+    let snapshot = reload(&table_path, engine.as_ref())?;
+    assert_eq!(snapshot.version(), 0);
+    assert!(
+        !snapshot
+            .table_configuration()
+            .is_feature_supported(&TableFeature::ClusteredTable)
+    );
+    assert_eq!(
+        snapshot.table_configuration().protocol(),
+        created.table_configuration().protocol()
+    );
     Ok(())
 }
