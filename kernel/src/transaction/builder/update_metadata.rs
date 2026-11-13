@@ -514,6 +514,14 @@ fn assign_column_mapping_to_existing_fields(
             );
             Cow::Owned(field)
         }
+        // Like CREATE TABLE, column mapping does not reach the fields inside variant and file
+        // values.
+        fn transform_variant(&mut self, stype: &'a StructType) -> Cow<'a, StructType> {
+            Cow::Borrowed(stype)
+        }
+        fn transform_file(&mut self, stype: &'a StructType) -> Cow<'a, StructType> {
+            Cow::Borrowed(stype)
+        }
     }
     let schema = drop_column_mapping_metadata(schema);
     let schema = FieldNameAsPhysicalName

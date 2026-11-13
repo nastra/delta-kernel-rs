@@ -1536,6 +1536,54 @@ mod tests {
     }
 
     #[test]
+    fn enabling_column_mapping_on_variant_and_file_columns_matches_create_table() -> Result<()> {
+        let schema = Arc::new(StructType::try_new([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("v", DataType::unshredded_variant()),
+            StructField::nullable("f", DataType::file_type()),
+        ])?);
+        let create = |url: &str, engine: &SyncEngine, mode: &str| -> Result<SnapshotRef> {
+            Ok(create_table(url, schema.clone(), "test", true)
+                .with_table_properties([(COLUMN_MAPPING_MODE, mode)])
+                .build(engine, Box::new(FileSystemCommitter::new()))?
+                .commit(engine)?
+                .unwrap_post_commit_snapshot())
+        };
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let created_with_mapping = create("memory:///created/", &engine, "name")?;
+        let snapshot = create("memory:///altered/", &engine, "none")?;
+
+        let mut builder =
+            snapshot.update_table(UpdateTableOperation::AlterTable, "test-engine", false);
+        builder
+            .local_state
+            .properties_added
+            .insert(COLUMN_MAPPING_MODE.to_string(), "name".to_string());
+        let transaction = builder.build(&engine, Box::new(FileSystemCommitter::new()))?;
+        let prepared = transaction.effective_table_config.clone();
+        transaction.commit(&engine)?.unwrap_committed();
+
+        let reloaded = Snapshot::builder_for("memory:///altered/").build(&engine)?;
+        let created = created_with_mapping.table_configuration();
+        // Variant and file values keep their inner fields unannotated, as CREATE TABLE does, both
+        // in the prepared configuration and after reload.
+        for altered in [&prepared, reloaded.table_configuration()] {
+            for name in ["v", "f"] {
+                assert_eq!(
+                    altered.logical_schema().field(name).unwrap().data_type(),
+                    created.logical_schema().field(name).unwrap().data_type(),
+                    "{name}"
+                );
+            }
+            assert_eq!(
+                altered.table_properties().column_mapping_max_column_id,
+                created.table_properties().column_mapping_max_column_id
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn enabling_column_mapping_name_mode_keeps_existing_data_readable() -> Result<()> {
         fn read_columns(snapshot: &SnapshotRef, engine: &Arc<SyncEngine>) -> Result<Vec<ArrayRef>> {
             let mut columns = Vec::new();
