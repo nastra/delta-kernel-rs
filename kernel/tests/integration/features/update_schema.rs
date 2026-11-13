@@ -556,6 +556,14 @@ async fn updated_schema_requires_column_mapping(
     field(s, "tags"),
     field(s, "part").with_name("PART"),
 ])]
+// Dropping the partition column and adding a new one with the same name: the new column gets a
+// new physical name, so the existing partition values would be orphaned. Java accepts this.
+#[case::drop_and_readd_with_the_same_name(|s: &StructType| vec![
+    field(s, "id"),
+    field(s, "address"),
+    field(s, "tags"),
+    StructField::nullable("part", field(s, "part").data_type().clone()),
+])]
 #[tokio::test]
 async fn updated_schema_rejects_dropping_or_renaming_partition_columns(
     #[case] edit: SchemaEdit,
