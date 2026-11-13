@@ -51,7 +51,7 @@ pub use update_table::*;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use url::Url;
 
-use crate::delta_types::{FfiColumnName, FfiNullableStringMap};
+use crate::delta_types::{FfiColumnName, FfiNullableStringMap, FfiStringMap};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::engine_funcs::FileMeta;
 use crate::error::{ExternResult, IntoExternResult};
@@ -142,6 +142,7 @@ mod tests {
     use delta_kernel::{KernelError, KernelResult, Snapshot};
     use delta_kernel_ffi::delta_types::{
         FfiColumnNameArray, FfiNullableStringMap, FfiNullableStringMapEntry, FfiStringArray,
+        FfiStringMap, FfiStringMapEntry,
     };
     use delta_kernel_ffi::engine_data::{ArrowFFIData, get_engine_data};
     use delta_kernel_ffi::error::FFIKernelError;
@@ -4408,12 +4409,24 @@ mod tests {
                 engine.shallow_copy(),
             ))
         };
-        for (key, value) in [("app.key", "value"), ("DELTA.CHECKPOINTINTERVAL", "5")] {
+        // The second call replaces the first, so `app.dropped` is not committed.
+        let calls = [
+            vec![("app.dropped", "value")],
+            vec![("app.key", "value"), ("DELTA.CHECKPOINTINTERVAL", "5")],
+        ];
+        for call in calls {
+            let entries: Vec<_> = call
+                .into_iter()
+                .map(|(key, value)| FfiStringMapEntry {
+                    key: ffi_str(key),
+                    value: ffi_str(value),
+                })
+                .collect();
+            let properties = unsafe { FfiStringMap::new_unsafe(&entries) };
             builder = ok_or_panic(unsafe {
-                update_table_txn_builder_with_table_property(
+                update_table_txn_builder_with_table_properties_added(
                     builder,
-                    ffi_str(key),
-                    ffi_str(value),
+                    &properties,
                     engine.shallow_copy(),
                 )
             });
@@ -4433,6 +4446,7 @@ mod tests {
             configuration.get("app.key").map(String::as_str),
             Some("value")
         );
+        assert!(!configuration.contains_key("app.dropped"));
         assert_eq!(
             configuration
                 .get("delta.checkpointInterval")

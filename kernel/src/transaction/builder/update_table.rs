@@ -190,8 +190,8 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
 
     /// Sets table properties, overwriting existing values for the supplied keys.
     ///
-    /// Properties not supplied keep their current values. Repeated calls merge, with later values
-    /// overwriting earlier ones for the same key. Application properties (keys outside the
+    /// Properties not supplied keep their current values. Each call replaces the properties
+    /// supplied by any previous call. Application properties (keys outside the
     /// `delta.` namespace) are stored as given. Recognized `delta.*` keys are matched
     /// case-insensitively and stored with their canonical case, and their values must parse; other
     /// `delta.*` keys, including Kernel-managed ones such as `delta.columnMapping.maxColumnId`, are
@@ -213,9 +213,10 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         K: Into<String>,
         V: Into<String>,
     {
-        self.local_state
-            .properties_added
-            .extend(properties.into_iter().map(|(k, v)| (k.into(), v.into())));
+        self.local_state.properties_added = properties
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
         self
     }
 
@@ -1261,14 +1262,13 @@ mod tests {
     }
 
     #[test]
-    fn repeated_property_calls_merge_with_later_values_winning() -> Result<()> {
+    fn repeated_property_calls_replace_previous_properties() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let builder = snapshot
             .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
             .with_table_properties_added([("app.a", "1"), ("app.b", "1")])
             .with_table_properties_added([("app.b", "2")]);
-        let expected = [("app.a", "1"), ("app.b", "2")]
-            .map(|(key, value)| (key.to_string(), value.to_string()));
+        let expected = [("app.b", "2")].map(|(key, value)| (key.to_string(), value.to_string()));
         assert_eq!(builder.local_state.properties_added, expected.into());
 
         let transaction = builder.build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
