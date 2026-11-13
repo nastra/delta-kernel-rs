@@ -9,8 +9,8 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::schema::{
-    ArrayType, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
-    schema_ref,
+    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, SchemaRef, StructField,
+    StructType, schema_ref,
 };
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::TableFeature;
@@ -86,6 +86,26 @@ fn update_schema(
         .build(engine, Box::new(FileSystemCommitter::new()))?
         .commit(engine)?
         .unwrap_post_commit_snapshot())
+}
+
+/// Asserts that updating `snapshot` to `schema` fails with `expected` and commits nothing.
+fn assert_update_rejected(
+    snapshot: &SnapshotRef,
+    engine: &dyn Engine,
+    schema: StructType,
+    expected: &str,
+) {
+    assert_result_error_with_message(update_schema(snapshot, engine, schema), expected);
+    assert_nothing_committed(snapshot, engine);
+}
+
+/// Asserts that the latest version of the table is still `snapshot`.
+fn assert_nothing_committed(snapshot: &SnapshotRef, engine: &dyn Engine) {
+    let reloaded = Snapshot::builder_for(snapshot.table_root())
+        .build(engine)
+        .unwrap();
+    assert_eq!(reloaded.version(), snapshot.version());
+    assert_eq!(reloaded.schema(), snapshot.schema());
 }
 
 fn field(schema: &StructType, name: &str) -> StructField {
@@ -282,6 +302,15 @@ async fn updated_schema_drop_keeps_max_column_id() -> delta_kernel::Result<()> {
 
     assert!(!committed.schema().contains("zip"));
     assert_eq!(max_column_id(&committed), max_column_id(&snapshot));
+    let (before, after) = (
+        snapshot.table_configuration(),
+        committed.table_configuration(),
+    );
+    assert_eq!(
+        after.metadata().configuration(),
+        before.metadata().configuration()
+    );
+    assert_eq!(after.protocol(), before.protocol());
     for name in ["id", "name"] {
         assert_eq!(field(&committed.schema(), name), field(&old_schema, name));
     }
@@ -315,8 +344,12 @@ async fn updated_schema_rejects_reusing_a_dropped_column_mapping_id() -> delta_k
     ]);
     let mut fields: Vec<_> = dropped.schema().fields().cloned().collect();
     fields.push(reused);
-    let result = update_schema(&dropped, engine.as_ref(), with_fields(fields));
-    assert_result_error_with_message(result, "does not belong to an existing field");
+    assert_update_rejected(
+        &dropped,
+        engine.as_ref(),
+        with_fields(fields),
+        "does not belong to an existing field",
+    );
     Ok(())
 }
 
@@ -350,6 +383,14 @@ type SchemaEdit = fn(&StructType) -> Vec<StructField>;
             MetadataValue::String("upper(name)".into()),
         )])),
     "delta.generationExpression"
+)]
+#[case::change_existing_default(
+    |s: &StructType| vec![
+        field(s, "id"),
+        field(s, "name").add_metadata([("CURRENT_DEFAULT", MetadataValue::String("'x'".into()))]),
+        field(s, "zip"),
+    ],
+    "Cannot change metadata 'CURRENT_DEFAULT' of existing field 'name'"
 )]
 #[case::change_protocol_metadata(
     |s: &StructType| vec![
@@ -431,7 +472,7 @@ async fn updated_schema_rejects_unsupported_changes(
         None,
     )?;
     let updated = with_fields(edit(&snapshot.schema()));
-    assert_result_error_with_message(update_schema(&snapshot, engine.as_ref(), updated), expected);
+    assert_update_rejected(&snapshot, engine.as_ref(), updated, expected);
     Ok(())
 }
 
@@ -471,8 +512,10 @@ async fn updated_schema_rejects_moving_a_nested_field_to_another_struct() -> del
         tags,
         field(&old_schema, "part"),
     ]);
-    assert_result_error_with_message(
-        update_schema(&snapshot, engine.as_ref(), updated),
+    assert_update_rejected(
+        &snapshot,
+        engine.as_ref(),
+        updated,
         "moved from 'address.zip' to 'tags.element.zip'",
     );
     Ok(())
@@ -489,8 +532,10 @@ async fn updated_schema_requires_column_mapping(
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot = create(&table_path, engine.as_ref(), flat_schema(), &[], None)?;
     let updated = with_fields(edit(&snapshot.schema()));
-    assert_result_error_with_message(
-        update_schema(&snapshot, engine.as_ref(), updated),
+    assert_update_rejected(
+        &snapshot,
+        engine.as_ref(),
+        updated,
         "Updating the table schema requires column mapping",
     );
     Ok(())
@@ -517,8 +562,10 @@ async fn updated_schema_rejects_dropping_or_renaming_partition_columns(
         Some(DataLayout::partitioned(["part"])),
     )?;
     let updated = with_fields(edit(&snapshot.schema()));
-    assert_result_error_with_message(
-        update_schema(&snapshot, engine.as_ref(), updated),
+    assert_update_rejected(
+        &snapshot,
+        engine.as_ref(),
+        updated,
         "Cannot drop or rename partition column 'part'",
     );
     Ok(())
@@ -542,6 +589,7 @@ async fn updated_schema_cannot_be_combined_with_incremental_schema_changes()
         .with_updated_schema(snapshot.schema())
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
     assert_result_error_with_message(result, "with_updated_schema cannot be combined");
+    assert_nothing_committed(&snapshot, engine.as_ref());
     Ok(())
 }
 
@@ -649,8 +697,10 @@ async fn updated_schema_rejects_renaming_a_collated_field() -> delta_kernel::Res
         None,
     )?;
     let renamed = with_fields([field(&snapshot.schema(), "s").with_name("t")]);
-    assert_result_error_with_message(
-        update_schema(&snapshot, engine.as_ref(), renamed),
+    assert_update_rejected(
+        &snapshot,
+        engine.as_ref(),
+        renamed,
         "Renaming field 's' with a collation is not supported",
     );
     Ok(())
@@ -675,9 +725,105 @@ async fn updated_schema_rejects_dropping_or_renaming_stats_columns(
         None,
     )?;
     let updated = with_fields(edit(&snapshot.schema()));
-    assert_result_error_with_message(
-        update_schema(&snapshot, engine.as_ref(), updated),
+    assert_update_rejected(
+        &snapshot,
+        engine.as_ref(),
+        updated,
         "Cannot drop or rename column 'name': it is listed in delta.dataSkippingStatsColumns",
     );
+    Ok(())
+}
+
+fn container_schema() -> SchemaRef {
+    let tag = StructType::try_new([StructField::nullable("label", DataType::STRING)]).unwrap();
+    Arc::new(
+        StructType::try_new([
+            StructField::nullable("tags", ArrayType::new(tag, true)),
+            StructField::nullable("scores", ArrayType::new(DataType::INTEGER, true)),
+            StructField::nullable(
+                "attrs",
+                MapType::new(DataType::STRING, DataType::INTEGER, true),
+            ),
+        ])
+        .unwrap(),
+    )
+}
+
+/// Returns the fields of `schema` with the type of field `name` replaced by `data_type`.
+fn retype(schema: &StructType, name: &str, data_type: DataType) -> Vec<StructField> {
+    schema
+        .fields()
+        .map(|f| match f.name() == name {
+            true => StructField {
+                data_type: data_type.clone(),
+                ..f.clone()
+            },
+            false => f.clone(),
+        })
+        .collect()
+}
+
+#[rstest]
+#[case::array_contains_null_tightened(
+    |s: &StructType| {
+        let DataType::Array(tags) = field(s, "tags").data_type().clone() else { unreachable!() };
+        retype(s, "tags", ArrayType::new(tags.element_type().clone(), false).into())
+    },
+    "Cannot tighten the nullability of existing field 'tags'"
+)]
+#[case::map_value_contains_null_tightened(
+    |s: &StructType| retype(
+        s,
+        "attrs",
+        MapType::new(DataType::STRING, DataType::INTEGER, false).into(),
+    ),
+    "Cannot tighten the nullability of existing field 'attrs'"
+)]
+#[case::array_to_primitive(
+    |s: &StructType| retype(s, "tags", DataType::STRING),
+    "Cannot change the type of existing field 'tags'"
+)]
+#[case::array_to_map(
+    |s: &StructType| retype(
+        s,
+        "scores",
+        MapType::new(DataType::INTEGER, DataType::INTEGER, true).into(),
+    ),
+    "Cannot change the type of existing field 'scores'"
+)]
+#[case::array_element_type(
+    |s: &StructType| retype(s, "scores", ArrayType::new(DataType::STRING, true).into()),
+    "Cannot change the type of existing field 'scores'"
+)]
+#[case::map_value_type(
+    |s: &StructType| retype(
+        s,
+        "attrs",
+        MapType::new(DataType::STRING, DataType::STRING, true).into(),
+    ),
+    "Cannot change the type of existing field 'attrs'"
+)]
+#[case::widening_not_yet_supported(
+    |s: &StructType| retype(s, "scores", ArrayType::new(DataType::LONG, true).into()),
+    "Cannot change the type of existing field 'scores'"
+)]
+#[tokio::test]
+async fn updated_schema_rejects_container_and_type_changes(
+    #[case] edit: SchemaEdit,
+    #[case] expected: &str,
+) -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create(
+        &table_path,
+        engine.as_ref(),
+        container_schema(),
+        &[
+            ("delta.columnMapping.mode", "name"),
+            ("delta.enableTypeWidening", "true"),
+        ],
+        None,
+    )?;
+    let updated = with_fields(edit(&snapshot.schema()));
+    assert_update_rejected(&snapshot, engine.as_ref(), updated, expected);
     Ok(())
 }
