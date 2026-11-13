@@ -114,6 +114,10 @@ pub(crate) fn evolve_metadata_to_schema(
         validate_field_update(update)?;
     }
     validate_partition_columns_unchanged(table_config.metadata(), &current_schema, &schema)?;
+    // The stats-column and change-data-feed checks below read the configuration before the
+    // transaction. No property setter is combined with this path yet; once one is, they must use
+    // the final configuration, so that a request that also replaces
+    // `delta.dataSkippingStatsColumns` or enables change data feed is checked against it.
     if let Some(columns) = &table_config.table_properties().data_skipping_stats_columns {
         validate_stats_columns_unchanged(columns, &current_schema, &schema)?;
     }
