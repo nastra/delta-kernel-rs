@@ -7,7 +7,7 @@
 //! and receive fresh identities; Kernel never accepts a caller-chosen identity for a new field.
 //! This mirrors Delta Kernel Java's `SchemaUtils.validateUpdatedSchemaAndGetUpdatedSchema`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use self::type_widening::AllowedTypeWidening;
@@ -101,21 +101,16 @@ pub(crate) fn evolve_metadata_to_schema(
         );
         StructType::ensure_no_metadata_columns_in_field(field)?;
     }
-    let mut current_ids = HashSet::new();
-    for_each_struct_field(&current_schema, |field| {
-        current_ids.extend(field.column_mapping_id());
-        Ok(())
-    })?;
-    for_each_struct_field(schema, |field| {
-        reject_caller_assigned_column_mapping_metadata(field, &current_ids)
-    })?;
-
-    let schema = assign_new_field_identities(schema, &mut max_column_id)?;
     let mut current_fields = HashMap::new();
     for_each_struct_field(&current_schema, |field| {
         current_fields.extend(field.column_mapping_id().map(|id| (id, field)));
         Ok(())
     })?;
+    for_each_struct_field(schema, |field| {
+        reject_caller_assigned_column_mapping_metadata(field, &current_fields)
+    })?;
+
+    let schema = assign_new_field_identities(schema, &mut max_column_id)?;
     let schema = type_widening::apply_type_changes(
         &current_fields,
         &schema,
@@ -232,23 +227,40 @@ pub(crate) fn validate_clustering_columns_retained(
     Ok(())
 }
 
-/// Rejects column-mapping metadata that does not identify an existing field.
+/// Rejects column-mapping metadata that does not identify an existing field, and changes to the
+/// `delta.columnMapping.nested.ids` of an existing field.
 ///
 /// Kernel assigns the identity of new fields. A caller-chosen ID or physical name could belong to
-/// a field dropped earlier, whose values existing data files still contain.
+/// a field dropped earlier, whose values existing data files still contain. Existing data files
+/// also carry the nested ids of array elements and map keys and values, which Kernel assigns
+/// when IcebergCompat is enabled.
 fn reject_caller_assigned_column_mapping_metadata(
     field: &StructField,
-    current_ids: &HashSet<i64>,
+    current_fields: &HashMap<i64, &StructField>,
 ) -> KernelResult<()> {
     let annotations = field.validate_and_extract_existing_column_mapping_annotations()?;
     match (annotations.id, annotations.physical_name) {
         (None, None) => Ok(()),
-        (Some(id), Some(_)) if current_ids.contains(&id) => Ok(()),
-        (Some(id), Some(_)) => Err(KernelError::schema(format!(
-            "Field '{}' has column mapping id {id}, which does not belong to an existing field. \
-             Omit column mapping metadata from new fields; Kernel assigns it",
-            field.name()
-        ))),
+        (Some(id), Some(_)) => match current_fields.get(&id) {
+            Some(current) => {
+                let key = ColumnMetadataKey::ColumnMappingNestedIds;
+                require!(
+                    field.get_config_value(&key) == current.get_config_value(&key),
+                    KernelError::schema(format!(
+                        "Cannot change `{}` of existing field '{}'. Keep the value from the \
+                         snapshot schema; Kernel assigns nested ids",
+                        key.as_ref(),
+                        field.name()
+                    ))
+                );
+                Ok(())
+            }
+            None => Err(KernelError::schema(format!(
+                "Field '{}' has column mapping id {id}, which does not belong to an existing \
+                 field. Omit column mapping metadata from new fields; Kernel assigns it",
+                field.name()
+            ))),
+        },
         _ => Err(KernelError::schema(format!(
             "Field '{}' must carry both `{}` and `{}`, or neither",
             field.name(),
@@ -504,6 +516,16 @@ impl<'a, F: FnMut(&'a StructField) -> KernelResult<()>> SchemaTransform<'a>
     fn transform_struct_field(&mut self, field: &'a StructField) -> KernelResult<()> {
         (self.0)(field)?;
         self.recurse_into_struct_field(field)
+    }
+
+    // The fields inside variant and file values are part of the type, not table columns: they
+    // carry no column-mapping identity and may be non-nullable.
+    fn transform_variant(&mut self, _: &'a StructType) -> KernelResult<()> {
+        Ok(())
+    }
+
+    fn transform_file(&mut self, _: &'a StructType) -> KernelResult<()> {
+        Ok(())
     }
 }
 

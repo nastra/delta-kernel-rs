@@ -116,9 +116,9 @@ commit includes a Protocol action. For example, adding a `TIMESTAMP_NTZ` column 
 `fileType-preview` this way and keeps every feature the table already supports.
 
 > [!NOTE]
-> Kernel rejects schema changes at `build()` when `icebergCompatV2`, `icebergCompatV3`, or
-> `allowColumnDefaults` is enabled, or when the table has generated columns. This restriction
-> applies to both workflows, regardless of the transaction operation or `dataChange` value.
+> Kernel rejects schema changes at `build()` when `allowColumnDefaults` is enabled or when the
+> table has generated columns. This restriction applies to both workflows, regardless of the
+> transaction operation or `dataChange` value.
 
 ## Chaining multiple operations
 

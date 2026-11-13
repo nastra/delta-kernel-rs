@@ -220,21 +220,24 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// with a non-zero scale, because Kernel cannot parse its existing partition values as the new
     /// type.
     ///
+    /// When `icebergCompatV2` or `icebergCompatV3` is enabled, Kernel assigns
+    /// `delta.columnMapping.nested.ids` to the array elements and map keys and values of new
+    /// fields, and the new schema must satisfy that version's type and type-change rules.
+    ///
     /// [`build`](Self::build) rejects the update if the table does not use column mapping, or if
     /// the schema has no columns, tightens nullability, makes any other type change or alters
-    /// `delta.typeChanges`, moves a field to a different parent struct, drops or renames a
-    /// partition column or a column listed in `delta.dataSkippingStatsColumns`, drops a clustering
-    /// column, renames a collated field, adds a non-nullable field (at any nesting depth), a field
-    /// with a default value, or a field with generation or identity metadata, or changes
-    /// protocol-defined field metadata such as generation expressions, invariants, or defaults.
-    /// It cannot be combined with
+    /// `delta.typeChanges` or `delta.columnMapping.nested.ids`, moves a field to a different parent
+    /// struct, drops or renames a partition column or a column listed in
+    /// `delta.dataSkippingStatsColumns`, drops a clustering column, renames a collated field, adds
+    /// a non-nullable field (at any nesting depth), a field with a default value, or a field with
+    /// generation or identity metadata, or changes protocol-defined field metadata such as
+    /// generation expressions, invariants, or defaults. It cannot be combined with
     /// [`add_column`](Self::add_column), [`add_column_at`](Self::add_column_at), or
     /// [`set_nullable`](Self::set_nullable) in the same transaction.
     ///
     /// Unlike Delta Kernel Java, `build()` also rejects any schema update on a table with
-    /// `icebergCompatV2` or `icebergCompatV3` enabled, with `allowColumnDefaults` enabled, or with
-    /// generated columns. Kernel cannot yet maintain the nested Iceberg field IDs, default values,
-    /// or generation expressions of those tables when their schema changes.
+    /// `allowColumnDefaults` enabled or with generated columns. Kernel cannot yet maintain the
+    /// default values or generation expressions of those tables when their schema changes.
     pub fn with_updated_schema(mut self, schema: SchemaRef) -> Self {
         self.local_state.updated_schema = Some(schema);
         self
@@ -277,9 +280,9 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// - Conflicting application ids or domain metadata, or reserved or unsupported domains.
     /// - Connector commit information that does not contain exactly one row.
     ///
-    /// Schema changes are rejected when `icebergCompatV2`, `icebergCompatV3`, or
-    /// `allowColumnDefaults` is enabled, or when the table has generated columns. This applies to
-    /// standalone ALTER TABLE transactions and schema evolution during data-changing writes.
+    /// Schema changes are rejected when `allowColumnDefaults` is enabled or when the table has
+    /// generated columns. This applies to standalone ALTER TABLE transactions and schema evolution
+    /// during data-changing writes.
     pub fn build(
         self,
         engine: &dyn Engine,
@@ -887,12 +890,9 @@ mod tests {
             1
         );
         let result = builder.build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
-        if let Some(feature) = feature.filter(|_| feature_enabled) {
-            assert!(
-                snapshot
-                    .table_configuration()
-                    .is_feature_supported(&feature)
-            );
+        if let Some(feature) = feature
+            .filter(|feature| feature_enabled && *feature == TableFeature::AllowColumnDefaults)
+        {
             assert!(snapshot.table_configuration().is_feature_enabled(&feature));
             let error = result.unwrap_err();
             let expected =
@@ -1448,8 +1448,8 @@ mod tests {
         Ok(())
     }
 
-    // A table with icebergCompatV3 enabled rejects any schema update before widening is checked,
-    // so enabling it in the same request is the way to reach the restriction today.
+    // Enabling icebergCompatV3 in the same request restricts widening before the V3 enablement
+    // itself is rejected.
     #[rstest]
     #[case::outside_the_iceberg_subset(
         DataType::DOUBLE,
@@ -1875,8 +1875,34 @@ mod tests {
     }
 
     #[rstest]
-    #[case::iceberg_compat_v2(TableFeature::IcebergCompatV2, "icebergCompatV2 enabled")]
-    #[case::iceberg_compat_v3(TableFeature::IcebergCompatV3, "icebergCompatV3 enabled")]
+    fn updated_schema_commits_on_iceberg_compat_tables(
+        #[values(TableFeature::IcebergCompatV2, TableFeature::IcebergCompatV3)]
+        feature: TableFeature,
+    ) -> Result<()> {
+        let (engine, snapshot, _tempdir) = create_schema_validation_table(Some(&feature), true);
+        let schema = snapshot.schema();
+        let updated = StructType::try_new(
+            schema
+                .fields()
+                .cloned()
+                .chain([StructField::nullable("added", DataType::STRING)]),
+        )?;
+        snapshot
+            .clone()
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_updated_schema(Arc::new(updated))
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
+            .unwrap_committed();
+
+        let reloaded = Snapshot::builder_for(snapshot.table_root()).build(engine.as_ref())?;
+        assert_eq!(reloaded.version(), snapshot.version() + 1);
+        assert!(reloaded.schema().field("added").is_some());
+        assert!(reloaded.table_configuration().is_feature_enabled(&feature));
+        Ok(())
+    }
+
+    #[rstest]
     #[case::column_defaults(TableFeature::AllowColumnDefaults, "allowColumnDefaults enabled")]
     fn updated_schema_is_rejected_on_tables_kernel_cannot_evolve_yet(
         #[case] feature: TableFeature,
