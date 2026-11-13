@@ -366,27 +366,25 @@ fn validate_transitions(
     }
 }
 
-/// Requires materialized row-tracking column names when row tracking is enabled, and rejects names
-/// that collide with a top-level logical or physical column name.
+/// Requires materialized row-tracking column names when row tracking is enabled, and rejects
+/// configured names that collide with a top-level logical or physical column name, whether or not
+/// row tracking is enabled.
 fn validate_row_tracking_column_names(table_config: &TableConfiguration) -> KernelResult<()> {
-    if table_config.table_properties().enable_row_tracking != Some(true) {
-        return Ok(());
-    }
+    let row_tracking_enabled = table_config.table_properties().enable_row_tracking == Some(true);
     let schema = table_config.logical_schema();
     let column_mapping_mode = table_config.column_mapping_mode();
     for key in [
         MATERIALIZED_ROW_ID_COLUMN_NAME,
         MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
     ] {
-        let name = table_config
-            .metadata()
-            .configuration()
-            .get(key)
-            .ok_or_else(|| {
-                KernelError::generic(format!(
+        let Some(name) = table_config.metadata().configuration().get(key) else {
+            if row_tracking_enabled {
+                return Err(KernelError::generic(format!(
                     "Row tracking is enabled but the materialized column name '{key}' is missing"
-                ))
-            })?;
+                )));
+            }
+            continue;
+        };
         if schema
             .fields()
             .any(|field| field.name() == name || field.physical_name(column_mapping_mode) == name)
@@ -538,6 +536,28 @@ mod tests {
             false,
         )
         .unwrap()
+    }
+
+    /// Returns `snapshot` with `key` set to `value`, or removed when `value` is `None`, in its
+    /// metadata. Used for table states that CREATE TABLE cannot produce.
+    fn with_configuration_entry(snapshot: &Snapshot, key: &str, value: Option<&str>) -> Snapshot {
+        let read_config = snapshot.table_configuration();
+        let mut configuration = read_config.metadata().configuration().clone();
+        match value {
+            Some(value) => configuration.insert(key.to_string(), value.to_string()),
+            None => configuration.remove(key),
+        };
+        let metadata = read_config
+            .metadata()
+            .clone()
+            .with_configuration(configuration);
+        let table_config = TableConfiguration::try_new_with_schema(
+            read_config,
+            metadata,
+            read_config.logical_schema(),
+        )
+        .unwrap();
+        with_table_config(snapshot, table_config)
     }
 
     fn configuration_value<'a>(config: &'a TableConfiguration, key: &str) -> Option<&'a str> {
@@ -996,9 +1016,21 @@ mod tests {
         assert!(configuration_value(config, IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP).is_none());
     }
 
-    #[test]
-    fn row_tracking_column_name_conflicting_with_column_is_rejected() {
+    #[rstest]
+    fn row_tracking_column_name_conflicting_with_column_is_rejected(
+        #[values(true, false)] row_tracking_enabled: bool,
+    ) {
         let (engine, snapshot) = create_test_table(&[(ENABLE_ROW_TRACKING, "true")]);
+        let snapshot = if row_tracking_enabled {
+            snapshot
+        } else {
+            // Names stay configured after row tracking is disabled.
+            Arc::new(with_configuration_entry(
+                &snapshot,
+                ENABLE_ROW_TRACKING,
+                Some("false"),
+            ))
+        };
         let row_id_name = configuration_value(
             snapshot.table_configuration(),
             MATERIALIZED_ROW_ID_COLUMN_NAME,
