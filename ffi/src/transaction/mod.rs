@@ -3392,7 +3392,7 @@ mod tests {
         assert_extern_result_error_contains(
             unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) },
             FFIKernelError::InvalidTransactionStateError,
-            "ALTER TABLE requires at least one schema change",
+            "ALTER TABLE requires at least one metadata change",
         );
         unsafe {
             free_snapshot(snapshot);
