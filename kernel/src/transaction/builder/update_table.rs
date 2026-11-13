@@ -203,7 +203,8 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// identified by their column-mapping ID, so keep each retained field's column-mapping
     /// metadata. A field without column-mapping metadata is new and receives a fresh ID and
     /// physical name; new fields must not carry column-mapping metadata of their own. Omitting an
-    /// existing field drops it. Repeated calls replace the previous schema.
+    /// existing field drops it. A retained field that omits its `delta.typeChanges` history keeps
+    /// the current history. Repeated calls replace the previous schema.
     ///
     /// Supported changes are adding nullable fields, dropping fields, renaming fields, reordering
     /// fields within their struct, changing comments and other non-protocol field metadata, and
