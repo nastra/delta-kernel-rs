@@ -136,8 +136,8 @@ let result = snapshot
 ```
 
 Building an `UpdateTableOperation::AlterTable` transaction without a schema operation or a table
-property change returns an error. The unified builder performs this check at runtime because other operations may combine
-schema evolution with data-file actions.
+property change returns an error. The unified builder performs this check at runtime because other
+operations may combine schema evolution with data-file actions.
 
 ## Setting table properties
 
