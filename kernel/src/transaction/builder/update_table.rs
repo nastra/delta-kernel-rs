@@ -415,9 +415,10 @@ mod tests {
     use crate::schema::{DataType, StructField, schema_ref};
     use crate::snapshot::Snapshot;
     use crate::table_configuration::InCommitTimestampEnablement;
-    use crate::table_features::TableFeature;
+    use crate::table_features::{ColumnMappingMode, TableFeature};
     use crate::table_properties::{
-        ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
+        COLUMN_MAPPING_MODE, ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3,
+        ENABLE_IN_COMMIT_TIMESTAMPS,
     };
     use crate::transaction::create_table::create_table;
     use crate::transaction::{SchemaOperation, UpdateTableOperation};
@@ -1212,6 +1213,48 @@ mod tests {
             reloaded.reader().get_in_commit_timestamp(&engine)?,
             Some(timestamp)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn enabling_column_mapping_name_mode_keeps_existing_data_readable() -> Result<()> {
+        fn read_columns(snapshot: &SnapshotRef, engine: &Arc<SyncEngine>) -> Result<Vec<ArrayRef>> {
+            let mut columns = Vec::new();
+            for data in snapshot
+                .clone()
+                .scan_builder()
+                .build()?
+                .execute(engine.clone())?
+            {
+                let batch = ArrowEngineData::try_from_engine_data(data?)?;
+                columns.extend(batch.record_batch().columns().iter().cloned());
+            }
+            Ok(columns)
+        }
+
+        let (url, _tempdir) = copy_test_table("table-without-dv-small")?;
+        let engine = Arc::new(SyncEngine::new());
+        let snapshot = Snapshot::builder_for(url.as_str()).build(engine.as_ref())?;
+        let columns = read_columns(&snapshot, &engine)?;
+        assert!(!columns.is_empty());
+
+        let mut builder =
+            snapshot.update_table(UpdateTableOperation::AlterTable, "test-engine", false);
+        builder
+            .local_state
+            .properties_added
+            .insert(COLUMN_MAPPING_MODE.to_string(), "name".to_string());
+        builder
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
+            .unwrap_committed();
+
+        let reloaded = Snapshot::builder_for(url.as_str()).build(engine.as_ref())?;
+        assert_eq!(
+            reloaded.table_configuration().column_mapping_mode(),
+            ColumnMappingMode::Name
+        );
+        assert_eq!(read_columns(&reloaded, &engine)?, columns);
         Ok(())
     }
 

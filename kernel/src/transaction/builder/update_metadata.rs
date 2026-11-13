@@ -5,7 +5,9 @@
 //! require, and validates the result. It mirrors Delta Kernel Java's
 //! `TransactionMetadataFactory.buildUpdateTableMetadata`.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use super::metadata_derivation::{
     ValidatedTableProperties, maybe_auto_enable_property_driven_features, maybe_enable_collations,
@@ -14,20 +16,24 @@ use super::metadata_derivation::{
     validate_extract_features_and_properties_for,
 };
 use crate::actions::{Metadata, Protocol};
-use crate::schema::SchemaRef;
+use crate::schema::{ColumnMetadataKey, MetadataValue, SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     ColumnMappingMode, LEGACY_WRITER_FEATURES, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
     TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature,
+    assign_column_mapping_metadata, drop_column_mapping_metadata,
     ensure_domain_metadata_dependency, extract_enabled_reader_features,
+    get_column_mapping_mode_from_properties,
 };
 use crate::table_properties::{
-    COLUMN_MAPPING_MAX_COLUMN_ID, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
-    IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP, IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
-    MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME, TableProperties,
+    COLUMN_MAPPING_MAX_COLUMN_ID, ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3,
+    ENABLE_IN_COMMIT_TIMESTAMPS, IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP,
+    IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
+    MATERIALIZED_ROW_ID_COLUMN_NAME, TableProperties,
 };
 use crate::transaction::schema_evolution::{SchemaOperation, evolve_metadata};
+use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::{Engine, KernelError, KernelResult};
 
 /// Operation name used in property validation errors.
@@ -78,9 +84,14 @@ pub(super) struct PreparedUpdateTableMetadata {
 /// protocol. When the transaction enables in-commit timestamps, the enablement version and
 /// timestamp are recorded for the commit at `read_snapshot.version() + 1` and `commit_timestamp`.
 ///
-/// Rejected transitions on existing tables: changing the column mapping mode, enabling or
-/// disabling row tracking, enabling or disabling `icebergCompatV3`, and disabling in-commit
-/// timestamps on a catalog-managed table.
+/// Enabling column mapping mode `name` on a table without column mapping assigns ids to the
+/// existing fields and uses their current names as physical names, since existing data files were
+/// written with those names.
+///
+/// Rejected transitions on existing tables: column mapping mode changes other than `none` ->
+/// `name`, a column mapping mode change combined with schema changes, enabling or disabling row
+/// tracking, enabling or disabling `icebergCompatV3`, and disabling in-commit timestamps on a
+/// catalog-managed table.
 pub(super) fn prepare_update_table_metadata(
     read_snapshot: &Snapshot,
     request: UpdateTableMetadataRequest,
@@ -106,7 +117,7 @@ pub(super) fn prepare_update_table_metadata(
     // identities (and `maxColumnId`) to added fields. The evolved schema is validated against the
     // final protocol below, after deriving the features it requires.
     let has_schema_changes = schema_changes.is_some();
-    let (evolved_metadata, schema) = match schema_changes {
+    let (mut evolved_metadata, mut schema) = match schema_changes {
         Some(changes) => apply_schema_changes(read_config, changes)?,
         None => (read_config.metadata().clone(), read_config.logical_schema()),
     };
@@ -117,7 +128,13 @@ pub(super) fn prepare_update_table_metadata(
     let mut configuration = evolved_metadata.configuration().clone();
     configuration.extend(requested.properties.drain());
     configuration.retain(|key, _| !property_keys_removed.contains(key));
-    validate_transitions(read_config, &configuration)?;
+    validate_transitions(read_config, &configuration, has_schema_changes)?;
+    if get_column_mapping_mode_from_properties(read_config.metadata().configuration())?
+        != get_column_mapping_mode_from_properties(&configuration)?
+    {
+        schema = assign_column_mapping_to_existing_fields(&schema, &mut configuration)?;
+        evolved_metadata = evolved_metadata.with_schema(schema.clone())?;
+    }
     let explicit_ict = properties_added
         .get(ENABLE_IN_COMMIT_TIMESTAMPS)
         .map(String::as_str);
@@ -290,22 +307,27 @@ fn validate_property_removals(
 fn validate_transitions(
     old: &TableConfiguration,
     new_configuration: &HashMap<String, String>,
+    has_schema_changes: bool,
 ) -> KernelResult<()> {
     let old_properties = old.table_properties();
     let new_properties = TableProperties::from(new_configuration.iter());
-    // Changing the mode requires rewriting the schema with identities that match existing data
-    // files, which Kernel does not support.
-    let old_mode = old_properties
-        .column_mapping_mode
-        .unwrap_or(ColumnMappingMode::None);
-    let new_mode = new_properties
-        .column_mapping_mode
-        .unwrap_or(ColumnMappingMode::None);
+    // Only `none` -> `name` keeps existing data files readable without rewriting them: the
+    // current field names become the physical names.
+    let old_mode = get_column_mapping_mode_from_properties(old.metadata().configuration())?;
+    let new_mode = get_column_mapping_mode_from_properties(new_configuration)?;
     if old_mode != new_mode {
-        return Err(KernelError::unsupported(format!(
-            "Changing the column mapping mode from {old_mode:?} to {new_mode:?} is not supported \
-             on an existing table"
-        )));
+        if (old_mode, new_mode) != (ColumnMappingMode::None, ColumnMappingMode::Name) {
+            return Err(KernelError::unsupported(format!(
+                "Changing the column mapping mode from {old_mode:?} to {new_mode:?} is not \
+                 supported on an existing table"
+            )));
+        }
+        if has_schema_changes {
+            return Err(KernelError::unsupported(
+                "Cannot update the column mapping mode and perform schema changes in one \
+                 transaction",
+            ));
+        }
     }
     // Enabling requires backfilling row IDs and row commit versions; disabling is irreversible.
     if old_properties.enable_row_tracking.unwrap_or(false)
@@ -365,6 +387,44 @@ fn validate_row_tracking_column_names(table_config: &TableConfiguration) -> Kern
         }
     }
     Ok(())
+}
+
+/// Assigns column-mapping ids and physical names to every field of `schema` and records the new
+/// `delta.columnMapping.maxColumnId` in `configuration`. Each physical name is the field's current
+/// name, as in Java's `ColumnMapping.assignColumnIdAndPhysicalName(metadata, isNewTable = false)`.
+///
+/// Column-mapping annotations left over from earlier history are dropped first: with mapping
+/// disabled they do not describe the data files, which were written with the field names.
+fn assign_column_mapping_to_existing_fields(
+    schema: &StructType,
+    configuration: &mut HashMap<String, String>,
+) -> KernelResult<SchemaRef> {
+    struct FieldNameAsPhysicalName;
+    impl<'a> SchemaTransform<'a> for FieldNameAsPhysicalName {
+        transform_output_type!(|'a, T| Cow<'a, T>);
+        fn transform_struct_field(&mut self, field: &'a StructField) -> Cow<'a, StructField> {
+            let mut field = field.clone();
+            field.data_type = self.transform(&field.data_type).into_owned();
+            field.metadata.insert(
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref().into(),
+                MetadataValue::String(field.name.clone()),
+            );
+            Cow::Owned(field)
+        }
+    }
+    let schema = drop_column_mapping_metadata(schema);
+    let schema = FieldNameAsPhysicalName
+        .transform_struct(&schema)
+        .into_owned();
+    let assign_nested_field_ids = [ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3]
+        .iter()
+        .any(|key| configuration.get(*key).map(String::as_str) == Some("true"));
+    let mut max_id = TableProperties::from(configuration.iter())
+        .column_mapping_max_column_id
+        .unwrap_or(0);
+    let schema = assign_column_mapping_metadata(&schema, &mut max_id, assign_nested_field_ids)?;
+    configuration.insert(COLUMN_MAPPING_MAX_COLUMN_ID.to_string(), max_id.to_string());
+    Ok(Arc::new(schema))
 }
 
 /// Adds `reader_features` and `writer_features` to the protocol of `table_config`, retaining every
@@ -739,7 +799,12 @@ mod tests {
         &[(ENABLE_ICEBERG_COMPAT_V3, "false")],
         "Disabling 'delta.enableIcebergCompatV3'"
     )]
-    #[case::enable_column_mapping(&[], &[(COLUMN_MAPPING_MODE, "name")], "column mapping mode")]
+    #[case::enable_column_mapping_id(&[], &[(COLUMN_MAPPING_MODE, "id")], "column mapping mode")]
+    #[case::disable_column_mapping(
+        &[(COLUMN_MAPPING_MODE, "name")],
+        &[(COLUMN_MAPPING_MODE, "none")],
+        "column mapping mode"
+    )]
     #[case::change_column_mapping(
         &[(COLUMN_MAPPING_MODE, "name")],
         &[(COLUMN_MAPPING_MODE, "id")],
@@ -754,6 +819,56 @@ mod tests {
         let error = prepare(engine.as_ref(), &snapshot, properties_request(requested)).unwrap_err();
         assert!(matches!(error, KernelError::Unsupported(_)), "{error}");
         assert!(error.to_string().contains(expected), "{error}");
+    }
+
+    #[test]
+    fn enabling_column_mapping_name_mode_assigns_existing_field_names_as_physical_names() {
+        let (engine, snapshot) = create_test_table(&[]);
+        let read_schema = snapshot.table_configuration().logical_schema();
+        let prepared = prepare(
+            engine.as_ref(),
+            &snapshot,
+            properties_request(&[(COLUMN_MAPPING_MODE, "name")]),
+        )
+        .unwrap();
+
+        assert!(prepared.should_emit_protocol);
+        assert!(prepared.should_emit_metadata);
+        let config = &prepared.table_config;
+        assert!(config.is_feature_supported(&TableFeature::ColumnMapping));
+        assert_eq!(config.column_mapping_mode(), ColumnMappingMode::Name);
+        let schema = config.logical_schema();
+        let mut ids: Vec<_> = schema
+            .fields()
+            .map(|field| {
+                assert_eq!(field.physical_name(ColumnMappingMode::Name), field.name());
+                field.column_mapping_id().unwrap()
+            })
+            .collect();
+        ids.sort_unstable();
+        let field_count = read_schema.fields().count() as i64;
+        assert_eq!(ids, (1..=field_count).collect::<Vec<_>>());
+        assert_eq!(
+            config.table_properties().column_mapping_max_column_id,
+            Some(field_count)
+        );
+    }
+
+    #[test]
+    fn enabling_column_mapping_with_schema_change_is_rejected() {
+        let (engine, snapshot) = create_test_table(&[]);
+        let mut request = add_column_request(StructField::nullable("added", DataType::STRING));
+        request
+            .properties_added
+            .insert(COLUMN_MAPPING_MODE.to_string(), "name".to_string());
+        let error = prepare(engine.as_ref(), &snapshot, request).unwrap_err();
+        assert!(matches!(error, KernelError::Unsupported(_)), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot update the column mapping mode and perform schema changes"),
+            "{error}"
+        );
     }
 
     #[test]
