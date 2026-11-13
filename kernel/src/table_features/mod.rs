@@ -22,7 +22,8 @@ pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 pub(crate) use iceberg_compat::v4::V4_VALIDATOR;
 pub(crate) use iceberg_compat::{
-    IcebergCompatValidationContext, validate_iceberg_compat_if_needed,
+    IcebergCompatValidationContext, is_iceberg_allowed_type_change,
+    validate_iceberg_compat_if_needed,
 };
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};

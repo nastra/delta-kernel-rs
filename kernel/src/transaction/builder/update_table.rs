@@ -211,9 +211,17 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// rewritten, and `delta.columnMapping.maxColumnId` never decreases. As with
     /// [`add_column`](Self::add_column), `build()` adds any table feature the new schema requires.
     ///
+    /// When `delta.enableTypeWidening` is `true`, the type of a field, array element, or map key
+    /// or value may also change to a wider type the Delta protocol supports, such as `integer` to
+    /// `long`. Kernel appends each change to the field's `delta.typeChanges` metadata, keeping the
+    /// existing history when the supplied field omits it. Partition columns cannot widen to a
+    /// decimal or `timestamp_ntz`, because Kernel cannot parse their existing partition values as
+    /// the new type.
+    ///
     /// [`build`](Self::build) rejects the update if the table does not use column mapping, or if
-    /// it tightens nullability, changes a field's type, moves a field to a different parent
-    /// struct, drops or renames a partition column or a column listed in
+    /// it tightens nullability, makes any other type change or alters `delta.typeChanges`, moves
+    /// a field to a different parent struct, drops or renames a partition column or a column
+    /// listed in
     /// `delta.dataSkippingStatsColumns`, drops a clustering column, renames a collated field, adds
     /// a non-nullable field or a field with a default value, or changes protocol-defined field
     /// metadata such as generation expressions, invariants, or defaults. It cannot be combined with

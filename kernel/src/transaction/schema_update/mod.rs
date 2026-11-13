@@ -7,9 +7,10 @@
 //! and receive fresh identities; Kernel never accepts a caller-chosen identity for a new field.
 //! This mirrors Delta Kernel Java's `SchemaUtils.validateUpdatedSchemaAndGetUpdatedSchema`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use self::type_widening::AllowedTypeWidening;
 use crate::actions::Metadata;
 use crate::expressions::ColumnName;
 use crate::schema::diff::{FieldChange, FieldChangeType, FieldUpdate, SchemaDiff};
@@ -29,10 +30,13 @@ use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::{FoldWithOption as _, require};
 use crate::{KernelError, KernelResult};
 
+mod type_widening;
+
 /// Replaces the table schema with `schema` and returns the evolved metadata and logical schema.
 ///
 /// Supported changes are nullable field additions, drops, renames, reordering within a struct,
-/// non-protocol metadata changes such as comments, and nullability relaxation. Existing fields
+/// non-protocol metadata changes such as comments, nullability relaxation, and type widening (see
+/// [`type_widening::apply_type_changes`]). Existing fields
 /// keep their column-mapping IDs and physical names; new fields get fresh ones and advance
 /// `delta.columnMapping.maxColumnId`, which never decreases.
 ///
@@ -91,6 +95,16 @@ pub(crate) fn evolve_metadata_to_schema(
     })?;
 
     let schema = assign_new_field_identities(schema, &mut max_column_id)?;
+    let mut current_fields = HashMap::new();
+    for_each_struct_field(&current_schema, |field| {
+        current_fields.extend(field.column_mapping_id().map(|id| (id, field)));
+        Ok(())
+    })?;
+    let schema = type_widening::apply_type_changes(
+        &current_fields,
+        &schema,
+        allowed_type_widening(table_config),
+    )?;
     let diff = SchemaDiff::new(&current_schema, &schema)
         .map_err(|e| KernelError::schema(format!("Invalid schema update: {e}")))?;
     for added in &diff.added_fields {
@@ -100,6 +114,11 @@ pub(crate) fn evolve_metadata_to_schema(
         validate_field_update(update)?;
     }
     validate_partition_columns_unchanged(table_config.metadata(), &current_schema, &schema)?;
+    type_widening::validate_partition_column_type_changes(
+        table_config.metadata().partition_columns(),
+        &current_schema,
+        &schema,
+    )?;
     if let Some(columns) = &table_config.table_properties().data_skipping_stats_columns {
         validate_stats_columns_unchanged(columns, &current_schema, &schema)?;
     }
@@ -119,6 +138,31 @@ pub(crate) fn evolve_metadata_to_schema(
             metadata.with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, id.to_string())
         });
     Ok((metadata, schema))
+}
+
+/// Returns the type changes `table_config` permits.
+///
+/// Reads the configuration before the transaction; a request that also changes the type-widening
+/// or icebergCompat properties would need the final configuration instead.
+fn allowed_type_widening(table_config: &TableConfiguration) -> AllowedTypeWidening {
+    let enabled = [
+        TableFeature::TypeWidening,
+        TableFeature::TypeWideningPreview,
+    ]
+    .iter()
+    .any(|feature| table_config.is_feature_enabled(feature));
+    let iceberg_compat = [
+        TableFeature::IcebergCompatV1,
+        TableFeature::IcebergCompatV2,
+        TableFeature::IcebergCompatV3,
+    ]
+    .iter()
+    .any(|feature| table_config.is_feature_supported(feature));
+    match (enabled, iceberg_compat) {
+        (false, _) => AllowedTypeWidening::None,
+        (true, false) => AllowedTypeWidening::Delta,
+        (true, true) => AllowedTypeWidening::IcebergV2,
+    }
 }
 
 /// Rejects an updated table configuration whose schema no longer contains every clustering column.
@@ -234,6 +278,16 @@ fn validate_added_field(added: &FieldChange) -> KernelResult<()> {
     for_each_struct_field_in(&added.field, |field| {
         require!(
             field
+                .get_config_value(&ColumnMetadataKey::TypeChanges)
+                .is_none(),
+            KernelError::schema(format!(
+                "Cannot add field '{}' under '{path}' with `{}` metadata",
+                field.name(),
+                ColumnMetadataKey::TypeChanges.as_ref()
+            ))
+        );
+        require!(
+            field
                 .get_config_value(&ColumnMetadataKey::CurrentDefault)
                 .is_none(),
             KernelError::schema(format!(
@@ -271,13 +325,8 @@ fn validate_field_update(update: &FieldUpdate) -> KernelResult<()> {
                     "Cannot tighten the nullability of existing field '{path}'"
                 )));
             }
-            FieldChangeType::TypeChanged => {
-                return Err(KernelError::schema(format!(
-                    "Cannot change the type of existing field '{path}' from {} to {}",
-                    update.before.data_type(),
-                    update.after.data_type()
-                )));
-            }
+            // Validated and recorded by `type_widening::apply_type_changes`.
+            FieldChangeType::TypeChanged => {}
             FieldChangeType::MetadataChanged => validate_metadata_change(update)?,
         }
     }
@@ -294,6 +343,8 @@ fn validate_metadata_change(update: &FieldUpdate) -> KernelResult<()> {
         .keys()
         .chain(after.keys())
         .filter(|key| before.get(*key) != after.get(*key))
+        // The type-change history is validated by `type_widening::apply_type_changes`.
+        .filter(|key| key.as_str() != ColumnMetadataKey::TypeChanges.as_ref())
         .find(|key| is_protocol_metadata_key(key.as_str()));
     match changed_key {
         Some(key) => Err(KernelError::schema(format!(
@@ -371,24 +422,26 @@ fn column_mapping_ids_at_path(schema: &StructType, path: &ColumnName) -> Option<
 }
 
 /// Calls `f` for every struct field in `schema`, at any nesting depth.
-fn for_each_struct_field(
-    schema: &StructType,
-    f: impl FnMut(&StructField) -> KernelResult<()>,
+fn for_each_struct_field<'a>(
+    schema: &'a StructType,
+    f: impl FnMut(&'a StructField) -> KernelResult<()>,
 ) -> KernelResult<()> {
     StructFieldVisitor(f).transform_struct(schema)
 }
 
 /// Calls `f` for `field` and every struct field nested in it.
-fn for_each_struct_field_in(
-    field: &StructField,
-    f: impl FnMut(&StructField) -> KernelResult<()>,
+fn for_each_struct_field_in<'a>(
+    field: &'a StructField,
+    f: impl FnMut(&'a StructField) -> KernelResult<()>,
 ) -> KernelResult<()> {
     StructFieldVisitor(f).transform_struct_field(field)
 }
 
 struct StructFieldVisitor<F>(F);
 
-impl<'a, F: FnMut(&StructField) -> KernelResult<()>> SchemaTransform<'a> for StructFieldVisitor<F> {
+impl<'a, F: FnMut(&'a StructField) -> KernelResult<()>> SchemaTransform<'a>
+    for StructFieldVisitor<F>
+{
     transform_output_type!(|'a, T| KernelResult<()>);
 
     fn transform_struct_field(&mut self, field: &'a StructField) -> KernelResult<()> {
