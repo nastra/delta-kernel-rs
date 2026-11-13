@@ -1537,6 +1537,43 @@ fn iceberg_compat_properties(compat: &str) -> Vec<(&'static str, &'static str)> 
     properties
 }
 
+#[rstest]
+#[case::inside_the_iceberg_subset(DataType::LONG, None)]
+#[case::outside_the_iceberg_subset(
+    DataType::DOUBLE,
+    Some("only allow type changes that Iceberg V2 supports")
+)]
+#[tokio::test]
+async fn updated_schema_restricts_widening_on_iceberg_compat_enabled_tables(
+    #[values("icebergCompatV2", "icebergCompatV3")] compat: &str,
+    #[case] element_type: DataType,
+    #[case] expected_error: Option<&str>,
+) -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let mut properties = iceberg_compat_properties(compat);
+    properties.push(TYPE_WIDENING);
+    let snapshot = create(
+        &table_path,
+        engine.as_ref(),
+        container_schema(),
+        &properties,
+        None,
+    )?;
+    let updated = with_fields(retype(
+        &snapshot.schema(),
+        "scores",
+        ArrayType::new(element_type, true).into(),
+    ));
+    match expected_error {
+        Some(expected) => assert_update_rejected(&snapshot, engine.as_ref(), updated, expected),
+        None => {
+            let committed = update_schema(&snapshot, engine.as_ref(), updated)?;
+            assert_eq!(committed.version(), snapshot.version() + 1);
+        }
+    }
+    Ok(())
+}
+
 fn create_iceberg_compat_table(
     table_path: &str,
     engine: &dyn Engine,

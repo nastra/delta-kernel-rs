@@ -1448,8 +1448,8 @@ mod tests {
         Ok(())
     }
 
-    // A table with icebergCompatV3 enabled rejects any schema update before widening is checked,
-    // so enabling it in the same request is the way to reach the restriction today.
+    // Enabling icebergCompatV3 in the same request restricts widening before the V3 enablement
+    // itself is rejected.
     #[rstest]
     #[case::outside_the_iceberg_subset(
         DataType::DOUBLE,
