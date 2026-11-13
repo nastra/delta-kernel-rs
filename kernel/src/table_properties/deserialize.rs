@@ -213,6 +213,13 @@ fn parse_interval_impl(value: &str) -> Result<Duration, ParseIntervalError> {
     // convert to u64 since Duration expects it
     let number = number as u64; // non-negative i64 => always safe
 
+    // Overflowing counts are rejected rather than wrapped (or panicking in debug builds).
+    let seconds = |seconds_per_unit: u64| {
+        number
+            .checked_mul(seconds_per_unit)
+            .map(Duration::from_secs)
+            .ok_or_else(|| ParseIntervalError::UnsupportedInterval(value.to_string()))
+    };
     let duration = match it
         .next()
         .ok_or_else(|| ParseIntervalError::NotAnInterval(value.to_string()))?
@@ -221,10 +228,10 @@ fn parse_interval_impl(value: &str) -> Result<Duration, ParseIntervalError> {
         "microsecond" | "microseconds" => Duration::from_micros(number),
         "millisecond" | "milliseconds" => Duration::from_millis(number),
         "second" | "seconds" => Duration::from_secs(number),
-        "minute" | "minutes" => Duration::from_secs(number * SECONDS_PER_MINUTE),
-        "hour" | "hours" => Duration::from_secs(number * SECONDS_PER_HOUR),
-        "day" | "days" => Duration::from_secs(number * SECONDS_PER_DAY),
-        "week" | "weeks" => Duration::from_secs(number * SECONDS_PER_WEEK),
+        "minute" | "minutes" => seconds(SECONDS_PER_MINUTE)?,
+        "hour" | "hours" => seconds(SECONDS_PER_HOUR)?,
+        "day" | "days" => seconds(SECONDS_PER_DAY)?,
+        "week" | "weeks" => seconds(SECONDS_PER_WEEK)?,
         unit @ ("month" | "months") => {
             return Err(ParseIntervalError::UnsupportedInterval(unit.to_string()));
         }
@@ -261,6 +268,21 @@ mod tests {
         assert_eq!(parse_non_negative::<i64>("12").unwrap(), 12);
         assert_eq!(parse_non_negative::<i64>("0").unwrap(), 0);
         assert_eq!(parse_non_negative::<i64>("-12"), None);
+    }
+
+    #[test]
+    fn parse_interval_rejects_overflowing_counts() {
+        for unit in ["minutes", "hours", "days", "weeks"] {
+            let value = format!("interval {} {unit}", i64::MAX);
+            assert!(
+                matches!(
+                    parse_interval_impl(&value),
+                    Err(ParseIntervalError::UnsupportedInterval(_))
+                ),
+                "{value}"
+            );
+        }
+        assert!(parse_interval("interval 100000000000000 weeks").is_none());
     }
 
     #[test]
