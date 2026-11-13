@@ -21,18 +21,17 @@ use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     ColumnMappingMode, IcebergCompatValidationContext, LEGACY_WRITER_FEATURES,
-    SET_TABLE_FEATURE_SUPPORTED_PREFIX, TABLE_FEATURES_MIN_READER_VERSION,
-    TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature, V2_VALIDATOR, V3_VALIDATOR,
-    assign_column_mapping_metadata, assign_nested_cm_ids, drop_column_mapping_metadata,
-    ensure_domain_metadata_dependency, extract_enabled_reader_features,
-    find_max_column_id_in_schema, get_column_mapping_mode_from_properties,
-    validate_iceberg_compat_if_needed,
+    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature,
+    V2_VALIDATOR, V3_VALIDATOR, assign_column_mapping_metadata, assign_nested_cm_ids,
+    drop_column_mapping_metadata, ensure_domain_metadata_dependency,
+    extract_enabled_reader_features, find_max_column_id_in_schema,
+    get_column_mapping_mode_from_properties, validate_iceberg_compat_if_needed,
 };
 use crate::table_properties::{
-    COLUMN_MAPPING_MAX_COLUMN_ID, ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3,
-    ENABLE_IN_COMMIT_TIMESTAMPS, IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP,
-    IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
-    MATERIALIZED_ROW_ID_COLUMN_NAME, TableProperties,
+    COLUMN_MAPPING_MAX_COLUMN_ID, DELTA_PROPERTY_PREFIX, ENABLE_ICEBERG_COMPAT_V2,
+    ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
+    IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP, IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
+    MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME, TableProperties,
 };
 use crate::transaction::schema_evolution::{SchemaOperation, evolve_metadata};
 use crate::transforms::{SchemaTransform, transform_output_type};
@@ -43,15 +42,6 @@ const UNIVERSAL_FORMAT_ENABLED_FORMATS: &str = "delta.universalFormat.enabledFor
 
 /// Operation name used in property validation errors.
 const UPDATE_TABLE: &str = "UPDATE TABLE";
-
-/// Properties that Kernel maintains on existing tables and that a transaction cannot set or remove.
-const KERNEL_MANAGED_PROPERTIES: &[&str] = &[
-    COLUMN_MAPPING_MAX_COLUMN_ID,
-    MATERIALIZED_ROW_ID_COLUMN_NAME,
-    MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
-    IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
-    IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP,
-];
 
 /// Schema and configuration changes requested for an existing table.
 #[derive(Debug, Default)]
@@ -336,10 +326,12 @@ fn validate_property_removals(
             overlapping.join(", ")
         )));
     }
-    if let Some(key) = property_keys_removed.iter().find(|key| {
-        key.starts_with(SET_TABLE_FEATURE_SUPPORTED_PREFIX)
-            || KERNEL_MANAGED_PROPERTIES.contains(&key.as_str())
-    }) {
+    // Like Java's `withTablePropertiesRemoved`, no `delta.*` key may be unset, whatever its case.
+    // Unsetting one would bypass the transition rules and the Kernel-managed keys.
+    if let Some(key) = property_keys_removed
+        .iter()
+        .find(|key| key.to_ascii_lowercase().starts_with(DELTA_PROPERTY_PREFIX))
+    {
         return Err(KernelError::generic(format!(
             "Unsetting table property '{key}' is not supported during {UPDATE_TABLE}"
         )));
@@ -585,6 +577,7 @@ mod tests {
     use crate::schema::{ArrayType, DataType, MapType};
     use crate::snapshot::SnapshotRef;
     use crate::table_configuration::InCommitTimestampEnablement;
+    use crate::table_features::SET_TABLE_FEATURE_SUPPORTED_PREFIX;
     use crate::table_properties::{CHECKPOINT_POLICY, COLUMN_MAPPING_MODE, ENABLE_ROW_TRACKING};
     use crate::transaction::create_table::create_table;
     use crate::unit_test_utils::{load_test_table, test_schema_flat};
@@ -954,6 +947,12 @@ mod tests {
         "Unsetting table property"
     )]
     #[case::unset_feature_signal(&[], &["delta.feature.rowTracking"], "Unsetting table property")]
+    #[case::unset_in_commit_timestamps(
+        &[],
+        &[ENABLE_IN_COMMIT_TIMESTAMPS],
+        "Unsetting table property"
+    )]
+    #[case::unset_delta_key_in_other_case(&[], &["DELTA.appendOnly"], "Unsetting table property")]
     #[case::set_and_unset(&[("app.key", "value")], &["app.key"], "both set and unset")]
     fn kernel_managed_and_conflicting_property_requests_are_rejected(
         #[case] added: &[(&str, &str)],
