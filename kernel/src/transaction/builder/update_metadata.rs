@@ -5,42 +5,43 @@
 //! require, and validates the result. It mirrors Delta Kernel Java's
 //! `TransactionMetadataFactory.buildUpdateTableMetadata`.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use super::metadata_derivation::{
-    ValidatedTableProperties, maybe_auto_enable_property_driven_features, maybe_enable_collations,
-    maybe_enable_ict_for_catalog_managed, maybe_enable_timestamp_ntz,
-    maybe_enable_v2_checkpoint_for_policy, maybe_enable_variant_type,
+    ALLOWED_DELTA_PROPERTIES, ValidatedTableProperties, maybe_auto_enable_property_driven_features,
+    maybe_enable_collations, maybe_enable_file_type_preview, maybe_enable_ict_for_catalog_managed,
+    maybe_enable_timestamp_ntz, maybe_enable_v2_checkpoint_for_policy, maybe_enable_variant_type,
     validate_extract_features_and_properties_for,
 };
 use crate::actions::{Metadata, Protocol};
-use crate::schema::SchemaRef;
+use crate::schema::{ColumnMetadataKey, MetadataValue, SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    ColumnMappingMode, LEGACY_WRITER_FEATURES, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
+    ColumnMappingMode, IcebergCompatValidationContext, LEGACY_WRITER_FEATURES,
     TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature,
-    ensure_domain_metadata_dependency, extract_enabled_reader_features,
+    V2_VALIDATOR, V3_VALIDATOR, assign_column_mapping_metadata, assign_nested_cm_ids,
+    drop_column_mapping_metadata, ensure_domain_metadata_dependency,
+    extract_enabled_reader_features, find_max_column_id_in_schema,
+    get_column_mapping_mode_from_properties, validate_iceberg_compat_if_needed,
 };
 use crate::table_properties::{
-    COLUMN_MAPPING_MAX_COLUMN_ID, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
+    COLUMN_MAPPING_MAX_COLUMN_ID, DELTA_PROPERTY_PREFIX, ENABLE_ICEBERG_COMPAT_V2,
+    ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
     IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP, IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
     MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME, TableProperties,
 };
 use crate::transaction::schema_evolution::{SchemaOperation, evolve_metadata};
+use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::{Engine, KernelError, KernelResult};
+
+/// Universal formats (UniForm) the table is converted to, as a comma-separated list.
+const UNIVERSAL_FORMAT_ENABLED_FORMATS: &str = "delta.universalFormat.enabledFormats";
 
 /// Operation name used in property validation errors.
 const UPDATE_TABLE: &str = "UPDATE TABLE";
-
-/// Properties that Kernel maintains on existing tables and that a transaction cannot set or remove.
-const KERNEL_MANAGED_PROPERTIES: &[&str] = &[
-    COLUMN_MAPPING_MAX_COLUMN_ID,
-    MATERIALIZED_ROW_ID_COLUMN_NAME,
-    MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
-    IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
-    IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP,
-];
 
 /// Schema and configuration changes requested for an existing table.
 #[derive(Debug, Default)]
@@ -78,9 +79,14 @@ pub(super) struct PreparedUpdateTableMetadata {
 /// protocol. When the transaction enables in-commit timestamps, the enablement version and
 /// timestamp are recorded for the commit at `read_snapshot.version() + 1` and `commit_timestamp`.
 ///
-/// Rejected transitions on existing tables: changing the column mapping mode, enabling or
-/// disabling row tracking, enabling or disabling `icebergCompatV3`, and disabling in-commit
-/// timestamps on a catalog-managed table.
+/// Enabling column mapping mode `name` on a table without column mapping assigns ids to the
+/// existing fields and uses their current names as physical names, since existing data files were
+/// written with those names.
+///
+/// Rejected transitions on existing tables: column mapping mode changes other than `none` ->
+/// `name`, a column mapping mode change combined with schema changes, enabling or disabling row
+/// tracking, enabling or disabling `icebergCompatV3`, and disabling in-commit timestamps on a
+/// catalog-managed table.
 pub(super) fn prepare_update_table_metadata(
     read_snapshot: &Snapshot,
     request: UpdateTableMetadataRequest,
@@ -101,12 +107,13 @@ pub(super) fn prepare_update_table_metadata(
         property_keys_removed,
     } = request;
     validate_property_removals(&properties_added, &property_keys_removed)?;
+    validate_property_value_case(&properties_added)?;
 
     // Schema changes preserve the column-mapping identities of surviving fields and assign new
     // identities (and `maxColumnId`) to added fields. The evolved schema is validated against the
     // final protocol below, after deriving the features it requires.
     let has_schema_changes = schema_changes.is_some();
-    let (evolved_metadata, schema) = match schema_changes {
+    let (mut evolved_metadata, mut schema) = match schema_changes {
         Some(changes) => apply_schema_changes(read_config, changes)?,
         None => (read_config.metadata().clone(), read_config.logical_schema()),
     };
@@ -117,7 +124,32 @@ pub(super) fn prepare_update_table_metadata(
     let mut configuration = evolved_metadata.configuration().clone();
     configuration.extend(requested.properties.drain());
     configuration.retain(|key, _| !property_keys_removed.contains(key));
-    validate_transitions(read_config, &configuration)?;
+    validate_transitions(read_config, &configuration, has_schema_changes)?;
+    let new_mode = get_column_mapping_mode_from_properties(&configuration)?;
+    let enables_column_mapping =
+        get_column_mapping_mode_from_properties(read_config.metadata().configuration())?
+            != new_mode;
+    if enables_column_mapping {
+        schema = assign_column_mapping_to_existing_fields(&schema, &mut configuration)?;
+    }
+    // Like Java's `rewriteFieldIdsForIceberg`, IcebergCompat requires ids for the array element and
+    // map key/value slots of a column-mapped schema.
+    let iceberg_compat_enabled = |configuration: &HashMap<String, String>| {
+        [ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3]
+            .iter()
+            .any(|key| configuration.get(*key).map(String::as_str) == Some("true"))
+    };
+    let enables_iceberg_compat = iceberg_compat_enabled(&configuration)
+        && !iceberg_compat_enabled(read_config.metadata().configuration());
+    if new_mode != ColumnMappingMode::None
+        && iceberg_compat_enabled(&configuration)
+        && (enables_column_mapping || enables_iceberg_compat)
+    {
+        schema = assign_iceberg_compat_nested_ids(&schema, &mut configuration)?;
+    }
+    if enables_column_mapping || enables_iceberg_compat {
+        evolved_metadata = evolved_metadata.with_schema(schema.clone())?;
+    }
     let explicit_ict = properties_added
         .get(ENABLE_IN_COMMIT_TIMESTAMPS)
         .map(String::as_str);
@@ -133,14 +165,23 @@ pub(super) fn prepare_update_table_metadata(
     let enables_catalog_managed = requested
         .writer_features
         .contains(&TableFeature::CatalogManaged);
-    if enables_catalog_managed && explicit_ict.is_none() {
-        configuration.insert(ENABLE_IN_COMMIT_TIMESTAMPS.to_string(), "true".to_string());
+    match explicit_ict {
+        Some(value) if enables_catalog_managed && value.eq_ignore_ascii_case("false") => {
+            return Err(KernelError::generic(
+                "Cannot disable inCommitTimestamp when enabling catalogManaged",
+            ));
+        }
+        None if enables_catalog_managed => {
+            configuration.insert(ENABLE_IN_COMMIT_TIMESTAMPS.to_string(), "true".to_string());
+        }
+        _ => {}
     }
     requested.properties = configuration;
 
     maybe_enable_variant_type(&schema, &mut requested);
     maybe_enable_timestamp_ntz(&schema, &mut requested);
     maybe_enable_collations(&schema, &mut requested);
+    maybe_enable_file_type_preview(&schema, &mut requested);
     maybe_auto_enable_property_driven_features(&mut requested);
     maybe_enable_ict_for_catalog_managed(&mut requested)?;
     maybe_enable_v2_checkpoint_for_policy(&mut requested);
@@ -205,14 +246,25 @@ pub(super) fn prepare_update_table_metadata(
     }
 
     validate_row_tracking_column_names(&table_config)?;
-    if should_emit_protocol {
-        table_config.ensure_write_supported()?;
-    }
     // Like Java, a removal request emits Metadata even when no requested key exists, so a
     // removal-only ALTER TABLE commits.
     let should_emit_metadata = has_schema_changes
         || !property_keys_removed.is_empty()
         || table_config.metadata() != read_config.metadata();
+    // A metadata-only change can break a feature requirement without changing the protocol, so
+    // the final configuration is validated whenever either action is emitted.
+    if should_emit_metadata || should_emit_protocol {
+        table_config.ensure_write_supported()?;
+        for validator in [&V2_VALIDATOR, &V3_VALIDATOR] {
+            validate_iceberg_compat_if_needed(
+                &table_config,
+                validator,
+                IcebergCompatValidationContext::Write,
+            )?;
+        }
+        validate_iceberg_compat_v2_without_deletion_vectors(read_config, &table_config)?;
+        validate_universal_format(table_config.metadata().configuration())?;
+    }
     Ok(PreparedUpdateTableMetadata {
         table_config,
         should_emit_metadata,
@@ -278,13 +330,38 @@ fn validate_property_removals(
             overlapping.join(", ")
         )));
     }
-    if let Some(key) = property_keys_removed.iter().find(|key| {
-        key.starts_with(SET_TABLE_FEATURE_SUPPORTED_PREFIX)
-            || KERNEL_MANAGED_PROPERTIES.contains(&key.as_str())
-    }) {
+    // Like Java's `withTablePropertiesRemoved`, no `delta.*` key may be unset, whatever its case.
+    // Unsetting one would bypass the transition rules and the Kernel-managed keys.
+    if let Some(key) = property_keys_removed
+        .iter()
+        .find(|key| key.to_ascii_lowercase().starts_with(DELTA_PROPERTY_PREFIX))
+    {
         return Err(KernelError::generic(format!(
             "Unsetting table property '{key}' is not supported during {UPDATE_TABLE}"
         )));
+    }
+    Ok(())
+}
+
+/// Rejects a value of a recognized `delta.*` property that Kernel parses only in another letter
+/// case, such as `TRUE`. Kernel would read such a value as unset, so the transition checks would
+/// not see it, while Java and Spark read it as set.
+fn validate_property_value_case(properties_added: &HashMap<String, String>) -> KernelResult<()> {
+    let parses = |key: &str, value: &str| {
+        !TableProperties::from([(key, value)])
+            .unknown_properties
+            .contains_key(key)
+    };
+    for (key, value) in properties_added {
+        if ALLOWED_DELTA_PROPERTIES.contains(&key.as_str())
+            && !parses(key, value)
+            && parses(key, &value.to_ascii_lowercase())
+        {
+            return Err(KernelError::generic(format!(
+                "Invalid value '{value}' for table property '{key}': use '{}'",
+                value.to_ascii_lowercase()
+            )));
+        }
     }
     Ok(())
 }
@@ -293,22 +370,27 @@ fn validate_property_removals(
 fn validate_transitions(
     old: &TableConfiguration,
     new_configuration: &HashMap<String, String>,
+    has_schema_changes: bool,
 ) -> KernelResult<()> {
     let old_properties = old.table_properties();
     let new_properties = TableProperties::from(new_configuration.iter());
-    // Changing the mode requires rewriting the schema with identities that match existing data
-    // files, which Kernel does not support.
-    let old_mode = old_properties
-        .column_mapping_mode
-        .unwrap_or(ColumnMappingMode::None);
-    let new_mode = new_properties
-        .column_mapping_mode
-        .unwrap_or(ColumnMappingMode::None);
+    // Only `none` -> `name` keeps existing data files readable without rewriting them: the
+    // current field names become the physical names.
+    let old_mode = get_column_mapping_mode_from_properties(old.metadata().configuration())?;
+    let new_mode = get_column_mapping_mode_from_properties(new_configuration)?;
     if old_mode != new_mode {
-        return Err(KernelError::unsupported(format!(
-            "Changing the column mapping mode from {old_mode:?} to {new_mode:?} is not supported \
-             on an existing table"
-        )));
+        if (old_mode, new_mode) != (ColumnMappingMode::None, ColumnMappingMode::Name) {
+            return Err(KernelError::unsupported(format!(
+                "Changing the column mapping mode from {old_mode:?} to {new_mode:?} is not \
+                 supported on an existing table"
+            )));
+        }
+        if has_schema_changes {
+            return Err(KernelError::unsupported(
+                "Cannot update the column mapping mode and perform schema changes in one \
+                 transaction",
+            ));
+        }
     }
     // Enabling requires backfilling row IDs and row commit versions; disabling is irreversible.
     if old_properties.enable_row_tracking.unwrap_or(false)
@@ -337,27 +419,79 @@ fn validate_transitions(
     }
 }
 
-/// Requires materialized row-tracking column names when row tracking is enabled, and rejects names
-/// that collide with a top-level logical or physical column name.
-fn validate_row_tracking_column_names(table_config: &TableConfiguration) -> KernelResult<()> {
-    if table_config.table_properties().enable_row_tracking != Some(true) {
-        return Ok(());
+/// Rejects `icebergCompatV2` when the final or the read protocol supports `deletionVectors`, as
+/// Java's `CHECK_HAS_NO_DELETION_VECTORS` does. Files written while deletion vectors were enabled
+/// may still carry them, so supported is enough to reject, and the read protocol is checked too.
+fn validate_iceberg_compat_v2_without_deletion_vectors(
+    read_config: &TableConfiguration,
+    table_config: &TableConfiguration,
+) -> KernelResult<()> {
+    let supports_deletion_vectors = [read_config, table_config]
+        .iter()
+        .any(|config| config.is_feature_supported(&TableFeature::DeletionVectors));
+    if table_config.is_feature_enabled(&TableFeature::IcebergCompatV2) && supports_deletion_vectors
+    {
+        return Err(KernelError::unsupported(format!(
+            "Table feature '{}' is incompatible with '{}'",
+            TableFeature::DeletionVectors,
+            TableFeature::IcebergCompatV2
+        )));
     }
+    Ok(())
+}
+
+/// Requires exactly one of `icebergCompatV2` and `icebergCompatV3` to be enabled when
+/// `delta.universalFormat.enabledFormats` contains `iceberg`, and at most one whenever the property
+/// is set. Mirrors Java's `IcebergUniversalFormatMetadataValidatorAndUpdater.validate`.
+fn validate_universal_format(configuration: &HashMap<String, String>) -> KernelResult<()> {
+    let Some(formats) = configuration.get(UNIVERSAL_FORMAT_ENABLED_FORMATS) else {
+        return Ok(());
+    };
+    let iceberg_enabled = formats.split(',').any(|format| format.trim() == "iceberg");
+    let compat_keys = [ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3];
+    let enabled_compat_count = compat_keys
+        .iter()
+        .filter(|key| {
+            configuration
+                .get(**key)
+                .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+        })
+        .count();
+    if iceberg_enabled && enabled_compat_count == 0 {
+        return Err(KernelError::generic(format!(
+            "One of '{}' must be set to \"true\" to enable the iceberg universal format in \
+             '{UNIVERSAL_FORMAT_ENABLED_FORMATS}'",
+            compat_keys.join("' or '")
+        )));
+    }
+    if enabled_compat_count > 1 {
+        return Err(KernelError::generic(format!(
+            "'{}' cannot be enabled at the same time",
+            compat_keys.join("' and '")
+        )));
+    }
+    Ok(())
+}
+
+/// Requires materialized row-tracking column names when row tracking is enabled, and rejects
+/// configured names that collide with a top-level logical or physical column name, whether or not
+/// row tracking is enabled.
+fn validate_row_tracking_column_names(table_config: &TableConfiguration) -> KernelResult<()> {
+    let row_tracking_enabled = table_config.table_properties().enable_row_tracking == Some(true);
     let schema = table_config.logical_schema();
     let column_mapping_mode = table_config.column_mapping_mode();
     for key in [
         MATERIALIZED_ROW_ID_COLUMN_NAME,
         MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
     ] {
-        let name = table_config
-            .metadata()
-            .configuration()
-            .get(key)
-            .ok_or_else(|| {
-                KernelError::generic(format!(
+        let Some(name) = table_config.metadata().configuration().get(key) else {
+            if row_tracking_enabled {
+                return Err(KernelError::generic(format!(
                     "Row tracking is enabled but the materialized column name '{key}' is missing"
-                ))
-            })?;
+                )));
+            }
+            continue;
+        };
         if schema
             .fields()
             .any(|field| field.name() == name || field.physical_name(column_mapping_mode) == name)
@@ -368,6 +502,56 @@ fn validate_row_tracking_column_names(table_config: &TableConfiguration) -> Kern
         }
     }
     Ok(())
+}
+
+/// Assigns column-mapping ids and physical names to every field of `schema` and records the new
+/// `delta.columnMapping.maxColumnId` in `configuration`. Each physical name is the field's current
+/// name, as in Java's `ColumnMapping.assignColumnIdAndPhysicalName(metadata, isNewTable = false)`.
+///
+/// Column-mapping annotations left over from earlier history are dropped first: with mapping
+/// disabled they do not describe the data files, which were written with the field names.
+fn assign_column_mapping_to_existing_fields(
+    schema: &StructType,
+    configuration: &mut HashMap<String, String>,
+) -> KernelResult<SchemaRef> {
+    struct FieldNameAsPhysicalName;
+    impl<'a> SchemaTransform<'a> for FieldNameAsPhysicalName {
+        transform_output_type!(|'a, T| Cow<'a, T>);
+        fn transform_struct_field(&mut self, field: &'a StructField) -> Cow<'a, StructField> {
+            let mut field = field.clone();
+            field.data_type = self.transform(&field.data_type).into_owned();
+            field.metadata.insert(
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref().into(),
+                MetadataValue::String(field.name.clone()),
+            );
+            Cow::Owned(field)
+        }
+    }
+    let schema = drop_column_mapping_metadata(schema);
+    let schema = FieldNameAsPhysicalName
+        .transform_struct(&schema)
+        .into_owned();
+    let mut max_id = TableProperties::from(configuration.iter())
+        .column_mapping_max_column_id
+        .unwrap_or(0);
+    let schema = assign_column_mapping_metadata(&schema, &mut max_id, false)?;
+    configuration.insert(COLUMN_MAPPING_MAX_COLUMN_ID.to_string(), max_id.to_string());
+    Ok(Arc::new(schema))
+}
+
+/// Assigns `delta.columnMapping.nested.ids` to the array and map slots of a column-mapped `schema`
+/// that have none, and records the new `delta.columnMapping.maxColumnId` in `configuration`.
+fn assign_iceberg_compat_nested_ids(
+    schema: &StructType,
+    configuration: &mut HashMap<String, String>,
+) -> KernelResult<SchemaRef> {
+    let mut max_id = TableProperties::from(configuration.iter())
+        .column_mapping_max_column_id
+        .unwrap_or(0)
+        .max(find_max_column_id_in_schema(schema).unwrap_or(0));
+    let schema = assign_nested_cm_ids(schema, &mut max_id)?;
+    configuration.insert(COLUMN_MAPPING_MAX_COLUMN_ID.to_string(), max_id.to_string());
+    Ok(Arc::new(schema))
 }
 
 /// Adds `reader_features` and `writer_features` to the protocol of `table_config`, retaining every
@@ -417,9 +601,10 @@ mod tests {
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
-    use crate::schema::{DataType, StructField};
+    use crate::schema::{ArrayType, DataType, MapType};
     use crate::snapshot::SnapshotRef;
     use crate::table_configuration::InCommitTimestampEnablement;
+    use crate::table_features::SET_TABLE_FEATURE_SUPPORTED_PREFIX;
     use crate::table_properties::{CHECKPOINT_POLICY, COLUMN_MAPPING_MODE, ENABLE_ROW_TRACKING};
     use crate::transaction::create_table::create_table;
     use crate::unit_test_utils::{load_test_table, test_schema_flat};
@@ -471,6 +656,28 @@ mod tests {
             false,
         )
         .unwrap()
+    }
+
+    /// Returns `snapshot` with `key` set to `value`, or removed when `value` is `None`, in its
+    /// metadata. Used for table states that CREATE TABLE cannot produce.
+    fn with_configuration_entry(snapshot: &Snapshot, key: &str, value: Option<&str>) -> Snapshot {
+        let read_config = snapshot.table_configuration();
+        let mut configuration = read_config.metadata().configuration().clone();
+        match value {
+            Some(value) => configuration.insert(key.to_string(), value.to_string()),
+            None => configuration.remove(key),
+        };
+        let metadata = read_config
+            .metadata()
+            .clone()
+            .with_configuration(configuration);
+        let table_config = TableConfiguration::try_new_with_schema(
+            read_config,
+            metadata,
+            read_config.logical_schema(),
+        )
+        .unwrap();
+        with_table_config(snapshot, table_config)
     }
 
     fn configuration_value<'a>(config: &'a TableConfiguration, key: &str) -> Option<&'a str> {
@@ -550,6 +757,25 @@ mod tests {
     }
 
     #[rstest]
+    #[case::timestamp_ntz(DataType::TIMESTAMP_NTZ, TableFeature::TimestampWithoutTimezone)]
+    #[case::variant(DataType::unshredded_variant(), TableFeature::VariantType)]
+    #[case::file(DataType::file_type(), TableFeature::FileTypePreview)]
+    fn schema_change_derives_type_feature(
+        #[case] data_type: DataType,
+        #[case] feature: TableFeature,
+    ) {
+        let (engine, snapshot) = create_test_table(&[]);
+        let prepared = prepare(
+            engine.as_ref(),
+            &snapshot,
+            add_column_request(StructField::nullable("added", data_type)),
+        )
+        .unwrap();
+        assert!(prepared.should_emit_protocol);
+        assert!(prepared.table_config.is_feature_supported(&feature));
+    }
+
+    #[rstest]
     #[case::v2_checkpoint(&[(CHECKPOINT_POLICY, "v2")], TableFeature::V2Checkpoint, true)]
     #[case::property_driven(
         &[("delta.enableChangeDataFeed", "true")],
@@ -619,6 +845,37 @@ mod tests {
             configuration_value(config, ENABLE_IN_COMMIT_TIMESTAMPS),
             Some("true")
         );
+        let InCommitTimestampEnablement::Enabled {
+            enablement: Some((version, _)),
+        } = config.in_commit_timestamp_enablement().unwrap()
+        else {
+            panic!("expected recorded enablement metadata");
+        };
+        assert_eq!(version, snapshot.version() + 1);
+    }
+
+    #[test]
+    fn disabling_in_commit_timestamps_on_catalog_managed_table_is_rejected() {
+        let (engine, snapshot) = create_test_table(&[]);
+        let catalog_managed = prepare(
+            engine.as_ref(),
+            &snapshot,
+            properties_request(&[("delta.feature.catalogManaged", "supported")]),
+        )
+        .unwrap();
+        let snapshot = with_table_config(&snapshot, catalog_managed.table_config);
+        let error = prepare(
+            engine.as_ref(),
+            &snapshot,
+            properties_request(&[(ENABLE_IN_COMMIT_TIMESTAMPS, "false")]),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot disable inCommitTimestamp on a catalogManaged table"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -633,7 +890,12 @@ mod tests {
             ]),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("Catalog-managed tables require"));
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot disable inCommitTimestamp when enabling catalogManaged"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -712,7 +974,23 @@ mod tests {
         "Unsetting table property"
     )]
     #[case::unset_feature_signal(&[], &["delta.feature.rowTracking"], "Unsetting table property")]
+    #[case::unset_in_commit_timestamps(
+        &[],
+        &[ENABLE_IN_COMMIT_TIMESTAMPS],
+        "Unsetting table property"
+    )]
+    #[case::unset_delta_key_in_other_case(&[], &["DELTA.appendOnly"], "Unsetting table property")]
     #[case::set_and_unset(&[("app.key", "value")], &["app.key"], "both set and unset")]
+    #[case::uppercase_row_tracking(
+        &[(ENABLE_ROW_TRACKING, "TRUE")],
+        &[],
+        "Invalid value 'TRUE' for table property 'delta.enableRowTracking'"
+    )]
+    #[case::mixed_case_iceberg_compat_v2(
+        &[(ENABLE_ICEBERG_COMPAT_V2, "True")],
+        &[],
+        "Invalid value 'True' for table property 'delta.enableIcebergCompatV2'"
+    )]
     fn kernel_managed_and_conflicting_property_requests_are_rejected(
         #[case] added: &[(&str, &str)],
         #[case] removed: &[&str],
@@ -742,7 +1020,12 @@ mod tests {
         &[(ENABLE_ICEBERG_COMPAT_V3, "false")],
         "Disabling 'delta.enableIcebergCompatV3'"
     )]
-    #[case::enable_column_mapping(&[], &[(COLUMN_MAPPING_MODE, "name")], "column mapping mode")]
+    #[case::enable_column_mapping_id(&[], &[(COLUMN_MAPPING_MODE, "id")], "column mapping mode")]
+    #[case::disable_column_mapping(
+        &[(COLUMN_MAPPING_MODE, "name")],
+        &[(COLUMN_MAPPING_MODE, "none")],
+        "column mapping mode"
+    )]
     #[case::change_column_mapping(
         &[(COLUMN_MAPPING_MODE, "name")],
         &[(COLUMN_MAPPING_MODE, "id")],
@@ -757,6 +1040,221 @@ mod tests {
         let error = prepare(engine.as_ref(), &snapshot, properties_request(requested)).unwrap_err();
         assert!(matches!(error, KernelError::Unsupported(_)), "{error}");
         assert!(error.to_string().contains(expected), "{error}");
+    }
+
+    #[test]
+    fn enabling_column_mapping_name_mode_assigns_existing_field_names_as_physical_names() {
+        let (engine, snapshot) = create_test_table(&[]);
+        let read_schema = snapshot.table_configuration().logical_schema();
+        let prepared = prepare(
+            engine.as_ref(),
+            &snapshot,
+            properties_request(&[(COLUMN_MAPPING_MODE, "name")]),
+        )
+        .unwrap();
+
+        assert!(prepared.should_emit_protocol);
+        assert!(prepared.should_emit_metadata);
+        let config = &prepared.table_config;
+        assert!(config.is_feature_supported(&TableFeature::ColumnMapping));
+        assert_eq!(config.column_mapping_mode(), ColumnMappingMode::Name);
+        let schema = config.logical_schema();
+        let mut ids: Vec<_> = schema
+            .fields()
+            .map(|field| {
+                assert_eq!(field.physical_name(ColumnMappingMode::Name), field.name());
+                field.column_mapping_id().unwrap()
+            })
+            .collect();
+        ids.sort_unstable();
+        let field_count = read_schema.fields().count() as i64;
+        assert_eq!(ids, (1..=field_count).collect::<Vec<_>>());
+        assert_eq!(
+            config.table_properties().column_mapping_max_column_id,
+            Some(field_count)
+        );
+    }
+
+    #[test]
+    fn enabling_column_mapping_name_mode_assigns_nested_fields_and_drops_leftover_annotations() {
+        fn annotated(
+            mut field: StructField,
+            key: ColumnMetadataKey,
+            value: MetadataValue,
+        ) -> StructField {
+            field.metadata.insert(key.as_ref().into(), value);
+            field
+        }
+        fn collect_struct_fields<'a>(data_type: &'a DataType, out: &mut Vec<&'a StructField>) {
+            match data_type {
+                DataType::Struct(inner) => {
+                    for field in inner.fields() {
+                        out.push(field);
+                        collect_struct_fields(field.data_type(), out);
+                    }
+                }
+                DataType::Array(array) => collect_struct_fields(array.element_type(), out),
+                DataType::Map(map) => {
+                    collect_struct_fields(map.key_type(), out);
+                    collect_struct_fields(map.value_type(), out);
+                }
+                _ => {}
+            }
+        }
+
+        let (engine, snapshot) = create_test_table(&[]);
+        // Leftover annotations on a mapping-disabled schema, which Kernel must not reuse.
+        let leftover_schema = Arc::new(
+            StructType::try_new([
+                StructField::nullable("id", DataType::INTEGER),
+                StructField::nullable(
+                    "s",
+                    StructType::try_new([
+                        annotated(
+                            StructField::nullable("a", DataType::INTEGER),
+                            ColumnMetadataKey::ColumnMappingPhysicalName,
+                            MetadataValue::String("stale-a".to_string()),
+                        ),
+                        StructField::nullable(
+                            "b",
+                            StructType::try_new([StructField::nullable("c", DataType::STRING)])
+                                .unwrap(),
+                        ),
+                    ])
+                    .unwrap(),
+                ),
+                annotated(
+                    StructField::nullable(
+                        "arr",
+                        ArrayType::new(
+                            StructType::try_new([StructField::nullable("x", DataType::INTEGER)])
+                                .unwrap(),
+                            true,
+                        ),
+                    ),
+                    ColumnMetadataKey::ColumnMappingNestedIds,
+                    MetadataValue::Other(serde_json::json!({ "arr.element": 99 })),
+                ),
+                annotated(
+                    StructField::nullable(
+                        "m",
+                        MapType::new(
+                            DataType::STRING,
+                            StructType::try_new([StructField::nullable("y", DataType::INTEGER)])
+                                .unwrap(),
+                            true,
+                        ),
+                    ),
+                    ColumnMetadataKey::ParquetFieldNestedIds,
+                    MetadataValue::Other(serde_json::json!({ "m.key": 98 })),
+                ),
+            ])
+            .unwrap(),
+        );
+        let read_config = snapshot.table_configuration();
+        let metadata = read_config
+            .metadata()
+            .clone()
+            .with_schema(leftover_schema.clone())
+            .unwrap();
+        let read_config =
+            TableConfiguration::try_new_with_schema(read_config, metadata, leftover_schema)
+                .unwrap();
+        let snapshot = with_table_config(&snapshot, read_config);
+
+        let prepared = prepare(
+            engine.as_ref(),
+            &snapshot,
+            properties_request(&[(COLUMN_MAPPING_MODE, "name")]),
+        )
+        .unwrap();
+
+        let schema = prepared.table_config.logical_schema();
+        let schema_type = DataType::from(schema.as_ref().clone());
+        let mut fields = Vec::new();
+        collect_struct_fields(&schema_type, &mut fields);
+        let names: Vec<_> = fields.iter().map(|field| field.name().as_str()).collect();
+        assert_eq!(names, ["id", "s", "a", "b", "c", "arr", "x", "m", "y"]);
+        let mut ids = Vec::new();
+        for field in &fields {
+            assert_eq!(field.physical_name(ColumnMappingMode::Name), field.name());
+            ids.push(field.column_mapping_id().unwrap());
+            for key in [
+                ColumnMetadataKey::ColumnMappingNestedIds,
+                ColumnMetadataKey::ParquetFieldNestedIds,
+            ] {
+                assert!(field.get_config_value(&key).is_none(), "{field:?}");
+            }
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, (1..=9).collect::<Vec<_>>());
+        assert_eq!(
+            prepared
+                .table_config
+                .table_properties()
+                .column_mapping_max_column_id,
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn enabling_column_mapping_with_schema_change_is_rejected() {
+        let (engine, snapshot) = create_test_table(&[]);
+        let mut request = add_column_request(StructField::nullable("added", DataType::STRING));
+        request
+            .properties_added
+            .insert(COLUMN_MAPPING_MODE.to_string(), "name".to_string());
+        let error = prepare(engine.as_ref(), &snapshot, request).unwrap_err();
+        assert!(matches!(error, KernelError::Unsupported(_)), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot update the column mapping mode and perform schema changes"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn metadata_only_change_violating_feature_requirement_is_rejected() {
+        let (engine, snapshot) = create_test_table(&[
+            (ENABLE_ICEBERG_COMPAT_V2, "true"),
+            ("delta.feature.deletionVectors", "supported"),
+        ]);
+        assert!(
+            snapshot
+                .table_configuration()
+                .is_feature_supported(&TableFeature::DeletionVectors)
+        );
+        let error = prepare(
+            engine.as_ref(),
+            &snapshot,
+            properties_request(&[("delta.enableDeletionVectors", "true")]),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("deletionVectors"), "{error}");
+    }
+
+    #[test]
+    fn disabling_iceberg_compat_v2_on_iceberg_universal_format_table_is_rejected() {
+        let (engine, snapshot) = create_test_table(&[
+            (COLUMN_MAPPING_MODE, "name"),
+            (ENABLE_ICEBERG_COMPAT_V2, "true"),
+        ]);
+        // CREATE TABLE does not accept the UniForm property, so set it on the read metadata.
+        let snapshot =
+            with_configuration_entry(&snapshot, UNIVERSAL_FORMAT_ENABLED_FORMATS, Some("iceberg"));
+        let error = prepare(
+            engine.as_ref(),
+            &snapshot,
+            properties_request(&[(ENABLE_ICEBERG_COMPAT_V2, "false")]),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must be set to \"true\" to enable the iceberg universal format"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -855,8 +1353,38 @@ mod tests {
     }
 
     #[test]
-    fn row_tracking_column_name_conflicting_with_column_is_rejected() {
+    fn missing_row_tracking_column_name_is_rejected() {
         let (engine, snapshot) = create_test_table(&[(ENABLE_ROW_TRACKING, "true")]);
+        let snapshot = with_configuration_entry(&snapshot, MATERIALIZED_ROW_ID_COLUMN_NAME, None);
+        let error = prepare(
+            engine.as_ref(),
+            &snapshot,
+            add_column_request(StructField::nullable("added", DataType::STRING)),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains(&format!(
+                "materialized column name '{MATERIALIZED_ROW_ID_COLUMN_NAME}' is missing"
+            )),
+            "{error}"
+        );
+    }
+
+    #[rstest]
+    fn row_tracking_column_name_conflicting_with_column_is_rejected(
+        #[values(true, false)] row_tracking_enabled: bool,
+    ) {
+        let (engine, snapshot) = create_test_table(&[(ENABLE_ROW_TRACKING, "true")]);
+        let snapshot = if row_tracking_enabled {
+            snapshot
+        } else {
+            // Names stay configured after row tracking is disabled.
+            Arc::new(with_configuration_entry(
+                &snapshot,
+                ENABLE_ROW_TRACKING,
+                Some("false"),
+            ))
+        };
         let row_id_name = configuration_value(
             snapshot.table_configuration(),
             MATERIALIZED_ROW_ID_COLUMN_NAME,

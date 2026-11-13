@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use crate::schema::SchemaRef;
 use crate::schema::collation_utils::schema_has_collations;
+use crate::schema::file_utils::schema_contains_file_type;
 use crate::schema::variant_utils::schema_contains_variant_type;
 use crate::table_features::{
     SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE, TableFeature,
@@ -165,6 +166,24 @@ pub(super) fn maybe_enable_timestamp_ntz(
     if schema_contains_timestamp_ntz(schema) {
         add_feature_to_lists(
             TableFeature::TimestampWithoutTimezone,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+    }
+}
+
+/// Conditionally adds the `fileType-preview` feature to the protocol when the schema contains File
+/// columns anywhere in the schema tree (top-level, nested structs, arrays, maps).
+///
+/// The stable `fileType` feature is deliberately not written: the protocol change is still only
+/// proposed, and a stable feature name is permanent once it is in a table's protocol.
+pub(super) fn maybe_enable_file_type_preview(
+    schema: &SchemaRef,
+    validated: &mut ValidatedTableProperties,
+) {
+    if schema_contains_file_type(schema) {
+        add_feature_to_lists(
+            TableFeature::FileTypePreview,
             &mut validated.reader_features,
             &mut validated.writer_features,
         );
