@@ -95,6 +95,16 @@ async fn set_properties_patches_configuration_and_canonicalizes_delta_keys()
 #[rstest]
 #[case::malformed_boolean(&[], &[("delta.enableChangeDataFeed", "yes")], "Invalid value")]
 #[case::malformed_integer(&[], &[(CHECKPOINT_INTERVAL, "0")], "Invalid value")]
+#[case::checkpoint_interval_beyond_java_int(
+    &[],
+    &[(CHECKPOINT_INTERVAL, "2147483648")],
+    "must be between 1 and 2147483647"
+)]
+#[case::num_indexed_cols_beyond_java_int(
+    &[],
+    &[("delta.dataSkippingNumIndexedCols", "2147483648")],
+    "must be between -1 and 2147483647"
+)]
 #[case::malformed_enum(&[], &[(CHECKPOINT_POLICY, "v3")], "Invalid value")]
 #[case::unknown_delta_key(&[], &[("delta.unknownProperty", "x")], "not supported")]
 #[case::unknown_delta_key_case_variant(&[], &[("Delta.unknownProperty", "x")], "not supported")]

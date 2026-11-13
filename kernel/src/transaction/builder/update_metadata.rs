@@ -28,11 +28,12 @@ use crate::table_features::{
     get_column_mapping_mode_from_properties, validate_iceberg_compat_if_needed,
 };
 use crate::table_properties::{
-    COLUMN_MAPPING_MAX_COLUMN_ID, DELTA_PROPERTY_PREFIX, ENABLE_ICEBERG_COMPAT_V2,
-    ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
-    IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP, IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
-    MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
-    PARQUET_FORMAT_VERSION, SET_TRANSACTION_RETENTION_DURATION, TableProperties,
+    CHECKPOINT_INTERVAL, COLUMN_MAPPING_MAX_COLUMN_ID, DATA_SKIPPING_NUM_INDEXED_COLS,
+    DELTA_PROPERTY_PREFIX, ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3,
+    ENABLE_IN_COMMIT_TIMESTAMPS, IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP,
+    IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
+    MATERIALIZED_ROW_ID_COLUMN_NAME, PARQUET_FORMAT_VERSION, SET_TRANSACTION_RETENTION_DURATION,
+    TableProperties,
 };
 use crate::transaction::schema_evolution::{SchemaOperation, evolve_metadata};
 use crate::transforms::{SchemaTransform, transform_output_type};
@@ -121,6 +122,7 @@ pub(super) fn prepare_update_table_metadata(
             "Setting delta property '{key}' is not supported during {UPDATE_TABLE}"
         )));
     }
+    validate_java_int_ranges(&properties_added)?;
     validate_property_removals(&properties_added, &property_keys_removed)?;
 
     // Schema changes preserve the column-mapping identities of surviving fields and assign new
@@ -323,6 +325,30 @@ fn apply_schema_changes(
         ));
     }
     evolve_metadata(table_config, changes)
+}
+
+/// Rejects integer properties outside the range Java accepts. Java parses them with
+/// `Integer.valueOf` both when it validates them and when it reads the table configuration, so a
+/// larger value would break Java and Spark writers.
+fn validate_java_int_ranges(properties_added: &HashMap<String, String>) -> KernelResult<()> {
+    for (key, min) in [
+        (CHECKPOINT_INTERVAL, 1),
+        (DATA_SKIPPING_NUM_INDEXED_COLS, -1),
+    ] {
+        let Some(value) = properties_added.get(key) else {
+            continue;
+        };
+        let in_range = value
+            .parse::<i64>()
+            .is_ok_and(|number| (min..=i64::from(i32::MAX)).contains(&number));
+        if !in_range {
+            return Err(KernelError::generic(format!(
+                "Invalid value '{value}' for table property '{key}': must be between {min} and {}",
+                i32::MAX
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_property_removals(
@@ -1355,6 +1381,24 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("columnMapping"), "{error}");
+    }
+
+    #[rstest]
+    #[case::checkpoint_interval_max(CHECKPOINT_INTERVAL, "2147483647")]
+    #[case::num_indexed_cols_all(DATA_SKIPPING_NUM_INDEXED_COLS, "-1")]
+    #[case::num_indexed_cols_max(DATA_SKIPPING_NUM_INDEXED_COLS, "2147483647")]
+    fn java_int_range_bounds_are_accepted(#[case] key: &str, #[case] value: &str) {
+        let (engine, snapshot) = create_test_table(&[]);
+        let prepared = prepare(
+            engine.as_ref(),
+            &snapshot,
+            properties_request(&[(key, value)]),
+        )
+        .unwrap();
+        assert_eq!(
+            configuration_value(&prepared.table_config, key),
+            Some(value)
+        );
     }
 
     #[test]
