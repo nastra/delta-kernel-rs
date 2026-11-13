@@ -4499,13 +4499,18 @@ mod tests {
                 engine.shallow_copy(),
             ))
         };
-        builder = ok_or_panic(unsafe {
-            update_table_txn_builder_with_table_property_removed(
-                builder,
-                ffi_str("app.removed"),
-                engine.shallow_copy(),
-            )
-        });
+        // The second call replaces the first, so `app.kept` survives.
+        for key in ["app.kept", "app.removed"] {
+            let keys = [ffi_str(key)];
+            let keys = unsafe { FfiStringArray::new_unsafe(&keys) };
+            builder = ok_or_panic(unsafe {
+                update_table_txn_builder_with_table_properties_removed(
+                    builder,
+                    &keys,
+                    engine.shallow_copy(),
+                )
+            });
+        }
         let txn =
             ok_or_panic(unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) });
         let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });

@@ -190,11 +190,11 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         self
     }
 
-    /// Removes table properties from the table configuration.
+    /// Sets the table property keys to remove from the table configuration.
     ///
-    /// Keys are matched exactly, so removing `app.key` leaves `APP.KEY` in place. Removing a key
-    /// that the table does not have is not an error: the commit still includes a Metadata action,
-    /// with an unchanged configuration. Calls accumulate keys.
+    /// Each call replaces the keys supplied by a previous call. Keys are matched exactly, so
+    /// removing `app.key` leaves `APP.KEY` in place. Removing a key that the table does not have is
+    /// not an error: the commit still includes a Metadata action, with an unchanged configuration.
     ///
     /// Only user properties can be removed. [`build`](Self::build) rejects keys that start with
     /// `delta.`, compared case-insensitively, and keys that are also set in the same transaction.
@@ -203,9 +203,7 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         mut self,
         keys: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
-        self.local_state
-            .property_keys_removed
-            .extend(keys.into_iter().map(Into::into));
+        self.local_state.property_keys_removed = keys.into_iter().map(Into::into).collect();
         self
     }
 
@@ -286,10 +284,13 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
                 ));
             }
         }
-        if let Some(key) = self.local_state.property_keys_removed.iter().find(|key| {
-            key.get(..DELTA_PROPERTY_PREFIX.len())
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(DELTA_PROPERTY_PREFIX))
-        }) {
+        // Matches Java's `key.toLowerCase(Locale.ROOT).startsWith("delta.")`.
+        if let Some(key) = self
+            .local_state
+            .property_keys_removed
+            .iter()
+            .find(|key| key.to_lowercase().starts_with(DELTA_PROPERTY_PREFIX))
+        {
             return Err(KernelError::unsupported(format!(
                 "Unsetting 'delta.' table properties is currently unsupported: '{key}'"
             )));
@@ -1261,9 +1262,10 @@ mod tests {
     #[case::exact_case_match(vec![vec!["app.key"]], &["APP.KEY", "app.other"])]
     #[case::other_case_match(vec![vec!["APP.KEY"]], &["app.key", "app.other"])]
     #[case::absent_key(vec![vec!["app.missing"]], &["app.key", "APP.KEY", "app.other"])]
-    #[case::calls_accumulate(
-        vec![vec!["app.key"], vec!["APP.KEY", "app.missing"]],
-        &["app.other"]
+    #[case::multiple_keys(vec![vec!["app.key", "APP.KEY", "app.missing"]], &["app.other"])]
+    #[case::last_call_replaces_earlier_keys(
+        vec![vec!["app.key", "app.other"], vec!["APP.KEY"]],
+        &["app.key", "app.other"]
     )]
     fn alter_table_removes_only_requested_user_properties(
         #[case] removals: Vec<Vec<&str>>,
