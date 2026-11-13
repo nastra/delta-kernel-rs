@@ -1447,6 +1447,53 @@ mod tests {
         Ok(())
     }
 
+    // A table with icebergCompatV3 enabled rejects any schema update before widening is checked,
+    // so enabling it in the same request is the way to reach the restriction today.
+    #[rstest]
+    #[case::outside_the_iceberg_subset(
+        DataType::DOUBLE,
+        "only allow type changes that Iceberg V2 supports"
+    )]
+    #[case::inside_the_iceberg_subset(DataType::LONG, "Enabling 'delta.enableIcebergCompatV3'")]
+    fn enabling_iceberg_compat_v3_restricts_widening(
+        #[case] to: DataType,
+        #[case] expected: &str,
+    ) -> Result<()> {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let schema = Arc::new(StructType::try_new([StructField::nullable(
+            "i",
+            DataType::INTEGER,
+        )])?);
+        let snapshot = create_table("memory:///", schema, "test", true)
+            .with_table_properties([
+                (COLUMN_MAPPING_MODE, "name"),
+                ("delta.enableTypeWidening", "true"),
+                ("delta.enableRowTracking", "true"),
+            ])
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
+            .unwrap_post_commit_snapshot();
+        let mut widened = snapshot.schema().field("i").unwrap().clone();
+        widened.data_type = to;
+        let mut builder = snapshot
+            .clone()
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_updated_schema(Arc::new(StructType::try_new([widened])?));
+        builder
+            .local_state
+            .properties_added
+            .insert(ENABLE_ICEBERG_COMPAT_V3.to_string(), "true".to_string());
+        let error = builder
+            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+
+        let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
+        assert_eq!(reloaded.version(), snapshot.version());
+        assert_eq!(reloaded.schema(), snapshot.schema());
+        Ok(())
+    }
+
     #[test]
     fn unchanged_updated_schema_counts_as_a_request_and_commits() -> Result<()> {
         let (engine, snapshot) = create_clustered_column_mapping_table()?;
