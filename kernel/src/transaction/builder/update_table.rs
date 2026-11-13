@@ -373,6 +373,16 @@ fn try_new_update_table<MODE: ExecutionMode>(
         commit_timestamp,
         engine,
     )?;
+    // A request whose properties all match the table changes nothing; reject it here rather than
+    // at commit.
+    if operation == UpdateTableOperation::AlterTable
+        && !should_emit_metadata
+        && !should_emit_protocol
+    {
+        return Err(KernelError::invalid_transaction_state(
+            "ALTER TABLE requires at least one metadata change",
+        ));
+    }
 
     Ok(Transaction {
         read_snapshot_opt: Some(read_snapshot),
@@ -1249,6 +1259,58 @@ mod tests {
                 .configuration()
                 .get(key),
             None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn protocol_only_alter_table_commits() -> Result<()> {
+        let (url, _tempdir) = copy_test_table("table-without-dv-small")?;
+        let engine = SyncEngine::new();
+        let snapshot = Snapshot::builder_for(url.as_str()).build(&engine)?;
+        let version = snapshot.version();
+        let mut builder =
+            snapshot.update_table(UpdateTableOperation::AlterTable, "test-engine", false);
+        builder.local_state.properties_added.insert(
+            "delta.feature.domainMetadata".to_string(),
+            "supported".to_string(),
+        );
+        let transaction = builder.build(&engine, Box::new(FileSystemCommitter::new()))?;
+        assert!(!transaction.should_emit_metadata);
+        assert!(transaction.should_emit_protocol);
+        transaction.commit(&engine)?.unwrap_committed();
+
+        let reloaded = Snapshot::builder_for(url.as_str()).build(&engine)?;
+        assert_eq!(reloaded.version(), version + 1);
+        assert!(
+            reloaded
+                .table_configuration()
+                .is_feature_supported(&TableFeature::DomainMetadata)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unchanged_property_alter_table_is_rejected_at_build() -> Result<()> {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let snapshot = create_table("memory:///", test_schema_flat(), "test", true)
+            .with_table_properties([("app.key", "value")])
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
+            .unwrap_post_commit_snapshot();
+        let mut builder =
+            snapshot.update_table(UpdateTableOperation::AlterTable, "test-engine", false);
+        builder
+            .local_state
+            .properties_added
+            .insert("app.key".to_string(), "value".to_string());
+        let error = builder
+            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(
+            matches!(&error, KernelError::InvalidTransactionState(message)
+            if message == "ALTER TABLE requires at least one metadata change"),
+            "{error}"
         );
         Ok(())
     }

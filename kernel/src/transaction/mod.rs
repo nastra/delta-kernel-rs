@@ -1090,7 +1090,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         match (self.is_create_table(), &self.operation) {
             (true, CommitOperation::CreateTable) => Ok(()),
             (false, CommitOperation::UpdateTable(UpdateTableOperation::AlterTable))
-                if !self.should_emit_metadata =>
+                if !self.should_emit_metadata && !self.should_emit_protocol =>
             {
                 Err(KernelError::invalid_transaction_state(
                     "ALTER TABLE requires at least one metadata change",
