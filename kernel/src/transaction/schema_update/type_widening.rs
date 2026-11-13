@@ -71,8 +71,18 @@ pub(super) fn validate_partition_column_type_changes<'a>(
 ) -> KernelResult<()> {
     use PrimitiveType::*;
     for column in partition_columns {
-        let (Some(current), Some(updated)) = (current_schema.field(column), schema.field(column))
+        // Like the partition drop check, resolve the column case-insensitively and follow it by
+        // column-mapping ID.
+        let Some(current) = current_schema
+            .fields()
+            .find(|field| field.name().eq_ignore_ascii_case(column))
         else {
+            continue;
+        };
+        let Some(updated) = schema.fields().find(|field| {
+            field.column_mapping_id().is_some()
+                && field.column_mapping_id() == current.column_mapping_id()
+        }) else {
             continue;
         };
         let (DataType::Primitive(from), DataType::Primitive(to)) =
@@ -403,5 +413,29 @@ mod tests {
         let error = collect_type_changes(&current, &updated, &mut Vec::new(), "f", &mut Vec::new())
             .unwrap_err();
         assert!(error.to_string().contains(expected), "{error}");
+    }
+
+    #[test]
+    fn partition_column_type_change_check_resolves_the_column_in_any_case() {
+        let field_with_id = |data_type: DataType| {
+            let mut field = StructField::nullable("d", data_type);
+            field.metadata.insert(
+                ColumnMetadataKey::ColumnMappingId.as_ref().into(),
+                MetadataValue::Number(1),
+            );
+            field
+        };
+        let current = StructType::try_new([field_with_id(DataType::DATE)]).unwrap();
+        let updated = StructType::try_new([field_with_id(DataType::TIMESTAMP_NTZ)]).unwrap();
+        // The metadata records the partition column in a different case than the schema.
+        let partition_columns = ["D".to_string()];
+        let error = validate_partition_column_type_changes(&partition_columns, &current, &updated)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot change the type of partition column 'D'"),
+            "{error}"
+        );
     }
 }
