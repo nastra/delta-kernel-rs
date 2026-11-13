@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use self::type_widening::AllowedTypeWidening;
 use crate::actions::Metadata;
 use crate::expressions::ColumnName;
 use crate::schema::diff::{FieldChange, FieldChangeType, FieldUpdate, SchemaDiff};
@@ -19,28 +20,39 @@ use crate::schema::{
 };
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    ColumnMappingMode, TableFeature, find_max_column_id_in_schema,
-    physical_to_logical_column_name_and_type, try_assign_flat_column_mapping_info,
-    validate_column_mapping_id,
+    ColumnMappingMode, SET_TABLE_FEATURE_SUPPORTED_PREFIX, TableFeature,
+    find_max_column_id_in_schema, physical_to_logical_column_name_and_type,
+    try_assign_flat_column_mapping_info, validate_column_mapping_id,
 };
-use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
+use crate::table_properties::{
+    COLUMN_MAPPING_MAX_COLUMN_ID, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
+    ENABLE_ICEBERG_COMPAT_V3, ENABLE_TYPE_WIDENING,
+};
 use crate::transaction::schema_evolution::reject_generated_or_identity_metadata;
 use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::{FoldWithOption as _, require};
 use crate::{KernelError, KernelResult};
 
+mod type_widening;
+
 /// Replaces the table schema with `schema` and returns the evolved metadata and logical schema.
 ///
 /// Supported changes are nullable field additions, drops, renames, reordering within a struct,
-/// non-protocol metadata changes such as comments, and nullability relaxation. Existing fields
+/// non-protocol metadata changes such as comments, nullability relaxation, and type widening (see
+/// [`type_widening::apply_type_changes`]). Existing fields
 /// keep their column-mapping IDs and physical names; new fields get fresh ones and advance
 /// `delta.columnMapping.maxColumnId`, which never decreases.
 ///
 /// The result is not validated against the table protocol; callers derive any required protocol
 /// features and validate the final table configuration.
+///
+/// `properties_added` are the table properties set in the same request. Like Java's
+/// `validateUpdatedSchemaAndGetUpdatedSchema`, which reads the new metadata, they decide whether
+/// type widening is enabled and whether only Iceberg V2 widenings are allowed.
 pub(crate) fn evolve_metadata_to_schema(
     table_config: &TableConfiguration,
     schema: &StructType,
+    properties_added: &HashMap<String, String>,
 ) -> KernelResult<(Metadata, SchemaRef)> {
     let column_mapping_mode = table_config.column_mapping_mode();
     // Without column mapping, fields have no stable identity across renames and drops.
@@ -104,7 +116,11 @@ pub(crate) fn evolve_metadata_to_schema(
         current_fields.extend(field.column_mapping_id().map(|id| (id, field)));
         Ok(())
     })?;
-    let schema = inherit_type_change_history(&schema, &current_fields)?;
+    let schema = type_widening::apply_type_changes(
+        &current_fields,
+        &schema,
+        allowed_type_widening(table_config, properties_added),
+    )?;
     let diff = SchemaDiff::new(&current_schema, &schema)
         .map_err(|e| KernelError::schema(format!("Invalid schema update: {e}")))?;
     for added in &diff.added_fields {
@@ -114,6 +130,11 @@ pub(crate) fn evolve_metadata_to_schema(
         validate_field_update(update)?;
     }
     validate_partition_columns_unchanged(table_config.metadata(), &current_schema, &schema)?;
+    type_widening::validate_partition_column_type_changes(
+        table_config.metadata().partition_columns(),
+        &current_schema,
+        &schema,
+    )?;
     // The stats-column and change-data-feed checks below read the configuration before the
     // transaction. No property setter is combined with this path yet; once one is, they must use
     // the final configuration, so that a request that also replaces
@@ -137,6 +158,48 @@ pub(crate) fn evolve_metadata_to_schema(
             metadata.with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, id.to_string())
         });
     Ok((metadata, schema))
+}
+
+/// Returns the type changes the table permits once `properties_added` are applied.
+///
+/// Type widening is enabled by `delta.enableTypeWidening`, as in Java. The Iceberg V2 subset
+/// applies while `icebergCompatV1` or `icebergCompatV2` is supported, as the protocol's type
+/// widening writer requirements state, or while `icebergCompatV3` is enabled, as its RFC states.
+fn allowed_type_widening(
+    table_config: &TableConfiguration,
+    properties_added: &HashMap<String, String>,
+) -> AllowedTypeWidening {
+    // The value from the request, or else the table's.
+    let is_true = |key: &str| match properties_added.get(key) {
+        Some(value) => value == "true",
+        None => {
+            table_config
+                .metadata()
+                .configuration()
+                .get(key)
+                .map(String::as_str)
+                == Some("true")
+        }
+    };
+    let signals_support = |feature: &TableFeature| {
+        properties_added
+            .get(&format!("{SET_TABLE_FEATURE_SUPPORTED_PREFIX}{feature}"))
+            .is_some()
+    };
+    let enabled = is_true(ENABLE_TYPE_WIDENING);
+    let iceberg_compat = [
+        (TableFeature::IcebergCompatV1, ENABLE_ICEBERG_COMPAT_V1),
+        (TableFeature::IcebergCompatV2, ENABLE_ICEBERG_COMPAT_V2),
+    ]
+    .iter()
+    .any(|(feature, key)| {
+        table_config.is_feature_supported(feature) || signals_support(feature) || is_true(key)
+    }) || is_true(ENABLE_ICEBERG_COMPAT_V3);
+    match (enabled, iceberg_compat) {
+        (false, _) => AllowedTypeWidening::None,
+        (true, false) => AllowedTypeWidening::Delta,
+        (true, true) => AllowedTypeWidening::IcebergV2,
+    }
 }
 
 /// Rejects an updated table configuration whose schema no longer contains every clustering column.
@@ -238,57 +301,6 @@ fn assign_new_identities_in_type(
     })
 }
 
-/// Copies the `delta.typeChanges` history of each retained field that omits it.
-///
-/// The protocol requires writers to preserve the history, and a caller-built schema may not carry
-/// it. A history that differs from the current one is rejected by [`validate_metadata_change`].
-fn inherit_type_change_history(
-    schema: &StructType,
-    current_fields: &HashMap<i64, &StructField>,
-) -> KernelResult<StructType> {
-    let key = ColumnMetadataKey::TypeChanges.as_ref();
-    let fields = schema
-        .fields()
-        .map(|field| {
-            let mut field = field.clone();
-            let history = field
-                .column_mapping_id()
-                .and_then(|id| current_fields.get(&id))
-                .and_then(|current| current.metadata.get(key));
-            if let Some(history) = history.filter(|_| !field.metadata.contains_key(key)) {
-                field.metadata.insert(key.into(), history.clone());
-            }
-            field.data_type =
-                inherit_type_change_history_in_type(&field.data_type, current_fields)?;
-            Ok(field)
-        })
-        .collect::<KernelResult<Vec<_>>>()?;
-    StructType::try_new(fields)
-}
-
-fn inherit_type_change_history_in_type(
-    data_type: &DataType,
-    current_fields: &HashMap<i64, &StructField>,
-) -> KernelResult<DataType> {
-    Ok(match data_type {
-        DataType::Struct(struct_type) => {
-            inherit_type_change_history(struct_type, current_fields)?.into()
-        }
-        DataType::Array(array_type) => ArrayType::new(
-            inherit_type_change_history_in_type(array_type.element_type(), current_fields)?,
-            array_type.contains_null(),
-        )
-        .into(),
-        DataType::Map(map_type) => MapType::new(
-            inherit_type_change_history_in_type(map_type.key_type(), current_fields)?,
-            inherit_type_change_history_in_type(map_type.value_type(), current_fields)?,
-            map_type.value_contains_null(),
-        )
-        .into(),
-        other => other.clone(),
-    })
-}
-
 /// Validates a field that is new in the updated schema, including its nested fields.
 fn validate_added_field(added: &FieldChange) -> KernelResult<()> {
     let path = &added.path;
@@ -309,6 +321,16 @@ fn validate_added_field(added: &FieldChange) -> KernelResult<()> {
                 "Cannot add non-nullable field '{}' under '{path}': existing data files do not \
                  contain it",
                 field.name()
+            ))
+        );
+        require!(
+            field
+                .get_config_value(&ColumnMetadataKey::TypeChanges)
+                .is_none(),
+            KernelError::schema(format!(
+                "Cannot add field '{}' under '{path}' with `{}` metadata",
+                field.name(),
+                ColumnMetadataKey::TypeChanges.as_ref()
             ))
         );
         require!(
@@ -350,13 +372,8 @@ fn validate_field_update(update: &FieldUpdate) -> KernelResult<()> {
                     "Cannot tighten the nullability of existing field '{path}'"
                 )));
             }
-            FieldChangeType::TypeChanged => {
-                return Err(KernelError::schema(format!(
-                    "Cannot change the type of existing field '{path}' from {} to {}",
-                    update.before.data_type(),
-                    update.after.data_type()
-                )));
-            }
+            // Validated and recorded by `type_widening::apply_type_changes`.
+            FieldChangeType::TypeChanged => {}
             FieldChangeType::MetadataChanged => validate_metadata_change(update)?,
         }
     }
@@ -373,6 +390,8 @@ fn validate_metadata_change(update: &FieldUpdate) -> KernelResult<()> {
         .keys()
         .chain(after.keys())
         .filter(|key| before.get(*key) != after.get(*key))
+        // The type-change history is validated by `type_widening::apply_type_changes`.
+        .filter(|key| key.as_str() != ColumnMetadataKey::TypeChanges.as_ref())
         .find(|key| is_protocol_metadata_key(key.as_str()));
     match changed_key {
         Some(key) => Err(KernelError::schema(format!(

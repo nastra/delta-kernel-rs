@@ -4,11 +4,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{Array, AsArray as _, Int32Array, StringArray};
-use delta_kernel::arrow::datatypes::{Int32Type, Schema as ArrowSchema};
+use delta_kernel::arrow::datatypes::{Float64Type, Int32Type, Int64Type, Schema as ArrowSchema};
 use delta_kernel::arrow::json::ReaderBuilder;
 use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::arrow::util::display::array_value_to_string;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
+use delta_kernel::expressions::Scalar;
 use delta_kernel::schema::{
     ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, SchemaRef, StructField,
     StructType, schema_ref,
@@ -903,19 +905,313 @@ async fn updated_schema_rejects_dropping_or_renaming_stats_columns(
     Ok(())
 }
 
-fn container_schema() -> SchemaRef {
-    let tag = StructType::try_new([StructField::nullable("label", DataType::STRING)]).unwrap();
+// === Type widening ===
+
+const TYPE_WIDENING: (&str, &str) = ("delta.enableTypeWidening", "true");
+
+fn type_changes(field: &StructField) -> Option<&MetadataValue> {
+    field.get_config_value(&ColumnMetadataKey::TypeChanges)
+}
+
+fn widening_schema() -> SchemaRef {
+    let address = StructType::try_new([StructField::nullable("zip", DataType::SHORT)]).unwrap();
     Arc::new(
         StructType::try_new([
-            StructField::nullable("tags", ArrayType::new(tag, true)),
+            StructField::nullable("i", DataType::INTEGER),
+            StructField::nullable("s", DataType::STRING),
             StructField::nullable("scores", ArrayType::new(DataType::INTEGER, true)),
-            StructField::nullable(
-                "attrs",
-                MapType::new(DataType::STRING, DataType::INTEGER, true),
-            ),
+            StructField::nullable("address", address),
         ])
         .unwrap(),
     )
+}
+
+#[tokio::test]
+async fn updated_schema_widens_types_and_records_type_changes() -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create(
+        &table_path,
+        engine.as_ref(),
+        schema_ref! { nullable "i": INTEGER, nullable "s": STRING },
+        &[("delta.columnMapping.mode", "name"), TYPE_WIDENING],
+        None,
+    )?;
+    let batch = RecordBatch::try_new(
+        Arc::new(
+            snapshot
+                .schema()
+                .as_ref()
+                .try_into_arrow()
+                .map_err(KernelError::from)?,
+        ),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(StringArray::from(vec!["a", "b"])),
+        ],
+    )
+    .map_err(KernelError::from)?;
+    let snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
+    let old_schema = snapshot.schema();
+    let widened = with_fields([
+        StructField {
+            data_type: DataType::LONG,
+            ..field(&old_schema, "i")
+        },
+        field(&old_schema, "s"),
+    ]);
+    update_schema(&snapshot, engine.as_ref(), widened)?;
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let i = field(&reloaded.schema(), "i");
+    assert_eq!(i.data_type(), &DataType::LONG);
+    assert_same_identity(&field(&old_schema, "i"), &i);
+    assert_eq!(
+        type_changes(&i),
+        Some(&MetadataValue::Other(serde_json::json!([
+            { "fromType": "integer", "toType": "long" }
+        ])))
+    );
+    let batches = read_scan(&reloaded.scan_builder().build()?, engine.clone())?;
+    let ids = batches[0].column(0).as_primitive::<Int64Type>();
+    assert_eq!(ids.values(), &[1, 2]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn updated_schema_records_nested_and_container_type_changes() -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create(
+        &table_path,
+        engine.as_ref(),
+        widening_schema(),
+        &[("delta.columnMapping.mode", "name"), TYPE_WIDENING],
+        None,
+    )?;
+    let batch = batch_from_json(
+        &snapshot,
+        r#"{"i": 1, "s": "a", "scores": [1, 2], "address": {"zip": 7}}"#,
+    );
+    let snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
+    let old_schema = snapshot.schema();
+    let mut address = field(&old_schema, "address");
+    let DataType::Struct(address_type) = address.data_type().clone() else {
+        panic!("address is a struct");
+    };
+    address.data_type = with_fields([StructField {
+        data_type: DataType::INTEGER,
+        ..field(&address_type, "zip")
+    }])
+    .into();
+    let updated = with_fields([
+        field(&old_schema, "i"),
+        field(&old_schema, "s"),
+        StructField {
+            data_type: ArrayType::new(DataType::DOUBLE, true).into(),
+            ..field(&old_schema, "scores")
+        },
+        address,
+    ]);
+    let committed = update_schema(&snapshot, engine.as_ref(), updated)?;
+
+    let schema = committed.schema();
+    assert_eq!(
+        type_changes(&field(&schema, "scores")),
+        Some(&MetadataValue::Other(serde_json::json!([
+            { "fromType": "integer", "toType": "double", "fieldPath": "element" }
+        ])))
+    );
+    let zip = schema.field_at_path(&["address".to_string(), "zip".to_string()]);
+    assert_eq!(
+        type_changes(zip),
+        Some(&MetadataValue::Other(serde_json::json!([
+            { "fromType": "short", "toType": "integer" }
+        ])))
+    );
+    assert_eq!(type_changes(&field(&schema, "address")), None);
+    assert_eq!(type_changes(&field(&schema, "i")), None);
+
+    // Values written before the widening read back as the wider types.
+    let batches = read_scan(&committed.scan_builder().build()?, engine.clone())?;
+    let scores = batches[0].column(2).as_list::<i32>().value(0);
+    assert_eq!(scores.as_primitive::<Float64Type>().values(), &[1.0, 2.0]);
+    let address = batches[0].column(3).as_struct();
+    assert_eq!(address.column(0).as_primitive::<Int32Type>().value(0), 7);
+    Ok(())
+}
+
+#[tokio::test]
+async fn updated_schema_widens_map_keys_and_values() -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create(
+        &table_path,
+        engine.as_ref(),
+        Arc::new(StructType::try_new([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("m", MapType::new(DataType::INTEGER, DataType::FLOAT, true)),
+        ])?),
+        &[("delta.columnMapping.mode", "name"), TYPE_WIDENING],
+        None,
+    )?;
+    let batch = batch_from_json(&snapshot, r#"{"id": 1, "m": {"3": 1.5}}"#);
+    let snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
+    let old_schema = snapshot.schema();
+    let updated = with_fields([
+        field(&old_schema, "id"),
+        StructField {
+            data_type: MapType::new(DataType::LONG, DataType::DOUBLE, true).into(),
+            ..field(&old_schema, "m")
+        },
+    ]);
+    update_schema(&snapshot, engine.as_ref(), updated)?;
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(
+        type_changes(&field(&reloaded.schema(), "m")),
+        Some(&MetadataValue::Other(serde_json::json!([
+            { "fromType": "integer", "toType": "long", "fieldPath": "key" },
+            { "fromType": "float", "toType": "double", "fieldPath": "value" }
+        ])))
+    );
+    let batches = read_scan(&reloaded.scan_builder().build()?, engine.clone())?;
+    let entries = batches[0].column(1).as_map().value(0);
+    assert_eq!(entries.column(0).as_primitive::<Int64Type>().values(), &[3]);
+    assert_eq!(
+        entries.column(1).as_primitive::<Float64Type>().values(),
+        &[1.5]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn updated_schema_keeps_type_change_history_omitted_by_the_caller() -> delta_kernel::Result<()>
+{
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create(
+        &table_path,
+        engine.as_ref(),
+        widening_schema(),
+        &[("delta.columnMapping.mode", "name"), TYPE_WIDENING],
+        None,
+    )?;
+    let widen_i = |schema: &StructType, data_type: DataType, keep_history: bool| {
+        let mut i = StructField {
+            data_type,
+            ..field(schema, "i")
+        };
+        if !keep_history {
+            i.metadata.remove(ColumnMetadataKey::TypeChanges.as_ref());
+        }
+        let fields = schema.fields().map(|f| {
+            if f.name() == "i" {
+                i.clone()
+            } else {
+                f.clone()
+            }
+        });
+        with_fields(fields)
+    };
+    let first = update_schema(
+        &snapshot,
+        engine.as_ref(),
+        widen_i(&snapshot.schema(), DataType::LONG, true),
+    )?;
+    let decimal = DataType::decimal(22, 2)?;
+    let second = update_schema(
+        &first,
+        engine.as_ref(),
+        widen_i(&first.schema(), decimal, false),
+    )?;
+    assert_eq!(
+        type_changes(&field(&second.schema(), "i")),
+        Some(&MetadataValue::Other(serde_json::json!([
+            { "fromType": "integer", "toType": "long" },
+            { "fromType": "long", "toType": "decimal(22,2)" }
+        ])))
+    );
+    // An update that keeps the type and omits the history keeps the history too.
+    let i = field(&second.schema(), "i");
+    let third = update_schema(
+        &second,
+        engine.as_ref(),
+        widen_i(&second.schema(), i.data_type().clone(), false),
+    )?;
+    assert_eq!(field(&third.schema(), "i"), i);
+    Ok(())
+}
+
+#[rstest]
+#[case::not_enabled(
+    false,
+    |s: &StructType| retype(s, "i", DataType::LONG),
+    "Cannot change the type of existing field 'i' from integer to long: type widening is not \
+     enabled on the table"
+)]
+#[case::narrowing(
+    true,
+    |s: &StructType| retype(s, "i", DataType::SHORT),
+    "Cannot change the type of existing field 'i' from integer to short"
+)]
+#[case::unsupported_element_change(
+    true,
+    |s: &StructType| retype(s, "scores", ArrayType::new(DataType::STRING, true).into()),
+    "Cannot change the type of existing field 'scores' at 'element' from integer to string"
+)]
+#[case::container_change(
+    true,
+    |s: &StructType| retype(s, "scores", DataType::INTEGER),
+    "Cannot change the type of existing field 'scores' from array<integer> to integer"
+)]
+#[case::modified_history(
+    true,
+    |s: &StructType| {
+        s.fields()
+            .map(|f| match f.name().as_str() {
+                "i" => f.clone().add_metadata([(
+                    "delta.typeChanges",
+                    MetadataValue::Other(serde_json::json!([
+                        { "fromType": "short", "toType": "integer" }
+                    ])),
+                )]),
+                _ => f.clone(),
+            })
+            .collect()
+    },
+    "Cannot change metadata 'delta.typeChanges' of existing field 'i'"
+)]
+#[case::history_on_new_field(
+    true,
+    |s: &StructType| appended(
+        s,
+        StructField::nullable("new", DataType::LONG).add_metadata([(
+            "delta.typeChanges",
+            MetadataValue::Other(serde_json::json!([
+                { "fromType": "integer", "toType": "long" }
+            ])),
+        )]),
+    ),
+    "Cannot add field 'new' under 'new' with `delta.typeChanges` metadata"
+)]
+#[tokio::test]
+async fn updated_schema_rejects_unsupported_type_changes(
+    #[case] type_widening: bool,
+    #[case] edit: SchemaEdit,
+    #[case] expected: &str,
+) -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let mut properties = vec![("delta.columnMapping.mode", "name")];
+    if type_widening {
+        properties.push(TYPE_WIDENING);
+    }
+    let snapshot = create(
+        &table_path,
+        engine.as_ref(),
+        widening_schema(),
+        &properties,
+        None,
+    )?;
+    let updated = with_fields(edit(&snapshot.schema()));
+    assert_update_rejected(&snapshot, engine.as_ref(), updated, expected);
+    Ok(())
 }
 
 /// Returns the fields of `schema` with the type of field `name` replaced by `data_type`.
@@ -930,6 +1226,163 @@ fn retype(schema: &StructType, name: &str, data_type: DataType) -> Vec<StructFie
             false => f.clone(),
         })
         .collect()
+}
+
+#[rstest]
+#[case::integer_to_long(DataType::INTEGER, Scalar::Integer(7), DataType::LONG, Ok("7"))]
+#[case::integer_to_double(DataType::INTEGER, Scalar::Integer(7), DataType::DOUBLE, Ok("7.0"))]
+#[case::integer_to_decimal_same_scale(
+    DataType::INTEGER,
+    Scalar::Integer(7),
+    DataType::decimal(12, 0).unwrap(),
+    Ok("7")
+)]
+#[case::decimal_precision(
+    DataType::decimal(5, 2).unwrap(),
+    Scalar::decimal(150, 5, 2).unwrap(),
+    DataType::decimal(10, 2).unwrap(),
+    Ok("1.50")
+)]
+#[case::integer_to_decimal(
+    DataType::INTEGER,
+    Scalar::Integer(7),
+    DataType::decimal(12, 2).unwrap(),
+    Err("Cannot change the type of partition column 'p' from integer to decimal(12,2)")
+)]
+#[case::decimal_scale(
+    DataType::decimal(5, 2).unwrap(),
+    Scalar::decimal(150, 5, 2).unwrap(),
+    DataType::decimal(8, 4).unwrap(),
+    Err("Cannot change the type of partition column 'p' from decimal(5,2) to decimal(8,4)")
+)]
+#[case::date_to_timestamp_ntz(
+    DataType::DATE,
+    Scalar::Date(18000),
+    DataType::TIMESTAMP_NTZ,
+    Err("Cannot change the type of partition column 'p' from date to timestamp_ntz")
+)]
+#[tokio::test]
+async fn updated_schema_widens_partition_columns_only_when_values_stay_readable(
+    #[case] from: DataType,
+    #[case] value: Scalar,
+    #[case] to: DataType,
+    // The partition value read back after the widening, or the rejection message.
+    #[case] expected: Result<&str, &str>,
+) -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create(
+        &table_path,
+        engine.as_ref(),
+        Arc::new(with_fields([
+            StructField::nullable("i", DataType::INTEGER),
+            StructField::nullable("p", from),
+        ])),
+        &[("delta.columnMapping.mode", "name"), TYPE_WIDENING],
+        Some(DataLayout::partitioned(["p"])),
+    )?;
+    let data_schema = schema_ref! { nullable "i": INTEGER };
+    let batch = RecordBatch::try_new(
+        Arc::new(
+            data_schema
+                .as_ref()
+                .try_into_arrow()
+                .map_err(KernelError::from)?,
+        ),
+        vec![Arc::new(Int32Array::from(vec![1]))],
+    )
+    .map_err(KernelError::from)?;
+    let partition_values = HashMap::from([("p".to_string(), value)]);
+    let snapshot =
+        write_batch_to_table(&snapshot, engine.as_ref(), batch, partition_values).await?;
+    let updated = with_fields(retype(&snapshot.schema(), "p", to.clone()));
+    let result = update_schema(&snapshot, engine.as_ref(), updated);
+    match expected {
+        Err(expected) => {
+            assert_result_error_with_message(result, expected);
+            assert_nothing_committed(&snapshot, engine.as_ref());
+        }
+        Ok(expected_value) => {
+            let committed = result?;
+            let batches = read_scan(&committed.scan_builder().build()?, engine.clone())?;
+            let partition = batches[0].column(1);
+            assert_eq!(partition.len(), 1);
+            assert_eq!(
+                partition.data_type(),
+                &(&to).try_into_arrow().map_err(KernelError::from)?
+            );
+            assert_eq!(
+                array_value_to_string(partition, 0).map_err(KernelError::from)?,
+                expected_value
+            );
+        }
+    }
+    Ok(())
+}
+
+#[rstest]
+#[case::integer_to_long(DataType::LONG, None)]
+#[case::integer_to_double(
+    DataType::DOUBLE,
+    Some("only allow type changes that Iceberg V2 supports")
+)]
+#[case::integer_to_decimal(
+    DataType::decimal(12, 0).unwrap(),
+    Some("only allow type changes that Iceberg V2 supports")
+)]
+#[tokio::test]
+async fn updated_schema_restricts_widening_while_iceberg_compat_is_supported(
+    #[case] to: DataType,
+    #[case] expected_error: Option<&str>,
+    #[values("icebergCompatV2", "icebergCompatV3")] compat: &str,
+) -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let signal = format!("delta.feature.{compat}");
+    let mut properties = vec![
+        ("delta.columnMapping.mode", "name"),
+        TYPE_WIDENING,
+        (signal.as_str(), "supported"),
+    ];
+    // Kernel requires row tracking whenever icebergCompatV3 is supported.
+    if compat == "icebergCompatV3" {
+        properties.push(("delta.enableRowTracking", "true"));
+    }
+    let snapshot = create(
+        &table_path,
+        engine.as_ref(),
+        widening_schema(),
+        &properties,
+        None,
+    )?;
+    // The protocol restricts widening while icebergCompatV1 or V2 is supported; the V3 RFC only
+    // while icebergCompatV3 is enabled.
+    let expected_error = expected_error.filter(|_| compat != "icebergCompatV3");
+    let updated = with_fields(retype(&snapshot.schema(), "i", to));
+    let result = update_schema(&snapshot, engine.as_ref(), updated);
+    match expected_error {
+        Some(expected) => {
+            assert_result_error_with_message(result, expected);
+            assert_nothing_committed(&snapshot, engine.as_ref());
+        }
+        None => {
+            result?;
+        }
+    }
+    Ok(())
+}
+
+fn container_schema() -> SchemaRef {
+    let tag = StructType::try_new([StructField::nullable("label", DataType::STRING)]).unwrap();
+    Arc::new(
+        StructType::try_new([
+            StructField::nullable("tags", ArrayType::new(tag, true)),
+            StructField::nullable("scores", ArrayType::new(DataType::INTEGER, true)),
+            StructField::nullable(
+                "attrs",
+                MapType::new(DataType::STRING, DataType::INTEGER, true),
+            ),
+        ])
+        .unwrap(),
+    )
 }
 
 #[rstest]
@@ -972,10 +1425,6 @@ fn retype(schema: &StructType, name: &str, data_type: DataType) -> Vec<StructFie
     ),
     "Cannot change the type of existing field 'attrs'"
 )]
-#[case::widening_not_yet_supported(
-    |s: &StructType| retype(s, "scores", ArrayType::new(DataType::LONG, true).into()),
-    "Cannot change the type of existing field 'scores'"
-)]
 #[tokio::test]
 async fn updated_schema_rejects_container_and_type_changes(
     #[case] edit: SchemaEdit,
@@ -998,8 +1447,7 @@ async fn updated_schema_rejects_container_and_type_changes(
 }
 
 #[tokio::test]
-async fn updated_schema_keeps_type_change_history_omitted_by_the_caller() -> delta_kernel::Result<()>
-{
+async fn updated_schema_keeps_type_change_history_through_a_rename() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let history = MetadataValue::Other(serde_json::json!([
         { "fromType": "integer", "toType": "long" }

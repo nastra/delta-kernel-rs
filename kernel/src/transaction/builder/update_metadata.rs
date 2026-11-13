@@ -131,7 +131,7 @@ pub(super) fn prepare_update_table_metadata(
         }
         (None, Some(schema)) => {
             ensure_schema_changes_supported(read_config)?;
-            evolve_metadata_to_schema(read_config, &schema)?
+            evolve_metadata_to_schema(read_config, &schema, &properties_added)?
         }
         (None, None) => (read_config.metadata().clone(), read_config.logical_schema()),
     };

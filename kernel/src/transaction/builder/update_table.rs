@@ -212,13 +212,22 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// rewritten, and `delta.columnMapping.maxColumnId` never decreases. As with
     /// [`add_column`](Self::add_column), `build()` adds any table feature the new schema requires.
     ///
+    /// When `delta.enableTypeWidening` is `true`, the type of a field, array element, or map key
+    /// or value may also change to a wider type the Delta protocol supports, such as `integer` to
+    /// `long`. Kernel appends each change to the field's `delta.typeChanges` metadata, keeping the
+    /// existing history when the supplied field omits it. A partition column cannot widen from
+    /// `date` to `timestamp_ntz`, change its decimal scale, or widen from an integer to a decimal
+    /// with a non-zero scale, because Kernel cannot parse its existing partition values as the new
+    /// type.
+    ///
     /// [`build`](Self::build) rejects the update if the table does not use column mapping, or if
-    /// the schema has no columns, tightens nullability, changes a field's type, moves a field to a
-    /// different parent struct, drops or renames a partition column or a column listed in
-    /// `delta.dataSkippingStatsColumns`, drops a clustering column, renames a collated field, adds
-    /// a non-nullable field (at any nesting depth), a field with a default value, or a field with
-    /// generation or identity metadata, or changes protocol-defined field metadata such as
-    /// generation expressions, invariants, or defaults. It cannot be combined with
+    /// the schema has no columns, tightens nullability, makes any other type change or alters
+    /// `delta.typeChanges`, moves a field to a different parent struct, drops or renames a
+    /// partition column or a column listed in `delta.dataSkippingStatsColumns`, drops a clustering
+    /// column, renames a collated field, adds a non-nullable field (at any nesting depth), a field
+    /// with a default value, or a field with generation or identity metadata, or changes
+    /// protocol-defined field metadata such as generation expressions, invariants, or defaults.
+    /// It cannot be combined with
     /// [`add_column`](Self::add_column), [`add_column_at`](Self::add_column_at), or
     /// [`set_nullable`](Self::set_nullable) in the same transaction.
     ///
@@ -1383,6 +1392,106 @@ mod tests {
         );
         let infos = reader.get_clustering_column_infos(&engine)?.unwrap();
         assert_eq!(infos[0].logical_column, column_name!("address.town"));
+        Ok(())
+    }
+
+    #[rstest]
+    fn type_widening_enabled_in_the_same_request_allows_widening(
+        #[values(false, true)] enable_in_request: bool,
+    ) -> Result<()> {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let schema = Arc::new(StructType::try_new([StructField::nullable(
+            "i",
+            DataType::INTEGER,
+        )])?);
+        let snapshot = create_table("memory:///", schema, "test", true)
+            .with_table_properties([(COLUMN_MAPPING_MODE, "name")])
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
+            .unwrap_post_commit_snapshot();
+        let mut widened = snapshot.schema().field("i").unwrap().clone();
+        widened.data_type = DataType::LONG;
+        let mut builder = snapshot
+            .clone()
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_updated_schema(Arc::new(StructType::try_new([widened])?));
+        if enable_in_request {
+            builder
+                .local_state
+                .properties_added
+                .insert("delta.enableTypeWidening".to_string(), "true".to_string());
+        }
+        let result = builder.build(&engine, Box::new(FileSystemCommitter::new()));
+        if !enable_in_request {
+            let error = result.unwrap_err();
+            assert!(
+                error.to_string().contains("type widening is not enabled"),
+                "{error}"
+            );
+            let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
+            assert_eq!(reloaded.version(), snapshot.version());
+            assert_eq!(reloaded.schema(), snapshot.schema());
+            return Ok(());
+        }
+        result?.commit(&engine)?.unwrap_committed();
+
+        let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
+        let config = reloaded.table_configuration();
+        assert!(config.is_feature_enabled(&TableFeature::TypeWidening));
+        let field = reloaded.schema().field("i").unwrap().clone();
+        assert_eq!(field.data_type(), &DataType::LONG);
+        assert!(
+            field
+                .get_config_value(&ColumnMetadataKey::TypeChanges)
+                .is_some()
+        );
+        Ok(())
+    }
+
+    // A table with icebergCompatV3 enabled rejects any schema update before widening is checked,
+    // so enabling it in the same request is the way to reach the restriction today.
+    #[rstest]
+    #[case::outside_the_iceberg_subset(
+        DataType::DOUBLE,
+        "only allow type changes that Iceberg V2 supports"
+    )]
+    #[case::inside_the_iceberg_subset(DataType::LONG, "Enabling 'delta.enableIcebergCompatV3'")]
+    fn enabling_iceberg_compat_v3_restricts_widening(
+        #[case] to: DataType,
+        #[case] expected: &str,
+    ) -> Result<()> {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let schema = Arc::new(StructType::try_new([StructField::nullable(
+            "i",
+            DataType::INTEGER,
+        )])?);
+        let snapshot = create_table("memory:///", schema, "test", true)
+            .with_table_properties([
+                (COLUMN_MAPPING_MODE, "name"),
+                ("delta.enableTypeWidening", "true"),
+                ("delta.enableRowTracking", "true"),
+            ])
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
+            .unwrap_post_commit_snapshot();
+        let mut widened = snapshot.schema().field("i").unwrap().clone();
+        widened.data_type = to;
+        let mut builder = snapshot
+            .clone()
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_updated_schema(Arc::new(StructType::try_new([widened])?));
+        builder
+            .local_state
+            .properties_added
+            .insert(ENABLE_ICEBERG_COMPAT_V3.to_string(), "true".to_string());
+        let error = builder
+            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+
+        let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
+        assert_eq!(reloaded.version(), snapshot.version());
+        assert_eq!(reloaded.schema(), snapshot.schema());
         Ok(())
     }
 
