@@ -10,8 +10,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::metadata_derivation::{
-    ValidatedTableProperties, maybe_auto_enable_property_driven_features, maybe_enable_collations,
-    maybe_enable_file_type_preview, maybe_enable_ict_for_catalog_managed,
+    ALLOWED_DELTA_PROPERTIES, ValidatedTableProperties, maybe_auto_enable_property_driven_features,
+    maybe_enable_collations, maybe_enable_file_type_preview, maybe_enable_ict_for_catalog_managed,
     maybe_enable_timestamp_ntz, maybe_enable_v2_checkpoint_for_policy, maybe_enable_variant_type,
     validate_extract_features_and_properties_for,
 };
@@ -107,6 +107,7 @@ pub(super) fn prepare_update_table_metadata(
         property_keys_removed,
     } = request;
     validate_property_removals(&properties_added, &property_keys_removed)?;
+    validate_property_value_case(&properties_added)?;
 
     // Schema changes preserve the column-mapping identities of surviving fields and assign new
     // identities (and `maxColumnId`) to added fields. The evolved schema is validated against the
@@ -335,6 +336,29 @@ fn validate_property_removals(
         return Err(KernelError::generic(format!(
             "Unsetting table property '{key}' is not supported during {UPDATE_TABLE}"
         )));
+    }
+    Ok(())
+}
+
+/// Rejects a value of a recognized `delta.*` property that Kernel parses only in another letter
+/// case, such as `TRUE`. Kernel would read such a value as unset, so the transition checks would
+/// not see it, while Java and Spark read it as set.
+fn validate_property_value_case(properties_added: &HashMap<String, String>) -> KernelResult<()> {
+    let parses = |key: &str, value: &str| {
+        !TableProperties::from([(key, value)])
+            .unknown_properties
+            .contains_key(key)
+    };
+    for (key, value) in properties_added {
+        if ALLOWED_DELTA_PROPERTIES.contains(&key.as_str())
+            && !parses(key, value)
+            && parses(key, &value.to_ascii_lowercase())
+        {
+            return Err(KernelError::generic(format!(
+                "Invalid value '{value}' for table property '{key}': use '{}'",
+                value.to_ascii_lowercase()
+            )));
+        }
     }
     Ok(())
 }
@@ -954,6 +978,16 @@ mod tests {
     )]
     #[case::unset_delta_key_in_other_case(&[], &["DELTA.appendOnly"], "Unsetting table property")]
     #[case::set_and_unset(&[("app.key", "value")], &["app.key"], "both set and unset")]
+    #[case::uppercase_row_tracking(
+        &[(ENABLE_ROW_TRACKING, "TRUE")],
+        &[],
+        "Invalid value 'TRUE' for table property 'delta.enableRowTracking'"
+    )]
+    #[case::mixed_case_iceberg_compat_v2(
+        &[(ENABLE_ICEBERG_COMPAT_V2, "True")],
+        &[],
+        "Invalid value 'True' for table property 'delta.enableIcebergCompatV2'"
+    )]
     fn kernel_managed_and_conflicting_property_requests_are_rejected(
         #[case] added: &[(&str, &str)],
         #[case] removed: &[&str],
