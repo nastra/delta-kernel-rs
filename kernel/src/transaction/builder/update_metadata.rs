@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use super::metadata_derivation::{
     ValidatedTableProperties, maybe_auto_enable_property_driven_features, maybe_enable_collations,
-    maybe_enable_ict_for_catalog_managed, maybe_enable_timestamp_ntz,
-    maybe_enable_v2_checkpoint_for_policy, maybe_enable_variant_type,
+    maybe_enable_file_type_preview, maybe_enable_ict_for_catalog_managed,
+    maybe_enable_timestamp_ntz, maybe_enable_v2_checkpoint_for_policy, maybe_enable_variant_type,
     validate_extract_features_and_properties_for,
 };
 use crate::actions::{Metadata, Protocol};
@@ -159,6 +159,7 @@ pub(super) fn prepare_update_table_metadata(
     maybe_enable_variant_type(&schema, &mut requested);
     maybe_enable_timestamp_ntz(&schema, &mut requested);
     maybe_enable_collations(&schema, &mut requested);
+    maybe_enable_file_type_preview(&schema, &mut requested);
     maybe_auto_enable_property_driven_features(&mut requested);
     maybe_enable_ict_for_catalog_managed(&mut requested)?;
     maybe_enable_v2_checkpoint_for_policy(&mut requested);
@@ -634,6 +635,25 @@ mod tests {
                 "{feature} was dropped"
             );
         }
+    }
+
+    #[rstest]
+    #[case::timestamp_ntz(DataType::TIMESTAMP_NTZ, TableFeature::TimestampWithoutTimezone)]
+    #[case::variant(DataType::unshredded_variant(), TableFeature::VariantType)]
+    #[case::file(DataType::file_type(), TableFeature::FileTypePreview)]
+    fn schema_change_derives_type_feature(
+        #[case] data_type: DataType,
+        #[case] feature: TableFeature,
+    ) {
+        let (engine, snapshot) = create_test_table(&[]);
+        let prepared = prepare(
+            engine.as_ref(),
+            &snapshot,
+            add_column_request(StructField::nullable("added", data_type)),
+        )
+        .unwrap();
+        assert!(prepared.should_emit_protocol);
+        assert!(prepared.table_config.is_feature_supported(&feature));
     }
 
     #[rstest]
