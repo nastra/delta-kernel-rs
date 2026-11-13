@@ -1296,6 +1296,8 @@ mod tests {
         }
     }
 
+    // Writer version 5 implies checkConstraints, which Kernel writes only with this feature.
+    #[cfg(feature = "check-constraints-in-dev")]
     #[test]
     fn legacy_column_mapping_protocol_upgrade_retains_implied_features() {
         let (engine, snapshot) = create_test_table(&[(COLUMN_MAPPING_MODE, "name")]);
