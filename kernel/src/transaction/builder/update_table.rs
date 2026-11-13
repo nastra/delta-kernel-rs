@@ -66,8 +66,6 @@ pub struct UpdateTableBuilderState {
     snapshot: SnapshotRef,
     operation: UpdateTableOperation,
     schema_changes: Option<Vec<SchemaOperation>>,
-    // Configuration overrides for the shared update preparation path. No public setter populates
-    // these yet.
     properties_added: HashMap<String, String>,
     property_keys_removed: HashSet<String>,
     domain_metadata_removals: Vec<String>,
@@ -187,6 +185,37 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
             .schema_changes
             .get_or_insert_with(Vec::new)
             .push(SchemaOperation::SetNullable { column });
+        self
+    }
+
+    /// Sets table properties, overwriting existing values for the supplied keys.
+    ///
+    /// Properties not supplied keep their current values. Repeated calls merge, with later values
+    /// overwriting earlier ones for the same key. Application properties (keys outside the
+    /// `delta.` namespace) are stored as given. Recognized `delta.*` keys are matched
+    /// case-insensitively and stored with their canonical case, and their values must parse; other
+    /// `delta.*` keys, including Kernel-managed ones such as `delta.columnMapping.maxColumnId`, are
+    /// rejected. `delta.feature.<name>=supported` adds a supported feature to the protocol.
+    ///
+    /// Setting a property changes only table metadata and, when the configuration requires a
+    /// feature the protocol lacks, the protocol. It does not rewrite or backfill data files or
+    /// create a checkpoint: for example, `delta.checkpointPolicy=v2` adds the `v2Checkpoint`
+    /// feature and only affects future checkpoints. Existing protocol features are always
+    /// retained, so disabling a property such as `delta.enableTypeWidening` keeps the feature that
+    /// existing files may need. Reasserting a property's current value changes nothing.
+    ///
+    /// [`build`](Self::build) rejects malformed values, keys that are also removed, and
+    /// transitions Kernel does not support on existing tables, such as changing the column mapping
+    /// mode or enabling or disabling row tracking.
+    pub fn with_table_properties_added<I, K, V>(mut self, properties: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.local_state
+            .properties_added
+            .extend(properties.into_iter().map(|(k, v)| (k.into(), v.into())));
         self
     }
 
@@ -1187,13 +1216,10 @@ mod tests {
             .build(&engine, Box::new(FileSystemCommitter::new()))?
             .commit(&engine)?
             .unwrap_post_commit_snapshot();
-        let mut builder =
-            snapshot.update_table(UpdateTableOperation::AlterTable, "test-engine", false);
-        builder
-            .local_state
-            .properties_added
-            .insert(ENABLE_IN_COMMIT_TIMESTAMPS.to_string(), "true".to_string());
-        let transaction = builder.build(&engine, Box::new(FileSystemCommitter::new()))?;
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([(ENABLE_IN_COMMIT_TIMESTAMPS, "true")])
+            .build(&engine, Box::new(FileSystemCommitter::new()))?;
         assert!(transaction.should_emit_protocol);
         let committed = transaction.commit(&engine)?.unwrap_post_commit_snapshot();
 
@@ -1212,6 +1238,42 @@ mod tests {
             reloaded.reader().get_in_commit_timestamp(&engine)?,
             Some(timestamp)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_managed_feature_signal_enables_in_commit_timestamps() -> Result<()> {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let snapshot = create_table("memory:///", test_schema_flat(), "test", true)
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
+            .unwrap_post_commit_snapshot();
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([("delta.feature.catalogManaged", "supported")])
+            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+
+        assert!(transaction.should_emit_protocol);
+        let config = &transaction.effective_table_config;
+        assert!(config.is_feature_supported(&TableFeature::CatalogManaged));
+        assert!(config.is_feature_enabled(&TableFeature::InCommitTimestamp));
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_property_calls_merge_with_later_values_winning() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let builder = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([("app.a", "1"), ("app.b", "1")])
+            .with_table_properties_added([("app.b", "2")]);
+        let expected = [("app.a", "1"), ("app.b", "2")]
+            .map(|(key, value)| (key.to_string(), value.to_string()));
+        assert_eq!(builder.local_state.properties_added, expected.into());
+
+        let transaction = builder.build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        assert!(transaction.should_emit_metadata);
+        assert!(!transaction.should_emit_protocol);
         Ok(())
     }
 

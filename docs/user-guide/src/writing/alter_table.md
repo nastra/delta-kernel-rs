@@ -135,9 +135,33 @@ let result = snapshot
     .commit(&engine)?;
 ```
 
-Building an `UpdateTableOperation::AlterTable` transaction without adding a schema operation returns an
-error. The unified builder performs this check at runtime because other operations may combine
+Building an `UpdateTableOperation::AlterTable` transaction without a schema operation or a table
+property change returns an error. The unified builder performs this check at runtime because other operations may combine
 schema evolution with data-file actions.
+
+## Setting table properties
+
+`with_table_properties_added()` sets table properties on an existing table. Supplied keys overwrite
+their current values, and all other properties are kept. A property-only `AlterTable` commit
+writes no data files:
+
+```rust,ignore
+let result = snapshot
+    .update_table(UpdateTableOperation::AlterTable, "my-app/1.0", /* data_change */ false)
+    .with_table_properties_added([
+        ("myapp.owner", "analytics"),
+        ("delta.checkpointPolicy", "v2"),
+    ])
+    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .commit(&engine)?;
+```
+
+Application properties are stored as given. Kernel validates `delta.*` properties at `build()`.
+When a property requires a table feature that the protocol lacks, the commit adds that feature.
+For example, `delta.checkpointPolicy=v2` adds `v2Checkpoint` but does not write a checkpoint. See
+the [`with_table_properties_added` rustdoc][set-props] for the full contract.
+
+[set-props]: https://docs.rs/delta_kernel/latest/delta_kernel/transaction/type.UpdateTableTransactionBuilder.html
 
 ## Evolving a schema while writing
 

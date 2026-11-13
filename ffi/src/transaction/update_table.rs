@@ -296,6 +296,34 @@ pub unsafe extern "C" fn update_table_txn_builder_with_domain_metadata(
     unsafe { result.into_extern_result(&engine) }
 }
 
+/// Sets one table property, overwriting the current value for `key`.
+///
+/// Repeated calls merge, with later values winning for the same key. See
+/// [`UpdateTableTransactionBuilder::with_table_properties_added`] for the property contract.
+/// Invalid properties are rejected when the builder is built.
+///
+/// # Safety
+///
+/// All handles and strings must be valid. This call borrows `engine`, `key`, and `value` and
+/// unconditionally consumes `builder`, including on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn update_table_txn_builder_with_table_property(
+    builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
+    key: KernelStringSlice,
+    value: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
+    let builder = unsafe { *builder.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    let key: KernelResult<String> = unsafe { TryFromStringSlice::try_from_slice(&key) };
+    let value: KernelResult<String> = unsafe { TryFromStringSlice::try_from_slice(&value) };
+    let result = key.and_then(|key| {
+        let builder = builder.with_table_properties_added([(key, value?)]);
+        Ok(Box::new(builder).into())
+    });
+    unsafe { result.into_extern_result(&engine) }
+}
+
 /// Adds a nullable top-level field described by a single-field engine schema.
 ///
 /// # Safety

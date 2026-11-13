@@ -10,3 +10,4 @@ mod iceberg_compat;
 mod interval;
 mod maintenance_ops;
 pub(crate) mod row_tracking;
+mod set_table_properties;

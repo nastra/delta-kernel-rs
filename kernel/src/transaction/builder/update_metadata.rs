@@ -11,7 +11,7 @@ use super::metadata_derivation::{
     ValidatedTableProperties, maybe_auto_enable_property_driven_features, maybe_enable_collations,
     maybe_enable_ict_for_catalog_managed, maybe_enable_timestamp_ntz,
     maybe_enable_v2_checkpoint_for_policy, maybe_enable_variant_type,
-    validate_extract_features_and_properties_for,
+    validate_and_normalize_delta_properties, validate_extract_features_and_properties_for,
 };
 use crate::actions::{Metadata, Protocol};
 use crate::schema::SchemaRef;
@@ -100,6 +100,7 @@ pub(super) fn prepare_update_table_metadata(
         properties_added,
         property_keys_removed,
     } = request;
+    let properties_added = validate_and_normalize_delta_properties(properties_added, UPDATE_TABLE)?;
     validate_property_removals(&properties_added, &property_keys_removed)?;
 
     // Schema changes preserve the column-mapping identities of surviving fields and assign new
@@ -710,6 +711,11 @@ mod tests {
     )]
     #[case::unset_feature_signal(&[], &["delta.feature.rowTracking"], "Unsetting table property")]
     #[case::set_and_unset(&[("app.key", "value")], &["app.key"], "both set and unset")]
+    #[case::set_and_unset_after_canonicalization(
+        &[("DELTA.APPENDONLY", "true")],
+        &["delta.appendOnly"],
+        "both set and unset"
+    )]
     fn kernel_managed_and_conflicting_property_requests_are_rejected(
         #[case] added: &[(&str, &str)],
         #[case] removed: &[&str],

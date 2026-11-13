@@ -4383,6 +4383,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_table_txn_builder_sets_table_properties() -> delta_kernel::Result<()> {
+        let (store, kernel_engine, table_url) =
+            test_utils::engine_store_setup("test_update_builder_table_properties", None);
+        delta_kernel::transaction::create_table::create_table(
+            table_url.as_str(),
+            schema_ref! { nullable "id": INTEGER },
+            "test-engine/1.0",
+            true,
+        )
+        .build(&kernel_engine, Box::new(FileSystemCommitter::new()))?
+        .commit(&kernel_engine)?
+        .unwrap_committed();
+        let engine = engine_handle_for_store(store);
+        let snapshot =
+            delta_kernel::Snapshot::builder_for(table_url.clone()).build(&kernel_engine)?;
+        let snapshot_handle: Handle<SharedSnapshot> = snapshot.into();
+        let mut builder = unsafe {
+            ok_or_panic(new_update_table_txn_builder(
+                snapshot_handle.shallow_copy(),
+                KernelUpdateTableOperation::AlterTable,
+                ffi_str("test-engine/1.0"),
+                false,
+                engine.shallow_copy(),
+            ))
+        };
+        for (key, value) in [("app.key", "value"), ("DELTA.CHECKPOINTINTERVAL", "5")] {
+            builder = ok_or_panic(unsafe {
+                update_table_txn_builder_with_table_property(
+                    builder,
+                    ffi_str(key),
+                    ffi_str(value),
+                    engine.shallow_copy(),
+                )
+            });
+        }
+        let txn =
+            ok_or_panic(unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
+        assert_eq!(unsafe { version_and_free(committed) }, 1);
+        unsafe {
+            free_snapshot(snapshot_handle);
+            free_engine(engine);
+        }
+
+        let snapshot = delta_kernel::Snapshot::builder_for(table_url).build(&kernel_engine)?;
+        let configuration = snapshot.table_configuration().metadata().configuration();
+        assert_eq!(
+            configuration.get("app.key").map(String::as_str),
+            Some("value")
+        );
+        assert_eq!(
+            configuration
+                .get("delta.checkpointInterval")
+                .map(String::as_str),
+            Some("5")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_update_table_txn_builder_applies_nested_schema_changes()
     -> delta_kernel::Result<()> {
         let (store, kernel_engine, table_url) =
