@@ -90,7 +90,7 @@ impl<'a> SchemaTransform<'a> for AddedFieldMetadataValidator {
     }
 }
 
-fn reject_generated_or_identity_metadata(field: &StructField) -> KernelResult<()> {
+pub(crate) fn reject_generated_or_identity_metadata(field: &StructField) -> KernelResult<()> {
     AddedFieldMetadataValidator.transform_struct_field(field)
 }
 

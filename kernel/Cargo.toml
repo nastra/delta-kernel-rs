@@ -118,7 +118,7 @@ arrow-60 = ["dep:arrow_60", "dep:parquet_60", "dep:object_store_14"]
 arrow-conversion = ["need-arrow"]
 arrow-expression = ["need-arrow", "dep:chrono-tz"]
 
-# Schema diffing functionality (experimental)
+# No-op: schema diffing is always compiled.
 schema-diff = []
 
 # Declarative plan IR (experimental).

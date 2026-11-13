@@ -41,9 +41,9 @@ For a rewrite that preserves logical data, select the data operation, such as
 `UpdateTableOperation::Optimize`, and pass `false` to `update_table()`.
 
 > [!NOTE]
-> The supported operations are adding columns and making columns nullable. Other schema operations
-> (drop column, rename, type changes) are not yet available through the
-> transaction builder.
+> The incremental operations are adding columns and making columns nullable. To drop, rename, or
+> reorder columns on a column-mapping table, supply the complete schema instead. See
+> [Replacing the schema](#replacing-the-schema).
 
 ## Adding a column
 
@@ -138,6 +138,34 @@ let result = snapshot
 Building an `UpdateTableOperation::AlterTable` transaction without adding a schema operation returns an
 error. The unified builder performs this check at runtime because other operations may combine
 schema evolution with data-file actions.
+
+## Replacing the schema
+
+On a table with column mapping enabled, `with_updated_schema()` replaces the schema with the
+complete schema you supply. Column mapping gives every column a stable ID and physical name, so
+Kernel can tell a renamed column from a dropped one. Start from `snapshot.schema()` and edit it.
+Keep each retained field's metadata, which carries its column-mapping ID. A field without that
+metadata is new, and omitting a field drops it.
+
+```rust,ignore
+let schema = snapshot.schema();
+// Drop `city`, rename `name` to `full_name`, and add a nullable `country` column.
+let updated = StructType::try_new([
+    schema.field("name").unwrap().with_name("full_name"),
+    schema.field("age").unwrap().clone(),
+    StructField::nullable("country", DataType::STRING),
+])?;
+let result = snapshot
+    .update_table(UpdateTableOperation::AlterTable, "my-app/1.0", /* data_change */ false)
+    .with_updated_schema(Arc::new(updated))
+    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .commit(&engine)?;
+```
+
+Renamed and reordered columns keep their physical names, so existing data files still read
+correctly. You cannot combine `with_updated_schema()` with `add_column()` or `set_nullable()` in
+one transaction. For the supported changes and the rules `build()` enforces, see the
+[`with_updated_schema` rustdoc](https://docs.rs/delta_kernel/latest/delta_kernel/transaction/type.UpdateTableTransactionBuilder.html).
 
 ## Evolving a schema while writing
 
