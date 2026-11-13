@@ -706,6 +706,37 @@ mod tests {
             configuration_value(config, ENABLE_IN_COMMIT_TIMESTAMPS),
             Some("true")
         );
+        let InCommitTimestampEnablement::Enabled {
+            enablement: Some((version, _)),
+        } = config.in_commit_timestamp_enablement().unwrap()
+        else {
+            panic!("expected recorded enablement metadata");
+        };
+        assert_eq!(version, snapshot.version() + 1);
+    }
+
+    #[test]
+    fn disabling_in_commit_timestamps_on_catalog_managed_table_is_rejected() {
+        let (engine, snapshot) = create_test_table(&[]);
+        let catalog_managed = prepare(
+            engine.as_ref(),
+            &snapshot,
+            properties_request(&[("delta.feature.catalogManaged", "supported")]),
+        )
+        .unwrap();
+        let snapshot = with_table_config(&snapshot, catalog_managed.table_config);
+        let error = prepare(
+            engine.as_ref(),
+            &snapshot,
+            properties_request(&[(ENABLE_IN_COMMIT_TIMESTAMPS, "false")]),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot disable inCommitTimestamp on a catalogManaged table"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1014,6 +1045,24 @@ mod tests {
         assert!(!config.is_feature_enabled(&TableFeature::InCommitTimestamp));
         assert!(configuration_value(config, IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION).is_none());
         assert!(configuration_value(config, IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP).is_none());
+    }
+
+    #[test]
+    fn missing_row_tracking_column_name_is_rejected() {
+        let (engine, snapshot) = create_test_table(&[(ENABLE_ROW_TRACKING, "true")]);
+        let snapshot = with_configuration_entry(&snapshot, MATERIALIZED_ROW_ID_COLUMN_NAME, None);
+        let error = prepare(
+            engine.as_ref(),
+            &snapshot,
+            add_column_request(StructField::nullable("added", DataType::STRING)),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains(&format!(
+                "materialized column name '{MATERIALIZED_ROW_ID_COLUMN_NAME}' is missing"
+            )),
+            "{error}"
+        );
     }
 
     #[rstest]

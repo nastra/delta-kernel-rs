@@ -418,7 +418,7 @@ mod tests {
     use crate::table_features::{ColumnMappingMode, TableFeature};
     use crate::table_properties::{
         COLUMN_MAPPING_MODE, ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3,
-        ENABLE_IN_COMMIT_TIMESTAMPS,
+        ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
     };
     use crate::transaction::create_table::create_table;
     use crate::transaction::{SchemaOperation, UpdateTableOperation};
@@ -1212,6 +1212,41 @@ mod tests {
         assert_eq!(
             reloaded.reader().get_in_commit_timestamp(&engine)?,
             Some(timestamp)
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::enable_row_tracking(ENABLE_ROW_TRACKING, "true")]
+    #[case::enable_column_mapping_id_mode(COLUMN_MAPPING_MODE, "id")]
+    fn rejected_property_change_commits_nothing(
+        #[case] key: &str,
+        #[case] value: &str,
+    ) -> Result<()> {
+        let (url, _tempdir) = copy_test_table("table-without-dv-small")?;
+        let engine = SyncEngine::new();
+        let snapshot = Snapshot::builder_for(url.as_str()).build(&engine)?;
+        let version = snapshot.version();
+        let mut builder =
+            snapshot.update_table(UpdateTableOperation::AlterTable, "test-engine", false);
+        builder
+            .local_state
+            .properties_added
+            .insert(key.to_string(), value.to_string());
+        let error = builder
+            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(matches!(error, KernelError::Unsupported(_)), "{error}");
+
+        let reloaded = Snapshot::builder_for(url.as_str()).build(&engine)?;
+        assert_eq!(reloaded.version(), version);
+        assert_eq!(
+            reloaded
+                .table_configuration()
+                .metadata()
+                .configuration()
+                .get(key),
+            None
         );
         Ok(())
     }
