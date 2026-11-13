@@ -68,7 +68,7 @@ pub struct UpdateTableBuilderState {
     schema_changes: Option<Vec<SchemaOperation>>,
     // Configuration overrides for the shared update preparation path.
     properties_added: HashMap<String, String>,
-    property_keys_removed: HashSet<String>,
+    property_keys_removed: Option<HashSet<String>>,
     domain_metadata_removals: Vec<String>,
     is_blind_append: bool,
 }
@@ -100,7 +100,7 @@ impl TransactionBuilder<UpdateTable> {
                 operation,
                 schema_changes: None,
                 properties_added: HashMap::new(),
-                property_keys_removed: HashSet::new(),
+                property_keys_removed: None,
                 domain_metadata_removals: Vec::new(),
                 is_blind_append: false,
             },
@@ -194,6 +194,7 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// Each call replaces the keys supplied by a previous call. Keys are matched exactly, so
     /// removing `app.key` leaves `APP.KEY` in place. Removing a key that the table does not have is
     /// not an error: the commit still includes a Metadata action, with an unchanged configuration.
+    /// The same holds for an empty set of keys, as in Java.
     ///
     /// Only user properties can be removed. [`build`](Self::build) rejects keys that start with
     /// `delta.`, compared case-insensitively, and keys that are also set in the same transaction.
@@ -202,7 +203,7 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         mut self,
         keys: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
-        self.local_state.property_keys_removed = keys.into_iter().map(Into::into).collect();
+        self.local_state.property_keys_removed = Some(keys.into_iter().map(Into::into).collect());
         self
     }
 
@@ -266,7 +267,7 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         if operation == &UpdateTableOperation::AlterTable {
             if self.local_state.schema_changes.is_none()
                 && self.local_state.properties_added.is_empty()
-                && self.local_state.property_keys_removed.is_empty()
+                && self.local_state.property_keys_removed.is_none()
             {
                 return Err(KernelError::invalid_transaction_state(
                     "ALTER TABLE requires at least one metadata change",
@@ -1251,6 +1252,7 @@ mod tests {
     #[case::exact_case_match(vec![vec!["app.key"]], &["APP.KEY", "app.other"])]
     #[case::other_case_match(vec![vec!["APP.KEY"]], &["app.key", "app.other"])]
     #[case::absent_key(vec![vec!["app.missing"]], &["app.key", "APP.KEY", "app.other"])]
+    #[case::empty_set(vec![vec![]], &["app.key", "APP.KEY", "app.other"])]
     #[case::multiple_keys(vec![vec!["app.key", "APP.KEY", "app.missing"]], &["app.other"])]
     #[case::last_call_replaces_earlier_keys(
         vec![vec!["app.key", "app.other"], vec!["APP.KEY"]],
