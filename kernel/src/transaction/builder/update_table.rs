@@ -223,10 +223,11 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// [`build`](Self::build) rejects the update if the table does not use column mapping, or if
     /// the schema has no columns, tightens nullability, makes any other type change or alters
     /// `delta.typeChanges`, moves a field to a different parent struct, drops or renames a
-    /// partition column or a column listed in
-    /// `delta.dataSkippingStatsColumns`, drops a clustering column, renames a collated field, adds
-    /// a non-nullable field or a field with a default value, or changes protocol-defined field
-    /// metadata such as generation expressions, invariants, or defaults. It cannot be combined with
+    /// partition column or a column listed in `delta.dataSkippingStatsColumns`, drops a clustering
+    /// column, renames a collated field, adds a non-nullable field (at any nesting depth), a field
+    /// with a default value, or a field with generation or identity metadata, or changes
+    /// protocol-defined field metadata such as generation expressions, invariants, or defaults.
+    /// It cannot be combined with
     /// [`add_column`](Self::add_column), [`add_column_at`](Self::add_column_at), or
     /// [`set_nullable`](Self::set_nullable) in the same transaction.
     ///
@@ -1487,6 +1488,35 @@ mod tests {
             .build(&engine, Box::new(FileSystemCommitter::new()))
             .unwrap_err();
         assert!(error.to_string().contains(expected), "{error}");
+
+        let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
+        assert_eq!(reloaded.version(), snapshot.version());
+        assert_eq!(reloaded.schema(), snapshot.schema());
+        Ok(())
+    }
+
+    #[test]
+    fn updated_schema_with_a_case_insensitive_duplicate_is_rejected() -> Result<()> {
+        let (engine, snapshot) = create_clustered_column_mapping_table()?;
+        let schema = snapshot.schema();
+        // `StructType::try_new` rejects this; a schema built without validation must still fail.
+        let duplicate = StructType::new_unchecked([
+            schema.field("id").unwrap().clone(),
+            schema.field("name").unwrap().clone(),
+            StructField::nullable("NAME", DataType::STRING),
+        ]);
+        let error = snapshot
+            .clone()
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_updated_schema(Arc::new(duplicate))
+            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Duplicate field name (case-insensitive): 'NAME'"),
+            "{error}"
+        );
 
         let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
         assert_eq!(reloaded.version(), snapshot.version());

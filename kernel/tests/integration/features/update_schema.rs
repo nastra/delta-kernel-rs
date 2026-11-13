@@ -227,6 +227,11 @@ async fn updated_schema_changes_nested_fields_preserving_identity() -> delta_ker
         &[("delta.columnMapping.mode", "name")],
         None,
     )?;
+    let batch = batch_from_json(
+        &snapshot,
+        r#"{"id": 1, "address": {"city": "Oslo", "zip": "0150"}, "tags": [{"label": "x", "weight": 3}], "part": "p"}"#,
+    );
+    let snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
     let old_schema = snapshot.schema();
     let old_address = field(&old_schema, "address");
     let DataType::Struct(old_address_type) = old_address.data_type() else {
@@ -286,7 +291,29 @@ async fn updated_schema_changes_nested_fields_preserving_identity() -> delta_ker
     };
     assert_same_identity(&field(old_tag_type, "weight"), &field(new_tag, "score"));
     assert!(field(new_tag, "score").is_nullable());
+
+    // The renamed nested fields still read the values written under their old names.
+    let batches = read_scan(&reloaded.scan_builder().build()?, engine.clone())?;
+    let batch = &batches[0];
+    let tags = batch.column(1).as_list::<i32>().value(0);
+    let tag = tags.as_struct();
+    assert_eq!(tag.column(0).as_string::<i32>().value(0), "x");
+    assert_eq!(tag.column(1).as_primitive::<Int32Type>().value(0), 3);
+    let address = batch.column(2).as_struct();
+    assert!(address.column(0).is_null(0), "the added street is null");
+    assert_eq!(address.column(1).as_string::<i32>().value(0), "Oslo");
     Ok(())
+}
+
+/// Decodes `rows` (one JSON object per line) into a batch with the table's Arrow schema.
+fn batch_from_json(snapshot: &Snapshot, rows: &str) -> RecordBatch {
+    let schema: ArrowSchema = snapshot.schema().as_ref().try_into_arrow().unwrap();
+    ReaderBuilder::new(Arc::new(schema))
+        .build(std::io::Cursor::new(rows))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
 }
 
 #[tokio::test]
@@ -374,6 +401,27 @@ type SchemaEdit = fn(&StructType) -> Vec<StructField>;
 #[case::add_non_nullable(
     |s: &StructType| appended(s, StructField::not_null("new", DataType::STRING)),
     "Cannot add non-nullable field 'new'"
+)]
+#[case::add_struct_with_non_nullable_child(
+    |s: &StructType| appended(s, StructField::nullable(
+        "new",
+        StructType::try_new([StructField::not_null("c", DataType::INTEGER)]).unwrap(),
+    )),
+    "Cannot add non-nullable field 'c' under 'new'"
+)]
+#[case::add_array_of_struct_with_non_nullable_child(
+    |s: &StructType| appended(s, StructField::nullable(
+        "new",
+        ArrayType::new(
+            StructType::try_new([StructField::not_null("c", DataType::INTEGER)]).unwrap(),
+            true,
+        ),
+    )),
+    "Cannot add non-nullable field 'c' under 'new'"
+)]
+#[case::add_field_with_newline_in_name(
+    |s: &StructType| appended(s, StructField::nullable("bad\nname", DataType::STRING)),
+    "contains a newline character"
 )]
 #[case::add_with_default(
     |s: &StructType| appended(s, StructField::nullable("new", DataType::STRING)
@@ -585,6 +633,32 @@ async fn updated_schema_rejects_dropping_or_renaming_partition_columns(
         engine.as_ref(),
         updated,
         "Cannot drop or rename partition column 'part'",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn updated_schema_rejects_change_data_feed_reserved_names() -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create(
+        &table_path,
+        engine.as_ref(),
+        flat_schema(),
+        &[
+            ("delta.columnMapping.mode", "name"),
+            ("delta.enableChangeDataFeed", "true"),
+        ],
+        None,
+    )?;
+    let updated = with_fields(appended(
+        &snapshot.schema(),
+        StructField::nullable("_change_type", DataType::STRING),
+    ));
+    assert_update_rejected(
+        &snapshot,
+        engine.as_ref(),
+        updated,
+        "is reserved for Change Data Feed",
     );
     Ok(())
 }
@@ -1006,17 +1080,6 @@ async fn updated_schema_widens_map_keys_and_values() -> delta_kernel::Result<()>
         &[1.5]
     );
     Ok(())
-}
-
-/// Decodes `rows` (one JSON object per line) into a batch with the table's Arrow schema.
-fn batch_from_json(snapshot: &Snapshot, rows: &str) -> RecordBatch {
-    let schema: ArrowSchema = snapshot.schema().as_ref().try_into_arrow().unwrap();
-    ReaderBuilder::new(Arc::new(schema))
-        .build(std::io::Cursor::new(rows))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
 }
 
 #[tokio::test]

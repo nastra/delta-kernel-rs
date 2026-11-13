@@ -135,6 +135,10 @@ pub(crate) fn evolve_metadata_to_schema(
         &current_schema,
         &schema,
     )?;
+    // The stats-column and change-data-feed checks below read the configuration before the
+    // transaction. No property setter is combined with this path yet; once one is, they must use
+    // the final configuration, so that a request that also replaces
+    // `delta.dataSkippingStatsColumns` or enables change data feed is checked against it.
     if let Some(columns) = &table_config.table_properties().data_skipping_stats_columns {
         validate_stats_columns_unchanged(columns, &current_schema, &schema)?;
     }
@@ -309,6 +313,16 @@ fn validate_added_field(added: &FieldChange) -> KernelResult<()> {
     );
     reject_generated_or_identity_metadata(&added.field)?;
     for_each_struct_field_in(&added.field, |field| {
+        // As in Java's `validateUpdatedSchemaCompatibility`, every new struct field must be
+        // nullable, including fields nested in structs, arrays, and maps of the added field.
+        require!(
+            field.is_nullable(),
+            KernelError::schema(format!(
+                "Cannot add non-nullable field '{}' under '{path}': existing data files do not \
+                 contain it",
+                field.name()
+            ))
+        );
         require!(
             field
                 .get_config_value(&ColumnMetadataKey::TypeChanges)
