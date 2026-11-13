@@ -1216,6 +1216,44 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn enabling_iceberg_compat_v2_with_supported_deletion_vectors_commits_nothing() -> Result<()> {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let snapshot = create_table("memory:///", test_schema_flat(), "test", true)
+            .with_table_properties([
+                (COLUMN_MAPPING_MODE, "name"),
+                ("delta.feature.deletionVectors", "supported"),
+            ])
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
+            .unwrap_post_commit_snapshot();
+        let version = snapshot.version();
+        let mut builder =
+            snapshot.update_table(UpdateTableOperation::AlterTable, "test-engine", false);
+        builder
+            .local_state
+            .properties_added
+            .insert(ENABLE_ICEBERG_COMPAT_V2.to_string(), "true".to_string());
+        let error = builder
+            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("'deletionVectors' is incompatible with 'icebergCompatV2'"),
+            "{error}"
+        );
+
+        let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
+        assert_eq!(reloaded.version(), version);
+        assert!(
+            !reloaded
+                .table_configuration()
+                .is_feature_supported(&TableFeature::IcebergCompatV2)
+        );
+        Ok(())
+    }
+
     #[rstest]
     #[case::enable_row_tracking(ENABLE_ROW_TRACKING, "true")]
     #[case::enable_column_mapping_id_mode(COLUMN_MAPPING_MODE, "id")]

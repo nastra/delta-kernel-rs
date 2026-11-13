@@ -38,6 +38,9 @@ use crate::transaction::schema_evolution::{SchemaOperation, evolve_metadata};
 use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::{Engine, KernelError, KernelResult};
 
+/// Universal formats (UniForm) the table is converted to, as a comma-separated list.
+const UNIVERSAL_FORMAT_ENABLED_FORMATS: &str = "delta.universalFormat.enabledFormats";
+
 /// Operation name used in property validation errors.
 const UPDATE_TABLE: &str = "UPDATE TABLE";
 
@@ -265,6 +268,8 @@ pub(super) fn prepare_update_table_metadata(
                 IcebergCompatValidationContext::Write,
             )?;
         }
+        validate_iceberg_compat_v2_without_deletion_vectors(read_config, &table_config)?;
+        validate_universal_format(table_config.metadata().configuration())?;
     }
     Ok(PreparedUpdateTableMetadata {
         table_config,
@@ -393,6 +398,60 @@ fn validate_transitions(
         ))),
         _ => Ok(()),
     }
+}
+
+/// Rejects `icebergCompatV2` when the final or the read protocol supports `deletionVectors`, as
+/// Java's `CHECK_HAS_NO_DELETION_VECTORS` does. Files written while deletion vectors were enabled
+/// may still carry them, so supported is enough to reject, and the read protocol is checked too.
+fn validate_iceberg_compat_v2_without_deletion_vectors(
+    read_config: &TableConfiguration,
+    table_config: &TableConfiguration,
+) -> KernelResult<()> {
+    let supports_deletion_vectors = [read_config, table_config]
+        .iter()
+        .any(|config| config.is_feature_supported(&TableFeature::DeletionVectors));
+    if table_config.is_feature_enabled(&TableFeature::IcebergCompatV2) && supports_deletion_vectors
+    {
+        return Err(KernelError::unsupported(format!(
+            "Table feature '{}' is incompatible with '{}'",
+            TableFeature::DeletionVectors,
+            TableFeature::IcebergCompatV2
+        )));
+    }
+    Ok(())
+}
+
+/// Requires exactly one of `icebergCompatV2` and `icebergCompatV3` to be enabled when
+/// `delta.universalFormat.enabledFormats` contains `iceberg`, and at most one whenever the property
+/// is set. Mirrors Java's `IcebergUniversalFormatMetadataValidatorAndUpdater.validate`.
+fn validate_universal_format(configuration: &HashMap<String, String>) -> KernelResult<()> {
+    let Some(formats) = configuration.get(UNIVERSAL_FORMAT_ENABLED_FORMATS) else {
+        return Ok(());
+    };
+    let iceberg_enabled = formats.split(',').any(|format| format.trim() == "iceberg");
+    let compat_keys = [ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3];
+    let enabled_compat_count = compat_keys
+        .iter()
+        .filter(|key| {
+            configuration
+                .get(**key)
+                .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+        })
+        .count();
+    if iceberg_enabled && enabled_compat_count == 0 {
+        return Err(KernelError::generic(format!(
+            "One of '{}' must be set to \"true\" to enable the iceberg universal format in \
+             '{UNIVERSAL_FORMAT_ENABLED_FORMATS}'",
+            compat_keys.join("' or '")
+        )));
+    }
+    if enabled_compat_count > 1 {
+        return Err(KernelError::generic(format!(
+            "'{}' cannot be enabled at the same time",
+            compat_keys.join("' and '")
+        )));
+    }
+    Ok(())
 }
 
 /// Requires materialized row-tracking column names when row tracking is enabled, and rejects
@@ -1137,6 +1196,29 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("deletionVectors"), "{error}");
+    }
+
+    #[test]
+    fn disabling_iceberg_compat_v2_on_iceberg_universal_format_table_is_rejected() {
+        let (engine, snapshot) = create_test_table(&[
+            (COLUMN_MAPPING_MODE, "name"),
+            (ENABLE_ICEBERG_COMPAT_V2, "true"),
+        ]);
+        // CREATE TABLE does not accept the UniForm property, so set it on the read metadata.
+        let snapshot =
+            with_configuration_entry(&snapshot, UNIVERSAL_FORMAT_ENABLED_FORMATS, Some("iceberg"));
+        let error = prepare(
+            engine.as_ref(),
+            &snapshot,
+            properties_request(&[(ENABLE_ICEBERG_COMPAT_V2, "false")]),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must be set to \"true\" to enable the iceberg universal format"),
+            "{error}"
+        );
     }
 
     #[test]
