@@ -67,6 +67,7 @@ async fn set_properties_patches_configuration_and_canonicalizes_delta_keys()
         &[
             ("app.overwrite", "new"),
             ("App.MixedCase", "kept"),
+            ("format-version", "2"),
             ("DELTA.CHECKPOINTINTERVAL", "5"),
         ],
     )?;
@@ -78,6 +79,7 @@ async fn set_properties_patches_configuration_and_canonicalizes_delta_keys()
         configuration_value(&reloaded, "App.MixedCase"),
         Some("kept")
     );
+    assert_eq!(configuration_value(&reloaded, "format-version"), Some("2"));
     assert_eq!(
         configuration_value(&reloaded, CHECKPOINT_INTERVAL),
         Some("5")
@@ -97,6 +99,12 @@ async fn set_properties_patches_configuration_and_canonicalizes_delta_keys()
 #[case::unknown_delta_key(&[], &[("delta.unknownProperty", "x")], "not supported")]
 #[case::unknown_delta_key_case_variant(&[], &[("Delta.unknownProperty", "x")], "not supported")]
 #[case::kernel_managed_key(&[], &[("delta.columnMapping.maxColumnId", "100")], "not supported")]
+#[case::not_editable_in_java(
+    &[],
+    &[("delta.setTransactionRetentionDuration", "interval 2 weeks")],
+    "not supported"
+)]
+#[case::unknown_to_java(&[], &[("delta.parquet.format.version", "2.12.0")], "not supported")]
 #[case::duplicate_after_canonicalization(
     &[],
     &[("delta.appendOnly", "true"), ("DELTA.APPENDONLY", "false")],

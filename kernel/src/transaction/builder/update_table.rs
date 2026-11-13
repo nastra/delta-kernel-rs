@@ -194,8 +194,10 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// supplied by any previous call. Application properties (keys outside the
     /// `delta.` namespace) are stored as given. Recognized `delta.*` keys are matched
     /// case-insensitively and stored with their canonical case, and their values must parse; other
-    /// `delta.*` keys, including Kernel-managed ones such as `delta.columnMapping.maxColumnId`, are
-    /// rejected. `delta.feature.<name>=supported` adds a supported feature to the protocol.
+    /// `delta.*` keys are rejected, including Kernel-managed ones such as
+    /// `delta.columnMapping.maxColumnId` and ones Delta Kernel Java does not let a writer set, such
+    /// as `delta.setTransactionRetentionDuration`. `delta.feature.<name>=supported` adds a
+    /// supported feature to the protocol.
     ///
     /// Setting a property changes only table metadata and, when the configuration requires a
     /// feature the protocol lacks, the protocol. It does not rewrite or backfill data files or

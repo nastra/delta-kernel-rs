@@ -31,7 +31,8 @@ use crate::table_properties::{
     COLUMN_MAPPING_MAX_COLUMN_ID, DELTA_PROPERTY_PREFIX, ENABLE_ICEBERG_COMPAT_V2,
     ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
     IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP, IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
-    MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME, TableProperties,
+    MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
+    PARQUET_FORMAT_VERSION, SET_TRANSACTION_RETENTION_DURATION, TableProperties,
 };
 use crate::transaction::schema_evolution::{SchemaOperation, evolve_metadata};
 use crate::transforms::{SchemaTransform, transform_output_type};
@@ -39,6 +40,11 @@ use crate::{Engine, KernelError, KernelResult};
 
 /// Universal formats (UniForm) the table is converted to, as a comma-separated list.
 const UNIVERSAL_FORMAT_ENABLED_FORMATS: &str = "delta.universalFormat.enabledFormats";
+
+/// `delta.*` properties CREATE TABLE accepts but an update rejects, because Java's editable
+/// `TableConfig.VALID_PROPERTIES` does not contain them.
+const NOT_SETTABLE_ON_UPDATE: &[&str] =
+    &[SET_TRANSACTION_RETENTION_DURATION, PARQUET_FORMAT_VERSION];
 
 /// Operation name used in property validation errors.
 const UPDATE_TABLE: &str = "UPDATE TABLE";
@@ -107,6 +113,14 @@ pub(super) fn prepare_update_table_metadata(
         property_keys_removed,
     } = request;
     let properties_added = validate_and_normalize_delta_properties(properties_added, UPDATE_TABLE)?;
+    if let Some(key) = properties_added
+        .keys()
+        .find(|key| NOT_SETTABLE_ON_UPDATE.contains(&key.as_str()))
+    {
+        return Err(KernelError::generic(format!(
+            "Setting delta property '{key}' is not supported during {UPDATE_TABLE}"
+        )));
+    }
     validate_property_removals(&properties_added, &property_keys_removed)?;
 
     // Schema changes preserve the column-mapping identities of surviving fields and assign new
@@ -955,6 +969,16 @@ mod tests {
     )]
     #[case::unset_delta_key_in_other_case(&[], &["DELTA.appendOnly"], "Unsetting table property")]
     #[case::set_and_unset(&[("app.key", "value")], &["app.key"], "both set and unset")]
+    #[case::set_transaction_retention(
+        &[("delta.setTransactionRetentionDuration", "interval 2 weeks")],
+        &[],
+        "Setting delta property 'delta.setTransactionRetentionDuration'"
+    )]
+    #[case::parquet_format_version(
+        &[("DELTA.PARQUET.FORMAT.VERSION", "2.12.0")],
+        &[],
+        "Setting delta property 'delta.parquet.format.version'"
+    )]
     #[case::set_and_unset_after_canonicalization(
         &[("DELTA.APPENDONLY", "true")],
         &["delta.appendOnly"],
