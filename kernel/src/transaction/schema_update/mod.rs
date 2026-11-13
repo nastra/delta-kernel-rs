@@ -84,6 +84,14 @@ pub(crate) fn evolve_metadata_to_schema(
     let mut max_column_id =
         configured_max_column_id.max(find_max_column_id_in_schema(&current_schema).unwrap_or(0));
 
+    // Like Java's `SchemaUtils.validateSchema`: dropping every column would leave a table that can
+    // no longer be scanned, and re-added columns get fresh identities, so the data would be lost.
+    require!(
+        schema.fields().next().is_some(),
+        KernelError::schema(
+            "Cannot update the schema: the schema must contain at least one column"
+        )
+    );
     for field in schema.fields() {
         require!(
             !field.is_metadata_column(),
@@ -128,6 +136,10 @@ pub(crate) fn evolve_metadata_to_schema(
         &current_schema,
         &schema,
     )?;
+    // The stats-column and change-data-feed checks below read the configuration before the
+    // transaction. No property setter is combined with this path yet; once one is, they must use
+    // the final configuration, so that a request that also replaces
+    // `delta.dataSkippingStatsColumns` or enables change data feed is checked against it.
     if let Some(columns) = &table_config.table_properties().data_skipping_stats_columns {
         validate_stats_columns_unchanged(columns, &current_schema, &schema)?;
     }
@@ -319,6 +331,16 @@ fn validate_added_field(added: &FieldChange) -> KernelResult<()> {
     );
     reject_generated_or_identity_metadata(&added.field)?;
     for_each_struct_field_in(&added.field, |field| {
+        // As in Java's `validateUpdatedSchemaCompatibility`, every new struct field must be
+        // nullable, including fields nested in structs, arrays, and maps of the added field.
+        require!(
+            field.is_nullable(),
+            KernelError::schema(format!(
+                "Cannot add non-nullable field '{}' under '{path}': existing data files do not \
+                 contain it",
+                field.name()
+            ))
+        );
         require!(
             field
                 .get_config_value(&ColumnMetadataKey::TypeChanges)
@@ -415,16 +437,21 @@ fn validate_partition_columns_unchanged(
     schema: &StructType,
 ) -> KernelResult<()> {
     for column in metadata.partition_columns() {
-        let Some(id) = current_schema
+        let Some(current) = current_schema
             .fields()
             .find(|field| field.name().eq_ignore_ascii_case(column))
-            .and_then(StructField::column_mapping_id)
         else {
             continue;
         };
+        let Some(id) = current.column_mapping_id() else {
+            continue;
+        };
+        // Compare with the current field's name: the metadata may spell the column in another
+        // case. Matching by ID also rejects dropping the column and re-adding one with the same
+        // name, whose new physical name would orphan the existing partition values.
         let kept = schema
             .fields()
-            .any(|field| field.column_mapping_id() == Some(id) && field.name() == column);
+            .any(|field| field.column_mapping_id() == Some(id) && field.name() == current.name());
         require!(
             kept,
             KernelError::schema(format!("Cannot drop or rename partition column '{column}'"))
@@ -499,5 +526,56 @@ impl<'a, F: FnMut(&'a StructField) -> KernelResult<()>> SchemaTransform<'a>
     fn transform_struct_field(&mut self, field: &'a StructField) -> KernelResult<()> {
         (self.0)(field)?;
         self.recurse_into_struct_field(field)
+    }
+
+    // The fields inside variant and file values are part of the type, not table columns: they
+    // carry no column-mapping identity and may be non-nullable.
+    fn transform_variant(&mut self, _: &'a StructType) -> KernelResult<()> {
+        Ok(())
+    }
+
+    fn transform_file(&mut self, _: &'a StructType) -> KernelResult<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::schema::{DataType, MetadataValue};
+
+    fn field_with_id(name: &str, id: i64) -> StructField {
+        let mut field = StructField::nullable(name, DataType::STRING);
+        field.metadata.insert(
+            ColumnMetadataKey::ColumnMappingId.as_ref().into(),
+            MetadataValue::Number(id),
+        );
+        field
+    }
+
+    #[rstest::rstest]
+    #[case::unchanged("part", true)]
+    #[case::renamed("partition", false)]
+    fn partition_columns_recorded_in_another_case_are_matched_by_the_field_name(
+        #[case] updated_name: &str,
+        #[case] accepted: bool,
+    ) {
+        let current = StructType::try_new([field_with_id("part", 1)]).unwrap();
+        let updated = StructType::try_new([field_with_id(updated_name, 1)]).unwrap();
+        // The metadata spells the partition column in a different case than the schema.
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            Arc::new(current.clone()),
+            vec!["PART".to_string()],
+            0,
+            HashMap::new(),
+        )
+        .unwrap();
+        let result = validate_partition_columns_unchanged(&metadata, &current, &updated);
+        assert_eq!(result.is_ok(), accepted, "{result:?}");
     }
 }

@@ -345,6 +345,28 @@ async fn schema_changes_fail_only_on_tables_with_generated_columns(
     Ok(())
 }
 
+#[tokio::test]
+async fn updated_schema_fails_on_tables_with_generated_columns() -> delta_kernel::Result<()> {
+    let (_tmp, table_path, engine) = test_table_setup()?;
+    let table_url = write_table(&table_path, GENERATED_COLUMNS_FEATURE, EVENT_YEAR).await?;
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+
+    let result = begin_transaction_with(
+        snapshot.clone(),
+        engine.as_ref(),
+        UpdateTableOperation::AlterTable,
+        "Test/1.0",
+        false,
+        |builder| builder.with_updated_schema(snapshot.schema()),
+    );
+    let expected = "Schema changes are not yet supported on tables with generated columns";
+    assert!(matches!(&result, Err(KernelError::Unsupported(msg)) if msg == expected));
+
+    let reloaded = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    assert_eq!(reloaded.version(), snapshot.version());
+    Ok(())
+}
+
 #[rstest]
 #[case::alter_table(UpdateTableOperation::AlterTable, false)]
 #[case::write_with_schema_evolution(UpdateTableOperation::Write, true)]

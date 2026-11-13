@@ -118,7 +118,7 @@ commit includes a Protocol action. For example, adding a `TIMESTAMP_NTZ` column 
 > [!NOTE]
 > Kernel rejects schema changes at `build()` when the table has generated columns, and rejects
 > `add_column()` and `set_nullable()` when `allowColumnDefaults` is enabled. These restrictions
-> apply regardless of the transaction operation or `dataChange` value.
+> apply to both workflows, regardless of the transaction operation or `dataChange` value.
 
 ## Chaining multiple operations
 
