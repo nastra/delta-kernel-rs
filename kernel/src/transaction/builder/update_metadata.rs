@@ -151,8 +151,16 @@ pub(super) fn prepare_update_table_metadata(
     let enables_catalog_managed = requested
         .writer_features
         .contains(&TableFeature::CatalogManaged);
-    if enables_catalog_managed && explicit_ict.is_none() {
-        configuration.insert(ENABLE_IN_COMMIT_TIMESTAMPS.to_string(), "true".to_string());
+    match explicit_ict {
+        Some(value) if enables_catalog_managed && value.eq_ignore_ascii_case("false") => {
+            return Err(KernelError::generic(
+                "Cannot disable inCommitTimestamp when enabling catalogManaged",
+            ));
+        }
+        None if enables_catalog_managed => {
+            configuration.insert(ENABLE_IN_COMMIT_TIMESTAMPS.to_string(), "true".to_string());
+        }
+        _ => {}
     }
     requested.properties = configuration;
 
@@ -771,7 +779,12 @@ mod tests {
             ]),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("Catalog-managed tables require"));
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot disable inCommitTimestamp when enabling catalogManaged"),
+            "{error}"
+        );
     }
 
     #[test]
