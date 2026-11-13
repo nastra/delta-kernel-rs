@@ -7,7 +7,7 @@ pub(crate) use column_mapping::get_any_level_column_physical_name;
 #[deprecated = "Enable internal-api and use TableConfiguration instead"]
 pub use column_mapping::validate_schema_column_mapping;
 pub(crate) use column_mapping::{
-    StaleAnnotationPolicy, column_mapping_mode, drop_column_mapping_metadata,
+    StaleAnnotationPolicy, assign_nested_cm_ids, column_mapping_mode, drop_column_mapping_metadata,
     get_column_mapping_mode_from_properties, physical_to_logical_column_name_and_type,
     schema_has_column_mapping_metadata, strip_stray_column_mapping_metadata,
     try_assign_flat_column_mapping_info, validate_and_extract_column_mapping_annotations,

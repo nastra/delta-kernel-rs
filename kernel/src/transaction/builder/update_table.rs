@@ -411,7 +411,10 @@ mod tests {
     use crate::expressions::ColumnName;
     use crate::expressions::column_name;
     use crate::object_store::memory::InMemory;
-    use crate::schema::{DataType, StructField, schema_ref};
+    use crate::schema::{
+        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+        schema_ref,
+    };
     use crate::snapshot::Snapshot;
     use crate::table_configuration::InCommitTimestampEnablement;
     use crate::table_features::{ColumnMappingMode, TableFeature};
@@ -1246,6 +1249,78 @@ mod tests {
                 .configuration()
                 .get(key),
             None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn enabling_iceberg_compat_v2_assigns_nested_field_ids() -> Result<()> {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let schema = Arc::new(StructType::try_new([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("tags", ArrayType::new(DataType::STRING, true)),
+            StructField::nullable(
+                "counts",
+                MapType::new(DataType::STRING, DataType::INTEGER, true),
+            ),
+        ])?);
+        let snapshot = create_table("memory:///", schema, "test", true)
+            .with_table_properties([(COLUMN_MAPPING_MODE, "name")])
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
+            .unwrap_post_commit_snapshot();
+        let read_max_id = snapshot
+            .table_configuration()
+            .table_properties()
+            .column_mapping_max_column_id
+            .unwrap();
+
+        let mut builder =
+            snapshot.update_table(UpdateTableOperation::AlterTable, "test-engine", false);
+        builder
+            .local_state
+            .properties_added
+            .insert(ENABLE_ICEBERG_COMPAT_V2.to_string(), "true".to_string());
+        builder
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
+            .unwrap_committed();
+
+        let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
+        let config = reloaded.table_configuration();
+        assert!(config.is_feature_enabled(&TableFeature::IcebergCompatV2));
+        let schema = config.logical_schema();
+        let nested_ids = |name: &str| {
+            let field = schema.field(name).unwrap();
+            let physical = field.physical_name(ColumnMappingMode::Name).to_string();
+            let Some(MetadataValue::Other(serde_json::Value::Object(ids))) =
+                field.get_config_value(&ColumnMetadataKey::ColumnMappingNestedIds)
+            else {
+                panic!("expected nested ids on '{name}'");
+            };
+            (physical, ids.clone())
+        };
+        let mut assigned = Vec::new();
+        for (name, slots) in [
+            ("tags", &["element"][..]),
+            ("counts", &["key", "value"][..]),
+        ] {
+            let (physical, ids) = nested_ids(name);
+            assert_eq!(ids.len(), slots.len(), "{ids:?}");
+            for slot in slots {
+                let id = ids[&format!("{physical}.{slot}")].as_i64().unwrap();
+                assert!(id > read_max_id);
+                assigned.push(id);
+            }
+        }
+        assigned.sort_unstable();
+        assert_eq!(
+            assigned,
+            (read_max_id + 1..=read_max_id + 3).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            config.table_properties().column_mapping_max_column_id,
+            Some(read_max_id + 3)
         );
         Ok(())
     }

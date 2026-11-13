@@ -23,9 +23,10 @@ use crate::table_features::{
     ColumnMappingMode, IcebergCompatValidationContext, LEGACY_WRITER_FEATURES,
     SET_TABLE_FEATURE_SUPPORTED_PREFIX, TABLE_FEATURES_MIN_READER_VERSION,
     TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature, V2_VALIDATOR, V3_VALIDATOR,
-    assign_column_mapping_metadata, drop_column_mapping_metadata,
+    assign_column_mapping_metadata, assign_nested_cm_ids, drop_column_mapping_metadata,
     ensure_domain_metadata_dependency, extract_enabled_reader_features,
-    get_column_mapping_mode_from_properties, validate_iceberg_compat_if_needed,
+    find_max_column_id_in_schema, get_column_mapping_mode_from_properties,
+    validate_iceberg_compat_if_needed,
 };
 use crate::table_properties::{
     COLUMN_MAPPING_MAX_COLUMN_ID, ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3,
@@ -130,10 +131,29 @@ pub(super) fn prepare_update_table_metadata(
     configuration.extend(requested.properties.drain());
     configuration.retain(|key, _| !property_keys_removed.contains(key));
     validate_transitions(read_config, &configuration, has_schema_changes)?;
-    if get_column_mapping_mode_from_properties(read_config.metadata().configuration())?
-        != get_column_mapping_mode_from_properties(&configuration)?
-    {
+    let new_mode = get_column_mapping_mode_from_properties(&configuration)?;
+    let enables_column_mapping =
+        get_column_mapping_mode_from_properties(read_config.metadata().configuration())?
+            != new_mode;
+    if enables_column_mapping {
         schema = assign_column_mapping_to_existing_fields(&schema, &mut configuration)?;
+    }
+    // Like Java's `rewriteFieldIdsForIceberg`, IcebergCompat requires ids for the array element and
+    // map key/value slots of a column-mapped schema.
+    let iceberg_compat_enabled = |configuration: &HashMap<String, String>| {
+        [ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3]
+            .iter()
+            .any(|key| configuration.get(*key).map(String::as_str) == Some("true"))
+    };
+    let enables_iceberg_compat = iceberg_compat_enabled(&configuration)
+        && !iceberg_compat_enabled(read_config.metadata().configuration());
+    if new_mode != ColumnMappingMode::None
+        && iceberg_compat_enabled(&configuration)
+        && (enables_column_mapping || enables_iceberg_compat)
+    {
+        schema = assign_iceberg_compat_nested_ids(&schema, &mut configuration)?;
+    }
+    if enables_column_mapping || enables_iceberg_compat {
         evolved_metadata = evolved_metadata.with_schema(schema.clone())?;
     }
     let explicit_ict = properties_added
@@ -433,13 +453,25 @@ fn assign_column_mapping_to_existing_fields(
     let schema = FieldNameAsPhysicalName
         .transform_struct(&schema)
         .into_owned();
-    let assign_nested_field_ids = [ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3]
-        .iter()
-        .any(|key| configuration.get(*key).map(String::as_str) == Some("true"));
     let mut max_id = TableProperties::from(configuration.iter())
         .column_mapping_max_column_id
         .unwrap_or(0);
-    let schema = assign_column_mapping_metadata(&schema, &mut max_id, assign_nested_field_ids)?;
+    let schema = assign_column_mapping_metadata(&schema, &mut max_id, false)?;
+    configuration.insert(COLUMN_MAPPING_MAX_COLUMN_ID.to_string(), max_id.to_string());
+    Ok(Arc::new(schema))
+}
+
+/// Assigns `delta.columnMapping.nested.ids` to the array and map slots of a column-mapped `schema`
+/// that have none, and records the new `delta.columnMapping.maxColumnId` in `configuration`.
+fn assign_iceberg_compat_nested_ids(
+    schema: &StructType,
+    configuration: &mut HashMap<String, String>,
+) -> KernelResult<SchemaRef> {
+    let mut max_id = TableProperties::from(configuration.iter())
+        .column_mapping_max_column_id
+        .unwrap_or(0)
+        .max(find_max_column_id_in_schema(schema).unwrap_or(0));
+    let schema = assign_nested_cm_ids(schema, &mut max_id)?;
     configuration.insert(COLUMN_MAPPING_MAX_COLUMN_ID.to_string(), max_id.to_string());
     Ok(Arc::new(schema))
 }
