@@ -359,35 +359,23 @@ fn try_new_update_table<MODE: ExecutionMode>(
         IcebergCompatValidationContext::Write,
     )?;
 
+    let request = UpdateTableMetadataRequest {
+        schema_changes,
+        properties_added,
+        property_keys_removed,
+    };
+    let has_metadata_request = !request.is_empty();
     let PreparedUpdateTableMetadata {
         table_config: effective_table_config,
         should_emit_metadata,
         should_emit_protocol,
-    } = prepare_update_table_metadata(
-        &read_snapshot,
-        UpdateTableMetadataRequest {
-            schema_changes,
-            properties_added,
-            property_keys_removed,
-        },
-        commit_timestamp,
-        engine,
-    )?;
-    // A request whose properties all match the table changes nothing; reject it here rather than
-    // at commit.
-    if operation == UpdateTableOperation::AlterTable
-        && !should_emit_metadata
-        && !should_emit_protocol
-    {
-        return Err(KernelError::invalid_transaction_state(
-            "ALTER TABLE requires at least one metadata change",
-        ));
-    }
+    } = prepare_update_table_metadata(&read_snapshot, request, commit_timestamp, engine)?;
 
     Ok(Transaction {
         read_snapshot_opt: Some(read_snapshot),
         should_emit_metadata,
         should_emit_protocol,
+        has_metadata_request,
         user_domain_removals: domain_metadata_removals,
         is_blind_append,
         physical_clustering_columns: clustering_columns,
@@ -1291,7 +1279,7 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_property_alter_table_is_rejected_at_build() -> Result<()> {
+    fn unchanged_property_alter_table_commits_without_metadata_or_protocol() -> Result<()> {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
         let snapshot = create_table("memory:///", test_schema_flat(), "test", true)
             .with_table_properties([("app.key", "value")])
@@ -1299,19 +1287,26 @@ mod tests {
             .commit(&engine)?
             .unwrap_post_commit_snapshot();
         let mut builder =
-            snapshot.update_table(UpdateTableOperation::AlterTable, "test-engine", false);
+            snapshot
+                .clone()
+                .update_table(UpdateTableOperation::AlterTable, "test-engine", false);
         builder
             .local_state
             .properties_added
             .insert("app.key".to_string(), "value".to_string());
-        let error = builder
-            .build(&engine, Box::new(FileSystemCommitter::new()))
-            .unwrap_err();
-        assert!(
-            matches!(&error, KernelError::InvalidTransactionState(message)
-            if message == "ALTER TABLE requires at least one metadata change"),
-            "{error}"
+        let transaction = builder.build(&engine, Box::new(FileSystemCommitter::new()))?;
+        assert!(!transaction.should_emit_metadata);
+        assert!(!transaction.should_emit_protocol);
+        transaction.commit(&engine)?.unwrap_committed();
+
+        let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
+        assert_eq!(reloaded.version(), snapshot.version() + 1);
+        let (read_config, config) = (
+            snapshot.table_configuration(),
+            reloaded.table_configuration(),
         );
+        assert_eq!(config.metadata(), read_config.metadata());
+        assert_eq!(config.protocol(), read_config.protocol());
         Ok(())
     }
 
