@@ -827,3 +827,53 @@ async fn updated_schema_rejects_container_and_type_changes(
     assert_update_rejected(&snapshot, engine.as_ref(), updated, expected);
     Ok(())
 }
+
+#[tokio::test]
+async fn updated_schema_keeps_type_change_history_omitted_by_the_caller() -> delta_kernel::Result<()>
+{
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let history = MetadataValue::Other(serde_json::json!([
+        { "fromType": "integer", "toType": "long" }
+    ]));
+    let widened = StructField::nullable("i", DataType::LONG)
+        .add_metadata([("delta.typeChanges", history.clone())]);
+    let snapshot = create(
+        &table_path,
+        engine.as_ref(),
+        Arc::new(with_fields([
+            widened,
+            StructField::nullable("s", DataType::STRING),
+        ])),
+        &[
+            ("delta.columnMapping.mode", "name"),
+            ("delta.enableTypeWidening", "true"),
+        ],
+        None,
+    )?;
+    let mut i = field(&snapshot.schema(), "i");
+    i.metadata.remove("delta.typeChanges");
+    let renamed = with_fields([i, field(&snapshot.schema(), "s").with_name("t")]);
+    let committed = update_schema(&snapshot, engine.as_ref(), renamed)?;
+    assert_eq!(
+        field(&committed.schema(), "i").get_config_value(&ColumnMetadataKey::TypeChanges),
+        Some(&history)
+    );
+
+    let altered = MetadataValue::Other(serde_json::json!([
+        { "fromType": "short", "toType": "long" }
+    ]));
+    let committed_schema = committed.schema();
+    let fields = committed_schema.fields().map(|f| match f.name().as_str() {
+        "i" => f
+            .clone()
+            .add_metadata([("delta.typeChanges", altered.clone())]),
+        _ => f.clone(),
+    });
+    assert_update_rejected(
+        &committed,
+        engine.as_ref(),
+        with_fields(fields),
+        "Cannot change metadata 'delta.typeChanges' of existing field 'i'",
+    );
+    Ok(())
+}

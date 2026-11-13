@@ -7,7 +7,7 @@
 //! and receive fresh identities; Kernel never accepts a caller-chosen identity for a new field.
 //! This mirrors Delta Kernel Java's `SchemaUtils.validateUpdatedSchemaAndGetUpdatedSchema`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::actions::Metadata;
@@ -91,6 +91,12 @@ pub(crate) fn evolve_metadata_to_schema(
     })?;
 
     let schema = assign_new_field_identities(schema, &mut max_column_id)?;
+    let mut current_fields = HashMap::new();
+    for_each_struct_field(&current_schema, |field| {
+        current_fields.extend(field.column_mapping_id().map(|id| (id, field)));
+        Ok(())
+    })?;
+    let schema = inherit_type_change_history(&schema, &current_fields)?;
     let diff = SchemaDiff::new(&current_schema, &schema)
         .map_err(|e| KernelError::schema(format!("Invalid schema update: {e}")))?;
     for added in &diff.added_fields {
@@ -213,6 +219,57 @@ fn assign_new_identities_in_type(
         DataType::Map(map_type) => MapType::new(
             assign_new_identities_in_type(map_type.key_type(), max_column_id)?,
             assign_new_identities_in_type(map_type.value_type(), max_column_id)?,
+            map_type.value_contains_null(),
+        )
+        .into(),
+        other => other.clone(),
+    })
+}
+
+/// Copies the `delta.typeChanges` history of each retained field that omits it.
+///
+/// The protocol requires writers to preserve the history, and a caller-built schema may not carry
+/// it. A history that differs from the current one is rejected by [`validate_metadata_change`].
+fn inherit_type_change_history(
+    schema: &StructType,
+    current_fields: &HashMap<i64, &StructField>,
+) -> KernelResult<StructType> {
+    let key = ColumnMetadataKey::TypeChanges.as_ref();
+    let fields = schema
+        .fields()
+        .map(|field| {
+            let mut field = field.clone();
+            let history = field
+                .column_mapping_id()
+                .and_then(|id| current_fields.get(&id))
+                .and_then(|current| current.metadata.get(key));
+            if let Some(history) = history.filter(|_| !field.metadata.contains_key(key)) {
+                field.metadata.insert(key.into(), history.clone());
+            }
+            field.data_type =
+                inherit_type_change_history_in_type(&field.data_type, current_fields)?;
+            Ok(field)
+        })
+        .collect::<KernelResult<Vec<_>>>()?;
+    StructType::try_new(fields)
+}
+
+fn inherit_type_change_history_in_type(
+    data_type: &DataType,
+    current_fields: &HashMap<i64, &StructField>,
+) -> KernelResult<DataType> {
+    Ok(match data_type {
+        DataType::Struct(struct_type) => {
+            inherit_type_change_history(struct_type, current_fields)?.into()
+        }
+        DataType::Array(array_type) => ArrayType::new(
+            inherit_type_change_history_in_type(array_type.element_type(), current_fields)?,
+            array_type.contains_null(),
+        )
+        .into(),
+        DataType::Map(map_type) => MapType::new(
+            inherit_type_change_history_in_type(map_type.key_type(), current_fields)?,
+            inherit_type_change_history_in_type(map_type.value_type(), current_fields)?,
             map_type.value_contains_null(),
         )
         .into(),
@@ -371,24 +428,26 @@ fn column_mapping_ids_at_path(schema: &StructType, path: &ColumnName) -> Option<
 }
 
 /// Calls `f` for every struct field in `schema`, at any nesting depth.
-fn for_each_struct_field(
-    schema: &StructType,
-    f: impl FnMut(&StructField) -> KernelResult<()>,
+fn for_each_struct_field<'a>(
+    schema: &'a StructType,
+    f: impl FnMut(&'a StructField) -> KernelResult<()>,
 ) -> KernelResult<()> {
     StructFieldVisitor(f).transform_struct(schema)
 }
 
 /// Calls `f` for `field` and every struct field nested in it.
-fn for_each_struct_field_in(
-    field: &StructField,
-    f: impl FnMut(&StructField) -> KernelResult<()>,
+fn for_each_struct_field_in<'a>(
+    field: &'a StructField,
+    f: impl FnMut(&'a StructField) -> KernelResult<()>,
 ) -> KernelResult<()> {
     StructFieldVisitor(f).transform_struct_field(field)
 }
 
 struct StructFieldVisitor<F>(F);
 
-impl<'a, F: FnMut(&StructField) -> KernelResult<()>> SchemaTransform<'a> for StructFieldVisitor<F> {
+impl<'a, F: FnMut(&'a StructField) -> KernelResult<()>> SchemaTransform<'a>
+    for StructFieldVisitor<F>
+{
     transform_output_type!(|'a, T| KernelResult<()>);
 
     fn transform_struct_field(&mut self, field: &'a StructField) -> KernelResult<()> {
