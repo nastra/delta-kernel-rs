@@ -41,7 +41,7 @@ use crate::table_features::{
     get_column_mapping_mode_from_properties, strip_stray_column_mapping_metadata,
     validate_iceberg_compat_if_needed,
 };
-#[cfg(feature = "adaptive-metadata-in-dev")]
+#[cfg(any(test, feature = "adaptive-metadata-in-dev"))]
 use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
 use crate::table_properties::{
     COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, ENABLE_CHANGE_DATA_FEED,
