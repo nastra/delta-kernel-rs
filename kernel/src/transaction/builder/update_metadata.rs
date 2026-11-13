@@ -50,8 +50,9 @@ pub(super) struct UpdateTableMetadataRequest {
     pub(super) schema_changes: Option<Vec<SchemaOperation>>,
     /// Table properties to set. May contain `delta.feature.<name>=supported` signals.
     pub(super) properties_added: HashMap<String, String>,
-    /// Table property keys to unset.
-    pub(super) property_keys_removed: HashSet<String>,
+    /// Table property keys to unset. `Some` with an empty set is still a removal request, which
+    /// emits Metadata as in Java.
+    pub(super) property_keys_removed: Option<HashSet<String>>,
 }
 
 impl UpdateTableMetadataRequest {
@@ -59,7 +60,7 @@ impl UpdateTableMetadataRequest {
     pub(super) fn is_empty(&self) -> bool {
         self.schema_changes.is_none()
             && self.properties_added.is_empty()
-            && self.property_keys_removed.is_empty()
+            && self.property_keys_removed.is_none()
     }
 }
 
@@ -106,6 +107,8 @@ pub(super) fn prepare_update_table_metadata(
         properties_added,
         property_keys_removed,
     } = request;
+    let has_removal_request = property_keys_removed.is_some();
+    let property_keys_removed = property_keys_removed.unwrap_or_default();
     validate_property_removals(&properties_added, &property_keys_removed)?;
     validate_property_value_case(&properties_added)?;
 
@@ -246,8 +249,11 @@ pub(super) fn prepare_update_table_metadata(
     }
 
     validate_row_tracking_column_names(&table_config)?;
-    let should_emit_metadata =
-        has_schema_changes || table_config.metadata() != read_config.metadata();
+    // Like Java, a removal request emits Metadata even when it removes no key, including an empty
+    // one, so a removal-only ALTER TABLE commits.
+    let should_emit_metadata = has_schema_changes
+        || has_removal_request
+        || table_config.metadata() != read_config.metadata();
     // A metadata-only change can break a feature requirement without changing the protocol, so
     // the final configuration is validated whenever either action is emitted.
     if should_emit_metadata || should_emit_protocol {
@@ -995,7 +1001,7 @@ mod tests {
     ) {
         let (engine, snapshot) = create_test_table(&[(ENABLE_ROW_TRACKING, "true")]);
         let mut request = properties_request(added);
-        request.property_keys_removed = removed.iter().map(|key| key.to_string()).collect();
+        request.property_keys_removed = Some(removed.iter().map(|key| key.to_string()).collect());
         let error = prepare(engine.as_ref(), &snapshot, request).unwrap_err();
         assert!(error.to_string().contains(expected), "{error}");
     }
