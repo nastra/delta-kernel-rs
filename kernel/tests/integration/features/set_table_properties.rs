@@ -98,6 +98,11 @@ async fn set_properties_patches_configuration_and_canonicalizes_delta_keys()
 #[case::malformed_enum(&[], &[(CHECKPOINT_POLICY, "v3")], "Invalid value")]
 #[case::unknown_delta_key(&[], &[("delta.unknownProperty", "x")], "not supported")]
 #[case::unknown_delta_key_case_variant(&[], &[("Delta.unknownProperty", "x")], "not supported")]
+#[case::unknown_feature_in_other_case(
+    &[],
+    &[("DELTA.FEATURE.noSuchFeature", "supported")],
+    "Enabling feature 'noSuchFeature'"
+)]
 #[case::kernel_managed_key(&[], &[("delta.columnMapping.maxColumnId", "100")], "not supported")]
 #[case::not_editable_in_java(
     &[],
@@ -135,6 +140,43 @@ async fn set_properties_rejects_invalid_requests(
         .with_table_properties_added(properties.to_vec())
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
     assert_result_error_with_message(result, error_contains);
+    Ok(())
+}
+
+#[rstest]
+#[case::exact("delta.feature.domainMetadata")]
+#[case::name_case("delta.feature.DOMAINMETADATA")]
+#[case::prefix_case("DELTA.Feature.domainMetadata")]
+#[tokio::test]
+async fn feature_signals_match_prefix_and_feature_name_in_any_case(
+    #[case] key: &str,
+) -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+    assert!(
+        !snapshot
+            .table_configuration()
+            .is_feature_supported(&TableFeature::DomainMetadata)
+    );
+
+    let reloaded = set_properties(
+        snapshot,
+        &table_path,
+        engine.as_ref(),
+        &[(key, "supported")],
+    )?;
+
+    assert_eq!(reloaded.version(), 1);
+    let config = reloaded.table_configuration();
+    assert!(config.is_feature_supported(&TableFeature::DomainMetadata));
+    assert!(
+        !config
+            .metadata()
+            .configuration()
+            .keys()
+            .any(|key| key.to_ascii_lowercase().starts_with("delta.feature."))
+    );
     Ok(())
 }
 
