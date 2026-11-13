@@ -215,9 +215,10 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// When `delta.enableTypeWidening` is `true`, the type of a field, array element, or map key
     /// or value may also change to a wider type the Delta protocol supports, such as `integer` to
     /// `long`. Kernel appends each change to the field's `delta.typeChanges` metadata, keeping the
-    /// existing history when the supplied field omits it. Partition columns cannot widen to a
-    /// decimal or `timestamp_ntz`, because Kernel cannot parse their existing partition values as
-    /// the new type.
+    /// existing history when the supplied field omits it. A partition column cannot widen from
+    /// `date` to `timestamp_ntz`, change its decimal scale, or widen from an integer to a decimal
+    /// with a non-zero scale, because Kernel cannot parse its existing partition values as the new
+    /// type.
     ///
     /// [`build`](Self::build) rejects the update if the table does not use column mapping, or if
     /// the schema has no columns, tightens nullability, makes any other type change or alters
