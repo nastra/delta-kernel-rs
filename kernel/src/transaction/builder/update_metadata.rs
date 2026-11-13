@@ -523,7 +523,7 @@ mod tests {
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
-    use crate::schema::{DataType, StructField};
+    use crate::schema::{ArrayType, DataType, MapType};
     use crate::snapshot::SnapshotRef;
     use crate::table_configuration::InCommitTimestampEnablement;
     use crate::table_properties::{CHECKPOINT_POLICY, COLUMN_MAPPING_MODE, ENABLE_ROW_TRACKING};
@@ -977,6 +977,128 @@ mod tests {
         assert_eq!(
             config.table_properties().column_mapping_max_column_id,
             Some(field_count)
+        );
+    }
+
+    #[test]
+    fn enabling_column_mapping_name_mode_assigns_nested_fields_and_drops_leftover_annotations() {
+        fn annotated(
+            mut field: StructField,
+            key: ColumnMetadataKey,
+            value: MetadataValue,
+        ) -> StructField {
+            field.metadata.insert(key.as_ref().into(), value);
+            field
+        }
+        fn collect_struct_fields<'a>(data_type: &'a DataType, out: &mut Vec<&'a StructField>) {
+            match data_type {
+                DataType::Struct(inner) => {
+                    for field in inner.fields() {
+                        out.push(field);
+                        collect_struct_fields(field.data_type(), out);
+                    }
+                }
+                DataType::Array(array) => collect_struct_fields(array.element_type(), out),
+                DataType::Map(map) => {
+                    collect_struct_fields(map.key_type(), out);
+                    collect_struct_fields(map.value_type(), out);
+                }
+                _ => {}
+            }
+        }
+
+        let (engine, snapshot) = create_test_table(&[]);
+        // Leftover annotations on a mapping-disabled schema, which Kernel must not reuse.
+        let leftover_schema = Arc::new(
+            StructType::try_new([
+                StructField::nullable("id", DataType::INTEGER),
+                StructField::nullable(
+                    "s",
+                    StructType::try_new([
+                        annotated(
+                            StructField::nullable("a", DataType::INTEGER),
+                            ColumnMetadataKey::ColumnMappingPhysicalName,
+                            MetadataValue::String("stale-a".to_string()),
+                        ),
+                        StructField::nullable(
+                            "b",
+                            StructType::try_new([StructField::nullable("c", DataType::STRING)])
+                                .unwrap(),
+                        ),
+                    ])
+                    .unwrap(),
+                ),
+                annotated(
+                    StructField::nullable(
+                        "arr",
+                        ArrayType::new(
+                            StructType::try_new([StructField::nullable("x", DataType::INTEGER)])
+                                .unwrap(),
+                            true,
+                        ),
+                    ),
+                    ColumnMetadataKey::ColumnMappingNestedIds,
+                    MetadataValue::Other(serde_json::json!({ "arr.element": 99 })),
+                ),
+                annotated(
+                    StructField::nullable(
+                        "m",
+                        MapType::new(
+                            DataType::STRING,
+                            StructType::try_new([StructField::nullable("y", DataType::INTEGER)])
+                                .unwrap(),
+                            true,
+                        ),
+                    ),
+                    ColumnMetadataKey::ParquetFieldNestedIds,
+                    MetadataValue::Other(serde_json::json!({ "m.key": 98 })),
+                ),
+            ])
+            .unwrap(),
+        );
+        let read_config = snapshot.table_configuration();
+        let metadata = read_config
+            .metadata()
+            .clone()
+            .with_schema(leftover_schema.clone())
+            .unwrap();
+        let read_config =
+            TableConfiguration::try_new_with_schema(read_config, metadata, leftover_schema)
+                .unwrap();
+        let snapshot = with_table_config(&snapshot, read_config);
+
+        let prepared = prepare(
+            engine.as_ref(),
+            &snapshot,
+            properties_request(&[(COLUMN_MAPPING_MODE, "name")]),
+        )
+        .unwrap();
+
+        let schema = prepared.table_config.logical_schema();
+        let schema_type = DataType::from(schema.as_ref().clone());
+        let mut fields = Vec::new();
+        collect_struct_fields(&schema_type, &mut fields);
+        let names: Vec<_> = fields.iter().map(|field| field.name().as_str()).collect();
+        assert_eq!(names, ["id", "s", "a", "b", "c", "arr", "x", "m", "y"]);
+        let mut ids = Vec::new();
+        for field in &fields {
+            assert_eq!(field.physical_name(ColumnMappingMode::Name), field.name());
+            ids.push(field.column_mapping_id().unwrap());
+            for key in [
+                ColumnMetadataKey::ColumnMappingNestedIds,
+                ColumnMetadataKey::ParquetFieldNestedIds,
+            ] {
+                assert!(field.get_config_value(&key).is_none(), "{field:?}");
+            }
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, (1..=9).collect::<Vec<_>>());
+        assert_eq!(
+            prepared
+                .table_config
+                .table_properties()
+                .column_mapping_max_column_id,
+            Some(9)
         );
     }
 
