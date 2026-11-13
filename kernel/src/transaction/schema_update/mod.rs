@@ -517,6 +517,16 @@ impl<'a, F: FnMut(&'a StructField) -> KernelResult<()>> SchemaTransform<'a>
         (self.0)(field)?;
         self.recurse_into_struct_field(field)
     }
+
+    // The fields inside variant and file values are part of the type, not table columns: they
+    // carry no column-mapping identity and may be non-nullable.
+    fn transform_variant(&mut self, _: &'a StructType) -> KernelResult<()> {
+        Ok(())
+    }
+
+    fn transform_file(&mut self, _: &'a StructType) -> KernelResult<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

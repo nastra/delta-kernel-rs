@@ -663,6 +663,32 @@ async fn updated_schema_rejects_change_data_feed_reserved_names() -> delta_kerne
     Ok(())
 }
 
+#[rstest]
+#[tokio::test]
+async fn updated_schema_adds_variant_and_file_columns(
+    #[values(DataType::unshredded_variant(), DataType::file_type())] data_type: DataType,
+) -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create(
+        &table_path,
+        engine.as_ref(),
+        flat_schema(),
+        &[("delta.columnMapping.mode", "name")],
+        None,
+    )?;
+    // The non-nullable fields inside variant and file values are not table columns.
+    let added = StructField::nullable("added", data_type.clone());
+    update_schema(
+        &snapshot,
+        engine.as_ref(),
+        with_fields(appended(&snapshot.schema(), added)),
+    )?;
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(field(&reloaded.schema(), "added").data_type(), &data_type);
+    Ok(())
+}
+
 #[tokio::test]
 async fn updated_schema_changes_only_a_comment() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
