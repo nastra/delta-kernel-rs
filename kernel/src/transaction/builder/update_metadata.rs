@@ -30,10 +30,10 @@ use crate::table_features::{
 use crate::table_properties::{
     CHECKPOINT_INTERVAL, COLUMN_MAPPING_MAX_COLUMN_ID, DATA_SKIPPING_NUM_INDEXED_COLS,
     DELTA_PROPERTY_PREFIX, ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3,
-    ENABLE_IN_COMMIT_TIMESTAMPS, IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP,
-    IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
-    MATERIALIZED_ROW_ID_COLUMN_NAME, PARQUET_FORMAT_VERSION, SET_TRANSACTION_RETENTION_DURATION,
-    TableProperties,
+    ENABLE_ICEBERG_NATIVE_V4, ENABLE_IN_COMMIT_TIMESTAMPS,
+    IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP, IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
+    MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
+    PARQUET_FORMAT_VERSION, SET_TRANSACTION_RETENTION_DURATION, TableProperties,
 };
 use crate::transaction::schema_evolution::{SchemaOperation, evolve_metadata};
 use crate::transforms::{SchemaTransform, transform_output_type};
@@ -43,9 +43,13 @@ use crate::{Engine, KernelError, KernelResult};
 const UNIVERSAL_FORMAT_ENABLED_FORMATS: &str = "delta.universalFormat.enabledFormats";
 
 /// `delta.*` properties CREATE TABLE accepts but an update rejects, because Java's editable
-/// `TableConfig.VALID_PROPERTIES` does not contain them.
-const NOT_SETTABLE_ON_UPDATE: &[&str] =
-    &[SET_TRANSACTION_RETENTION_DURATION, PARQUET_FORMAT_VERSION];
+/// `TableConfig.VALID_PROPERTIES` does not contain them. `delta.enableIcebergNativeV4` exists
+/// only under the `adaptive-metadata-in-dev` feature.
+const NOT_SETTABLE_ON_UPDATE: &[&str] = &[
+    SET_TRANSACTION_RETENTION_DURATION,
+    PARQUET_FORMAT_VERSION,
+    ENABLE_ICEBERG_NATIVE_V4,
+];
 
 /// Operation name used in property validation errors.
 const UPDATE_TABLE: &str = "UPDATE TABLE";
@@ -1007,6 +1011,11 @@ mod tests {
         &[("delta.setTransactionRetentionDuration", "interval 2 weeks")],
         &[],
         "Setting delta property 'delta.setTransactionRetentionDuration'"
+    )]
+    #[case::iceberg_native_v4(
+        &[("delta.enableIcebergNativeV4", "true")],
+        &[],
+        "Setting delta property 'delta.enableIcebergNativeV4'"
     )]
     #[case::parquet_format_version(
         &[("DELTA.PARQUET.FORMAT.VERSION", "2.12.0")],
