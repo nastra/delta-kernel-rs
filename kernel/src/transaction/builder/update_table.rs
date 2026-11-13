@@ -223,13 +223,21 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// `delta.columnMapping.nested.ids` to the array elements and map keys and values of new
     /// fields, and the new schema must satisfy that version's type and type-change rules.
     ///
+    /// The `CURRENT_DEFAULT` of an existing field, including a nested one, may be set, changed, or
+    /// removed when the table supports `allowColumnDefaults` and has `delta.enableIcebergCompatV3`
+    /// enabled. Each default must be a literal of the field's type: a quoted string or binary, a
+    /// number that fits the type, an ISO date, an ISO timestamp with an offset, or an ISO
+    /// `timestamp_ntz` without one. Byte and non-primitive fields cannot have defaults. A schema
+    /// with defaults does not add the `allowColumnDefaults` feature, and a table with that feature
+    /// but without icebergCompatV3 rejects every schema update.
+    ///
     /// [`build`](Self::build) rejects the update if the table does not use column mapping, or if
     /// it tightens nullability, makes any other type change or alters `delta.typeChanges` or
     /// `delta.columnMapping.nested.ids`, moves a field to a different parent struct, drops or
     /// renames a partition column or a column listed in `delta.dataSkippingStatsColumns`, drops a
     /// clustering column, renames a collated field, adds a non-nullable field or a field with a
-    /// default value, or changes protocol-defined field metadata such as generation expressions,
-    /// invariants, or defaults. It cannot be combined with
+    /// default value, has a default the table does not allow, or changes other protocol-defined
+    /// field metadata such as generation expressions or invariants. It cannot be combined with
     /// [`add_column`](Self::add_column), [`add_column_at`](Self::add_column_at), or
     /// [`set_nullable`](Self::set_nullable) in the same transaction.
     pub fn with_updated_schema(mut self, schema: SchemaRef) -> Self {
@@ -274,9 +282,11 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// - Conflicting application ids or domain metadata, or reserved or unsupported domains.
     /// - Connector commit information that does not contain exactly one row.
     ///
-    /// Schema changes are rejected when `icebergCompatV2`, `icebergCompatV3`, or
-    /// `allowColumnDefaults` is enabled, or when the table has generated columns. This applies to
-    /// standalone ALTER TABLE transactions and schema evolution during data-changing writes.
+    /// Schema changes are rejected when the table has generated columns. Schema operations are
+    /// also rejected when `allowColumnDefaults` is enabled; see
+    /// [`with_updated_schema`](Self::with_updated_schema) for its rules on such tables. This
+    /// applies to standalone ALTER TABLE transactions and schema evolution during data-changing
+    /// writes.
     pub fn build(
         self,
         engine: &dyn Engine,
