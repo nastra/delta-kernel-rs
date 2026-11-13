@@ -112,8 +112,8 @@ commit. See [Check constraints](./check_constraints.md) for the acknowledgement.
 
 When the evolved schema needs a table feature that the protocol lacks, Kernel adds it and the
 commit includes a Protocol action. For example, adding a `TIMESTAMP_NTZ` column adds the
-`timestampNtz` feature. Kernel derives `timestampNtz`, `variantType`, and `collations` this way and
-keeps every feature the table already supports.
+`timestampNtz` feature. Kernel derives `timestampNtz`, `variantType`, `collations`, and
+`fileType-preview` this way and keeps every feature the table already supports.
 
 > [!NOTE]
 > Kernel rejects schema changes at `build()` when `icebergCompatV2`, `icebergCompatV3`, or
