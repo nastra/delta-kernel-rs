@@ -70,6 +70,14 @@ pub(crate) fn evolve_metadata_to_schema(
     let mut max_column_id =
         configured_max_column_id.max(find_max_column_id_in_schema(&current_schema).unwrap_or(0));
 
+    // Like Java's `SchemaUtils.validateSchema`: dropping every column would leave a table that can
+    // no longer be scanned, and re-added columns get fresh identities, so the data would be lost.
+    require!(
+        schema.fields().next().is_some(),
+        KernelError::schema(
+            "Cannot update the schema: the schema must contain at least one column"
+        )
+    );
     for field in schema.fields() {
         require!(
             !field.is_metadata_column(),

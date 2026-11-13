@@ -451,6 +451,7 @@ type SchemaEdit = fn(&StructType) -> Vec<StructField>;
     ],
     "Fields cannot move to a different parent"
 )]
+#[case::empty_schema(|_: &StructType| vec![], "must contain at least one column")]
 #[case::metadata_column(
     |s: &StructType| appended(s, StructField::create_metadata_column(
             "row_index",
