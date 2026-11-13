@@ -17,8 +17,8 @@ use uuid::Uuid;
 use super::TransactionBuilder;
 use super::metadata_derivation::{
     ValidatedTableProperties, maybe_auto_enable_property_driven_features, maybe_enable_collations,
-    maybe_enable_ict_for_catalog_managed, maybe_enable_timestamp_ntz,
-    maybe_enable_v2_checkpoint_for_policy, maybe_enable_variant_type,
+    maybe_enable_file_type_preview, maybe_enable_ict_for_catalog_managed,
+    maybe_enable_timestamp_ntz, maybe_enable_v2_checkpoint_for_policy, maybe_enable_variant_type,
     validate_extract_table_features_and_properties,
 };
 use super::state::TransactionBuilderState;
@@ -28,7 +28,6 @@ use crate::clustering::validate_clustering_columns;
 use crate::clustering::{create_clustering_domain_metadata, resolve_physical_clustering_columns};
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
-use crate::schema::file_utils::schema_contains_file_type;
 use crate::schema::validation::validate_schema;
 use crate::schema::{
     DataType, SchemaRef, StructType, normalize_column_names_to_schema_casing,
@@ -41,7 +40,7 @@ use crate::table_features::{
     find_max_column_id_in_schema, get_column_mapping_mode_from_properties,
     strip_stray_column_mapping_metadata, validate_iceberg_compat_if_needed,
 };
-#[cfg(feature = "adaptive-metadata-in-dev")]
+#[cfg(any(test, feature = "adaptive-metadata-in-dev"))]
 use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
 use crate::table_properties::{
     COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, ENABLE_CHANGE_DATA_FEED,
@@ -256,21 +255,6 @@ fn apply_data_layout(
                 partition_columns: Some(normalized),
             })
         }
-    }
-}
-
-/// Conditionally adds the `fileType-preview` feature to the protocol when the schema contains File
-/// columns anywhere in the schema tree (top-level, nested structs, arrays, maps).
-///
-/// The stable `fileType` feature is deliberately not written: the protocol change is still only
-/// proposed, and a stable feature name is permanent once it is in a table's protocol.
-fn maybe_enable_file_type_preview(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
-    if schema_contains_file_type(schema) {
-        add_feature_to_lists(
-            TableFeature::FileTypePreview,
-            &mut validated.reader_features,
-            &mut validated.writer_features,
-        );
     }
 }
 
