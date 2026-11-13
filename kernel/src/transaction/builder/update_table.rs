@@ -220,14 +220,19 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// the new type.
     ///
     /// [`build`](Self::build) rejects the update if the table does not use column mapping, or if
-    /// it tightens nullability, makes any other type change or alters `delta.typeChanges`, moves
-    /// a field to a different parent struct, drops or renames a partition column or a column
-    /// listed in
+    /// the schema has no columns, tightens nullability, makes any other type change or alters
+    /// `delta.typeChanges`, moves a field to a different parent struct, drops or renames a
+    /// partition column or a column listed in
     /// `delta.dataSkippingStatsColumns`, drops a clustering column, renames a collated field, adds
     /// a non-nullable field or a field with a default value, or changes protocol-defined field
     /// metadata such as generation expressions, invariants, or defaults. It cannot be combined with
     /// [`add_column`](Self::add_column), [`add_column_at`](Self::add_column_at), or
     /// [`set_nullable`](Self::set_nullable) in the same transaction.
+    ///
+    /// Unlike Delta Kernel Java, `build()` also rejects any schema update on a table with
+    /// `icebergCompatV2` or `icebergCompatV3` enabled, with `allowColumnDefaults` enabled, or with
+    /// generated columns. Kernel cannot yet maintain the nested Iceberg field IDs, default values,
+    /// or generation expressions of those tables when their schema changes.
     pub fn with_updated_schema(mut self, schema: SchemaRef) -> Self {
         self.local_state.updated_schema = Some(schema);
         self
@@ -1308,6 +1313,7 @@ mod tests {
         let schema = snapshot.schema();
         let without_name = StructType::try_new([schema.field("id").unwrap().clone()])?;
         let error = snapshot
+            .clone()
             .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
             .with_updated_schema(Arc::new(without_name))
             .build(&engine, Box::new(FileSystemCommitter::new()))
@@ -1318,6 +1324,72 @@ mod tests {
                 .contains("Cannot drop clustering column 'name'"),
             "{error}"
         );
+        let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
+        assert_eq!(reloaded.version(), snapshot.version());
+        Ok(())
+    }
+
+    #[rstest]
+    fn updated_schema_handles_a_nested_clustering_column(
+        #[values(false, true)] drop: bool,
+    ) -> Result<()> {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let address = StructType::try_new([
+            StructField::nullable("city", DataType::STRING),
+            StructField::nullable("zip", DataType::STRING),
+        ])?;
+        let schema = Arc::new(StructType::try_new([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("address", address),
+        ])?);
+        let snapshot = create_table("memory:///", schema, "test", true)
+            .with_table_properties([(COLUMN_MAPPING_MODE, "name")])
+            .with_data_layout(DataLayout::Clustered {
+                columns: vec![column_name!("address.city")],
+            })
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
+            .unwrap_post_commit_snapshot();
+        let schema = snapshot.schema();
+        let DataType::Struct(address) = schema.field("address").unwrap().data_type() else {
+            panic!("address is a struct");
+        };
+        let city = address.field("city").unwrap();
+        let zip = address.field("zip").unwrap().clone();
+        let address_fields = if drop {
+            vec![zip]
+        } else {
+            vec![city.with_name("town"), zip]
+        };
+        let mut new_address = schema.field("address").unwrap().clone();
+        new_address.data_type = StructType::try_new(address_fields)?.into();
+        let updated = StructType::try_new([schema.field("id").unwrap().clone(), new_address])?;
+
+        let result = snapshot
+            .clone()
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_updated_schema(Arc::new(updated))
+            .build(&engine, Box::new(FileSystemCommitter::new()));
+        if drop {
+            let error = result.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Cannot drop clustering column 'address.city'"),
+                "{error}"
+            );
+            let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
+            assert_eq!(reloaded.version(), snapshot.version());
+            return Ok(());
+        }
+        let committed = result?.commit(&engine)?.unwrap_post_commit_snapshot();
+        let reader = committed.reader();
+        assert_eq!(
+            reader.get_physical_clustering_columns(&engine)?,
+            snapshot.reader().get_physical_clustering_columns(&engine)?
+        );
+        let infos = reader.get_clustering_column_infos(&engine)?.unwrap();
+        assert_eq!(infos[0].logical_column, column_name!("address.town"));
         Ok(())
     }
 
@@ -1718,6 +1790,34 @@ mod tests {
             ColumnMappingMode::Name
         );
         assert_eq!(read_columns(&reloaded, &engine)?, columns);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::iceberg_compat_v2(TableFeature::IcebergCompatV2, "icebergCompatV2 enabled")]
+    #[case::iceberg_compat_v3(TableFeature::IcebergCompatV3, "icebergCompatV3 enabled")]
+    #[case::column_defaults(TableFeature::AllowColumnDefaults, "allowColumnDefaults enabled")]
+    fn updated_schema_is_rejected_on_tables_kernel_cannot_evolve_yet(
+        #[case] feature: TableFeature,
+        #[case] expected: &str,
+    ) -> Result<()> {
+        let (engine, snapshot, _tempdir) = create_schema_validation_table(Some(&feature), true);
+        let error = snapshot
+            .clone()
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_updated_schema(snapshot.schema())
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(matches!(error, KernelError::Unsupported(_)), "{error}");
+        assert!(
+            error.to_string().contains(&format!(
+                "Schema changes are not yet supported on tables with {expected}"
+            )),
+            "{error}"
+        );
+
+        let reloaded = Snapshot::builder_for(snapshot.table_root()).build(engine.as_ref())?;
+        assert_eq!(reloaded.version(), snapshot.version());
         Ok(())
     }
 

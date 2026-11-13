@@ -452,6 +452,7 @@ type SchemaEdit = fn(&StructType) -> Vec<StructField>;
     ],
     "Fields cannot move to a different parent"
 )]
+#[case::empty_schema(|_: &StructType| vec![], "must contain at least one column")]
 #[case::metadata_column(
     |s: &StructType| appended(s, StructField::create_metadata_column(
             "row_index",
@@ -556,6 +557,14 @@ async fn updated_schema_requires_column_mapping(
     field(s, "tags"),
     field(s, "part").with_name("PART"),
 ])]
+// Dropping the partition column and adding a new one with the same name: the new column gets a
+// new physical name, so the existing partition values would be orphaned. Java accepts this.
+#[case::drop_and_readd_with_the_same_name(|s: &StructType| vec![
+    field(s, "id"),
+    field(s, "address"),
+    field(s, "tags"),
+    StructField::nullable("part", field(s, "part").data_type().clone()),
+])]
 #[tokio::test]
 async fn updated_schema_rejects_dropping_or_renaming_partition_columns(
     #[case] edit: SchemaEdit,
@@ -575,6 +584,85 @@ async fn updated_schema_rejects_dropping_or_renaming_partition_columns(
         updated,
         "Cannot drop or rename partition column 'part'",
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn updated_schema_changes_only_a_comment() -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create(
+        &table_path,
+        engine.as_ref(),
+        flat_schema(),
+        &[("delta.columnMapping.mode", "name")],
+        None,
+    )?;
+    let schema = snapshot.schema();
+    let commented = field(&schema, "name").add_metadata([("comment", "the customer name")]);
+    let updated = with_fields([field(&schema, "id"), commented, field(&schema, "zip")]);
+
+    let committed = update_schema(&snapshot, engine.as_ref(), updated)?;
+
+    assert_eq!(committed.version(), snapshot.version() + 1);
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let name = field(&reloaded.schema(), "name");
+    assert_eq!(
+        name.metadata().get("comment"),
+        Some(&MetadataValue::String("the customer name".to_string()))
+    );
+    assert_eq!(physical_name(&name), physical_name(&field(&schema, "name")));
+    assert_eq!(field(&reloaded.schema(), "id"), field(&schema, "id"));
+    assert_eq!(field(&reloaded.schema(), "zip"), field(&schema, "zip"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn updated_schema_renames_and_reorders_fields_in_a_map_value_struct()
+-> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let value = StructType::try_new([
+        StructField::nullable("a", DataType::INTEGER),
+        StructField::nullable("b", DataType::STRING),
+    ])?;
+    let schema = Arc::new(StructType::try_new([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("m", MapType::new(DataType::STRING, value, true)),
+    ])?);
+    let snapshot = create(
+        &table_path,
+        engine.as_ref(),
+        schema,
+        &[("delta.columnMapping.mode", "name")],
+        None,
+    )?;
+    let map_value_fields = |schema: &StructType| -> Vec<StructField> {
+        let DataType::Map(map) = field(schema, "m").data_type().clone() else {
+            panic!("m is a map");
+        };
+        let DataType::Struct(value) = map.value_type().clone() else {
+            panic!("the map value is a struct");
+        };
+        value.fields().cloned().collect()
+    };
+    let current = map_value_fields(&snapshot.schema());
+    // Rename `a` to `alpha` and move it after `b`.
+    let renamed_value = StructType::try_new([current[1].clone(), current[0].with_name("alpha")])?;
+    let mut m = field(&snapshot.schema(), "m");
+    m.data_type = MapType::new(DataType::STRING, renamed_value, true).into();
+    let updated = with_fields([field(&snapshot.schema(), "id"), m]);
+
+    update_schema(&snapshot, engine.as_ref(), updated)?;
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let fields = map_value_fields(&reloaded.schema());
+    let names: Vec<_> = fields.iter().map(|field| field.name().as_str()).collect();
+    assert_eq!(names, ["b", "alpha"]);
+    assert_eq!(fields[0], current[1]);
+    assert_eq!(
+        fields[1].column_mapping_id(),
+        current[0].column_mapping_id()
+    );
+    assert_eq!(physical_name(&fields[1]), physical_name(&current[0]));
     Ok(())
 }
 
