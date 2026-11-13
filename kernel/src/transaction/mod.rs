@@ -1093,7 +1093,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
                 if !self.should_emit_metadata =>
             {
                 Err(KernelError::invalid_transaction_state(
-                    "ALTER TABLE requires at least one schema change",
+                    "ALTER TABLE requires at least one metadata change",
                 ))
             }
             (false, CommitOperation::UpdateTable(UpdateTableOperation::AlterTable))
@@ -2947,7 +2947,7 @@ mod tests {
     #[case::alter_without_schema_changes(
         false,
         CommitOperation::UpdateTable(UpdateTableOperation::AlterTable),
-        "ALTER TABLE requires at least one schema change"
+        "ALTER TABLE requires at least one metadata change"
     )]
     #[case::empty_custom_operation(
         false,

@@ -252,7 +252,7 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
                 && self.local_state.property_keys_removed.is_empty()
             {
                 return Err(KernelError::invalid_transaction_state(
-                    "ALTER TABLE requires at least one schema change",
+                    "ALTER TABLE requires at least one metadata change",
                 ));
             }
             if self.local_state.is_blind_append {
@@ -332,8 +332,7 @@ fn try_new_update_table<MODE: ExecutionMode>(
     // formulas.
 
     // TODO(#3240): Validate that delta.enableRowTracking=true has the required protocol support
-    // and materialized column-name properties. Materialized names must be distinct and must not
-    // collide with physical data columns.
+    // and that the materialized column names are distinct.
 
     // Read clustering columns from snapshot (returns None if clustering not enabled)
     let clustering_columns = read_snapshot
@@ -670,7 +669,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("requires at least one schema change")
+                .contains("requires at least one metadata change")
         );
         Ok(())
     }
@@ -777,7 +776,7 @@ mod tests {
             let error = result.unwrap_err();
             assert!(
                 matches!(&error, KernelError::InvalidTransactionState(message)
-                if message == "ALTER TABLE requires at least one schema change")
+                if message == "ALTER TABLE requires at least one metadata change")
             );
         } else {
             let transaction = result.expect("non-ALTER transactions do not require schema changes");
