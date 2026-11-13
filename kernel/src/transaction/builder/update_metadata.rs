@@ -10,10 +10,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::metadata_derivation::{
-    ALLOWED_DELTA_PROPERTIES, ValidatedTableProperties, maybe_auto_enable_property_driven_features,
-    maybe_enable_collations, maybe_enable_file_type_preview, maybe_enable_ict_for_catalog_managed,
+    UPDATE_ONLY_FEATURE_SIGNALS, ValidatedTableProperties,
+    maybe_auto_enable_property_driven_features, maybe_enable_collations,
+    maybe_enable_file_type_preview, maybe_enable_ict_for_catalog_managed,
     maybe_enable_timestamp_ntz, maybe_enable_v2_checkpoint_for_policy, maybe_enable_variant_type,
-    validate_extract_features_and_properties_for,
+    validate_and_normalize_delta_properties, validate_extract_features_and_properties_for,
 };
 use crate::actions::{Metadata, Protocol};
 use crate::schema::{ColumnMetadataKey, MetadataValue, SchemaRef, StructField, StructType};
@@ -21,17 +22,21 @@ use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     ColumnMappingMode, IcebergCompatValidationContext, LEGACY_WRITER_FEATURES,
+    SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
     TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature,
-    V2_VALIDATOR, V3_VALIDATOR, assign_column_mapping_metadata, assign_nested_cm_ids,
-    drop_column_mapping_metadata, ensure_domain_metadata_dependency,
+    V2_VALIDATOR, V3_VALIDATOR, add_feature_to_lists, assign_column_mapping_metadata,
+    assign_nested_cm_ids, drop_column_mapping_metadata, ensure_domain_metadata_dependency,
     extract_enabled_reader_features, find_max_column_id_in_schema,
     get_column_mapping_mode_from_properties, validate_iceberg_compat_if_needed,
 };
 use crate::table_properties::{
-    COLUMN_MAPPING_MAX_COLUMN_ID, DELTA_PROPERTY_PREFIX, ENABLE_ICEBERG_COMPAT_V2,
-    ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
+    CHECKPOINT_INTERVAL, COLUMN_MAPPING_MAX_COLUMN_ID, DATA_SKIPPING_NUM_INDEXED_COLS,
+    DELETED_FILE_RETENTION_DURATION, DELTA_PROPERTY_PREFIX, ENABLE_ICEBERG_COMPAT_V2,
+    ENABLE_ICEBERG_COMPAT_V3, ENABLE_ICEBERG_NATIVE_V4, ENABLE_IN_COMMIT_TIMESTAMPS,
     IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP, IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
-    MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME, TableProperties,
+    LOG_RETENTION_DURATION, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
+    MATERIALIZED_ROW_ID_COLUMN_NAME, PARQUET_FORMAT_VERSION, SET_TRANSACTION_RETENTION_DURATION,
+    TableProperties,
 };
 use crate::transaction::schema_evolution::{SchemaOperation, evolve_metadata};
 use crate::transforms::{SchemaTransform, transform_output_type};
@@ -39,6 +44,15 @@ use crate::{Engine, KernelError, KernelResult};
 
 /// Universal formats (UniForm) the table is converted to, as a comma-separated list.
 const UNIVERSAL_FORMAT_ENABLED_FORMATS: &str = "delta.universalFormat.enabledFormats";
+
+/// `delta.*` properties CREATE TABLE accepts but an update rejects, because Java's editable
+/// `TableConfig.VALID_PROPERTIES` does not contain them. `delta.enableIcebergNativeV4` exists
+/// only under the `adaptive-metadata-in-dev` feature.
+const NOT_SETTABLE_ON_UPDATE: &[&str] = &[
+    SET_TRANSACTION_RETENTION_DURATION,
+    PARQUET_FORMAT_VERSION,
+    ENABLE_ICEBERG_NATIVE_V4,
+];
 
 /// Operation name used in property validation errors.
 const UPDATE_TABLE: &str = "UPDATE TABLE";
@@ -106,8 +120,18 @@ pub(super) fn prepare_update_table_metadata(
         properties_added,
         property_keys_removed,
     } = request;
+    let properties_added = validate_and_normalize_delta_properties(properties_added, UPDATE_TABLE)?;
+    if let Some(key) = properties_added
+        .keys()
+        .find(|key| NOT_SETTABLE_ON_UPDATE.contains(&key.as_str()))
+    {
+        return Err(KernelError::generic(format!(
+            "Setting delta property '{key}' is not supported during {UPDATE_TABLE}"
+        )));
+    }
+    validate_java_int_ranges(&properties_added)?;
+    validate_retention_intervals(&properties_added)?;
     validate_property_removals(&properties_added, &property_keys_removed)?;
-    validate_property_value_case(&properties_added)?;
 
     // Schema changes preserve the column-mapping identities of surviving fields and assign new
     // identities (and `maxColumnId`) to added fields. The evolved schema is validated against the
@@ -119,8 +143,25 @@ pub(super) fn prepare_update_table_metadata(
     };
 
     // Kernel-managed keys are rejected by the property allow-list.
+    let (update_only_features, shared_properties) =
+        split_update_only_feature_signals(properties_added.clone())?;
     let mut requested =
-        validate_extract_features_and_properties_for(properties_added.clone(), UPDATE_TABLE)?;
+        validate_extract_features_and_properties_for(shared_properties, UPDATE_TABLE)?;
+    for feature in update_only_features {
+        // Like Java, variantShredding-preview requires the stable variantType feature.
+        if feature == TableFeature::VariantShreddingPreview {
+            add_feature_to_lists(
+                TableFeature::VariantType,
+                &mut requested.reader_features,
+                &mut requested.writer_features,
+            );
+        }
+        add_feature_to_lists(
+            feature,
+            &mut requested.reader_features,
+            &mut requested.writer_features,
+        );
+    }
     let mut configuration = evolved_metadata.configuration().clone();
     configuration.extend(requested.properties.drain());
     configuration.retain(|key, _| !property_keys_removed.contains(key));
@@ -311,6 +352,98 @@ fn apply_schema_changes(
     evolve_metadata(table_config, changes)
 }
 
+/// Splits the feature signals in [`UPDATE_ONLY_FEATURE_SIGNALS`] from `properties`, which keeps the
+/// rest for the validation shared with CREATE TABLE.
+fn split_update_only_feature_signals(
+    mut properties: HashMap<String, String>,
+) -> KernelResult<(Vec<TableFeature>, HashMap<String, String>)> {
+    let mut features = Vec::new();
+    for feature in UPDATE_ONLY_FEATURE_SIGNALS {
+        let key = format!("{SET_TABLE_FEATURE_SUPPORTED_PREFIX}{feature}");
+        if let Some(value) = properties.remove(&key) {
+            if value != SET_TABLE_FEATURE_SUPPORTED_VALUE {
+                return Err(KernelError::generic(format!(
+                    "Invalid value '{value}' for '{key}'. Only \
+                     '{SET_TABLE_FEATURE_SUPPORTED_VALUE}' is allowed."
+                )));
+            }
+            features.push(feature.clone());
+        }
+    }
+    Ok((features, properties))
+}
+
+/// Rejects integer properties outside the range Java accepts. Java parses them with
+/// `Integer.valueOf` both when it validates them and when it reads the table configuration, so a
+/// larger value would break Java and Spark writers.
+fn validate_java_int_ranges(properties_added: &HashMap<String, String>) -> KernelResult<()> {
+    for (key, min) in [
+        (CHECKPOINT_INTERVAL, 1),
+        (DATA_SKIPPING_NUM_INDEXED_COLS, -1),
+    ] {
+        let Some(value) = properties_added.get(key) else {
+            continue;
+        };
+        let in_range = value
+            .parse::<i64>()
+            .is_ok_and(|number| (min..=i64::from(i32::MAX)).contains(&number));
+        if !in_range {
+            return Err(KernelError::generic(format!(
+                "Invalid value '{value}' for table property '{key}': must be between {min} and {}",
+                i32::MAX
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Rejects retention intervals that Kernel and Delta Kernel Java would read differently, or that
+/// Java rejects.
+///
+/// Kernel's interval parser reads only the first unit, so `interval 1 day 12 hours` would read as
+/// a shorter retention than Java and Spark read. Java's `IntervalParserUtils` has no nanosecond
+/// unit, keeps the day count (weeks included) in an `int`, and the other units in a `long` count
+/// of microseconds, so larger values fail there.
+fn validate_retention_intervals(properties_added: &HashMap<String, String>) -> KernelResult<()> {
+    const MICROS_PER_SECOND: i64 = 1_000_000;
+    const MICROS_PER_DAY: i64 = 86_400 * MICROS_PER_SECOND;
+    for key in [LOG_RETENTION_DURATION, DELETED_FILE_RETENTION_DURATION] {
+        let Some(value) = properties_added.get(key) else {
+            continue;
+        };
+        let invalid = |reason: &str| {
+            Err(KernelError::generic(format!(
+                "Invalid value '{value}' for table property '{key}': {reason}"
+            )))
+        };
+        let [_, count, unit] = value.split_whitespace().collect::<Vec<_>>()[..] else {
+            return invalid("use one unit, such as 'interval 2 weeks'");
+        };
+        // The snapshot parser has already accepted the prefix and a non-negative count.
+        let Ok(count) = count.parse::<i64>() else {
+            return invalid("the count must be an integer");
+        };
+        let days = |days: Option<i64>| {
+            days.and_then(|days| i32::try_from(days).ok())
+                .and_then(|days| i64::from(days).checked_mul(MICROS_PER_DAY))
+        };
+        let micros = match unit.strip_suffix('s').unwrap_or(unit) {
+            "week" => days(count.checked_mul(7)),
+            "day" => days(Some(count)),
+            "hour" => count.checked_mul(3_600 * MICROS_PER_SECOND),
+            "minute" => count.checked_mul(60 * MICROS_PER_SECOND),
+            "second" => count.checked_mul(MICROS_PER_SECOND),
+            "millisecond" => count.checked_mul(1_000),
+            "microsecond" => Some(count),
+            _ => return invalid("Delta Kernel Java does not support this unit"),
+        };
+        if micros.is_none() {
+            return invalid("the duration is out of the range Delta Kernel Java supports");
+        }
+    }
+    Ok(())
+}
+
 fn validate_property_removals(
     properties_added: &HashMap<String, String>,
     property_keys_removed: &HashSet<String>,
@@ -336,29 +469,6 @@ fn validate_property_removals(
         return Err(KernelError::generic(format!(
             "Unsetting table property '{key}' is not supported during {UPDATE_TABLE}"
         )));
-    }
-    Ok(())
-}
-
-/// Rejects a value of a recognized `delta.*` property that Kernel parses only in another letter
-/// case, such as `TRUE`. Kernel would read such a value as unset, so the transition checks would
-/// not see it, while Java and Spark read it as set.
-fn validate_property_value_case(properties_added: &HashMap<String, String>) -> KernelResult<()> {
-    let parses = |key: &str, value: &str| {
-        !TableProperties::from([(key, value)])
-            .unknown_properties
-            .contains_key(key)
-    };
-    for (key, value) in properties_added {
-        if ALLOWED_DELTA_PROPERTIES.contains(&key.as_str())
-            && !parses(key, value)
-            && parses(key, &value.to_ascii_lowercase())
-        {
-            return Err(KernelError::generic(format!(
-                "Invalid value '{value}' for table property '{key}': use '{}'",
-                value.to_ascii_lowercase()
-            )));
-        }
     }
     Ok(())
 }
@@ -523,6 +633,14 @@ fn assign_column_mapping_to_existing_fields(
             );
             Cow::Owned(field)
         }
+        // Like CREATE TABLE, column mapping does not reach the fields inside variant and file
+        // values.
+        fn transform_variant(&mut self, stype: &'a StructType) -> Cow<'a, StructType> {
+            Cow::Borrowed(stype)
+        }
+        fn transform_file(&mut self, stype: &'a StructType) -> Cow<'a, StructType> {
+            Cow::Borrowed(stype)
+        }
     }
     let schema = drop_column_mapping_metadata(schema);
     let schema = FieldNameAsPhysicalName
@@ -601,7 +719,6 @@ mod tests {
     use crate::schema::{ArrayType, DataType, MapType};
     use crate::snapshot::SnapshotRef;
     use crate::table_configuration::InCommitTimestampEnablement;
-    use crate::table_features::SET_TABLE_FEATURE_SUPPORTED_PREFIX;
     use crate::table_properties::{CHECKPOINT_POLICY, COLUMN_MAPPING_MODE, ENABLE_ROW_TRACKING};
     use crate::transaction::create_table::create_table;
     use crate::unit_test_utils::{load_test_table, test_schema_flat};
@@ -978,6 +1095,26 @@ mod tests {
     )]
     #[case::unset_delta_key_in_other_case(&[], &["DELTA.appendOnly"], "Unsetting table property")]
     #[case::set_and_unset(&[("app.key", "value")], &["app.key"], "both set and unset")]
+    #[case::set_transaction_retention(
+        &[("delta.setTransactionRetentionDuration", "interval 2 weeks")],
+        &[],
+        "Setting delta property 'delta.setTransactionRetentionDuration'"
+    )]
+    #[case::iceberg_native_v4(
+        &[("delta.enableIcebergNativeV4", "true")],
+        &[],
+        "Setting delta property 'delta.enableIcebergNativeV4'"
+    )]
+    #[case::parquet_format_version(
+        &[("DELTA.PARQUET.FORMAT.VERSION", "2.12.0")],
+        &[],
+        "Setting delta property 'delta.parquet.format.version'"
+    )]
+    #[case::set_and_unset_after_canonicalization(
+        &[("DELTA.APPENDONLY", "true")],
+        &["delta.appendOnly"],
+        "both set and unset"
+    )]
     #[case::uppercase_row_tracking(
         &[(ENABLE_ROW_TRACKING, "TRUE")],
         &[],
@@ -1251,6 +1388,203 @@ mod tests {
                 .to_string()
                 .contains("must be set to \"true\" to enable the iceberg universal format"),
             "{error}"
+        );
+    }
+
+    #[rstest]
+    #[case::timestamp_ntz(TableFeature::TimestampWithoutTimezone, &[])]
+    #[case::type_widening_preview(TableFeature::TypeWideningPreview, &[])]
+    #[case::variant_type_preview(TableFeature::VariantTypePreview, &[])]
+    #[case::variant_shredding_preview(
+        TableFeature::VariantShreddingPreview,
+        &[TableFeature::VariantType]
+    )]
+    #[case::collations_preview(TableFeature::CollationsPreview, &[])]
+    #[case::allow_column_defaults(TableFeature::AllowColumnDefaults, &[])]
+    fn update_only_feature_signals_add_the_feature(
+        #[case] feature: TableFeature,
+        #[case] dependencies: &[TableFeature],
+    ) {
+        let (engine, snapshot) = create_test_table(&[]);
+        // Any case of the feature name is accepted.
+        let key = format!("delta.feature.{}", feature.to_string().to_ascii_uppercase());
+        let prepared = prepare(
+            engine.as_ref(),
+            &snapshot,
+            properties_request(&[(&key, "supported")]),
+        )
+        .unwrap();
+        assert!(prepared.should_emit_protocol);
+        for feature in std::iter::once(&feature).chain(dependencies) {
+            assert!(
+                prepared.table_config.is_feature_supported(feature),
+                "{feature} is missing"
+            );
+        }
+        assert!(
+            !prepared
+                .table_config
+                .metadata()
+                .configuration()
+                .keys()
+                .any(|key| key.starts_with(SET_TABLE_FEATURE_SUPPORTED_PREFIX))
+        );
+    }
+
+    #[test]
+    fn checkpoint_protection_signal_requires_kernel_write_support() {
+        let (engine, snapshot) = create_test_table(&[]);
+        let result = prepare(
+            engine.as_ref(),
+            &snapshot,
+            properties_request(&[("delta.feature.checkpointProtection", "supported")]),
+        );
+        if cfg!(feature = "checkpoint-protection") {
+            let config = result.unwrap().table_config;
+            assert!(config.is_feature_supported(&TableFeature::CheckpointProtection));
+        } else {
+            let error = result.unwrap_err();
+            assert!(
+                error.to_string().contains("checkpointProtection"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_only_feature_signal_rejects_values_other_than_supported() {
+        let (engine, snapshot) = create_test_table(&[]);
+        let error = prepare(
+            engine.as_ref(),
+            &snapshot,
+            properties_request(&[("delta.feature.timestampNtz", "enabled")]),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("Only 'supported' is allowed"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn allow_column_defaults_is_never_derived() {
+        let (engine, snapshot) = create_test_table(&[]);
+        let mut request = properties_request(&[("delta.enableChangeDataFeed", "true")]);
+        request.schema_changes = Some(vec![SchemaOperation::add_column(
+            None,
+            StructField::nullable("added", DataType::STRING),
+        )]);
+        let config = prepare(engine.as_ref(), &snapshot, request)
+            .unwrap()
+            .table_config;
+        assert!(!config.is_feature_supported(&TableFeature::AllowColumnDefaults));
+    }
+
+    // Writer version 5 implies checkConstraints, which Kernel writes only with this feature.
+    #[cfg(feature = "check-constraints-in-dev")]
+    #[test]
+    fn legacy_column_mapping_protocol_upgrade_retains_implied_features() {
+        let (engine, snapshot) = create_test_table(&[(COLUMN_MAPPING_MODE, "name")]);
+        // A (2, 5) protocol implies columnMapping without listing table features.
+        let read_config = snapshot.table_configuration();
+        let legacy = TableConfiguration::try_new(
+            read_config.metadata().clone(),
+            Protocol::try_new(2, 5, None::<Vec<String>>, None::<Vec<String>>).unwrap(),
+            read_config.table_root().clone(),
+            read_config.version(),
+        )
+        .unwrap();
+        assert!(legacy.is_feature_supported(&TableFeature::ColumnMapping));
+        let snapshot = with_table_config(&snapshot, legacy);
+
+        let prepared = prepare(
+            engine.as_ref(),
+            &snapshot,
+            add_column_request(StructField::nullable("ts", DataType::TIMESTAMP_NTZ)),
+        )
+        .unwrap();
+
+        assert!(prepared.should_emit_protocol);
+        let config = &prepared.table_config;
+        assert_eq!(config.column_mapping_mode(), ColumnMappingMode::Name);
+        for feature in [
+            TableFeature::ColumnMapping,
+            TableFeature::AppendOnly,
+            TableFeature::Invariants,
+            TableFeature::CheckConstraints,
+            TableFeature::ChangeDataFeed,
+            TableFeature::GeneratedColumns,
+            TableFeature::TimestampWithoutTimezone,
+        ] {
+            assert!(
+                config.is_feature_supported(&feature),
+                "{feature} was dropped"
+            );
+        }
+        let protocol = config.protocol();
+        assert!(
+            protocol
+                .reader_features()
+                .is_some_and(|features| features.contains(&TableFeature::ColumnMapping))
+        );
+    }
+
+    #[test]
+    fn enabling_iceberg_compat_v2_without_column_mapping_is_rejected() {
+        let (engine, snapshot) = create_test_table(&[]);
+        let error = prepare(
+            engine.as_ref(),
+            &snapshot,
+            properties_request(&[(ENABLE_ICEBERG_COMPAT_V2, "true")]),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("columnMapping"), "{error}");
+    }
+
+    #[rstest]
+    fn retention_intervals_java_supports_are_accepted(
+        #[values(LOG_RETENTION_DURATION, DELETED_FILE_RETENTION_DURATION)] key: &str,
+        #[values(
+            "interval 2 weeks",
+            "interval 1 week",
+            "interval 30 days",
+            "interval 168 hours",
+            "interval 90 minutes",
+            "interval 45 seconds",
+            "interval 500 milliseconds",
+            "interval 1 microsecond",
+            "interval 106751991 days"
+        )]
+        value: &str,
+    ) {
+        let (engine, snapshot) = create_test_table(&[]);
+        let prepared = prepare(
+            engine.as_ref(),
+            &snapshot,
+            properties_request(&[(key, value)]),
+        )
+        .unwrap();
+        assert_eq!(
+            configuration_value(&prepared.table_config, key),
+            Some(value)
+        );
+    }
+
+    #[rstest]
+    #[case::checkpoint_interval_max(CHECKPOINT_INTERVAL, "2147483647")]
+    #[case::num_indexed_cols_all(DATA_SKIPPING_NUM_INDEXED_COLS, "-1")]
+    #[case::num_indexed_cols_max(DATA_SKIPPING_NUM_INDEXED_COLS, "2147483647")]
+    fn java_int_range_bounds_are_accepted(#[case] key: &str, #[case] value: &str) {
+        let (engine, snapshot) = create_test_table(&[]);
+        let prepared = prepare(
+            engine.as_ref(),
+            &snapshot,
+            properties_request(&[(key, value)]),
+        )
+        .unwrap();
+        assert_eq!(
+            configuration_value(&prepared.table_config, key),
+            Some(value)
         );
     }
 

@@ -80,6 +80,21 @@ pub(super) const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     TableFeature::IcebergNativeV4Preview,
 ];
 
+/// Features an update, but not CREATE TABLE, may add through `delta.feature.<name>=supported`.
+/// Delta Kernel Java accepts these signals on update. A feature that Kernel cannot write, such as
+/// `checkpointProtection` without the `checkpoint-protection` feature, is still rejected when the
+/// final configuration is validated, as in Java's `validateKernelCanWriteToTable`.
+pub(super) const UPDATE_ONLY_FEATURE_SIGNALS: &[TableFeature] = &[
+    TableFeature::TimestampWithoutTimezone,
+    TableFeature::CheckpointProtection,
+    // Only the explicit signal adds it: an update never derives allowColumnDefaults.
+    TableFeature::AllowColumnDefaults,
+    TableFeature::TypeWideningPreview,
+    TableFeature::VariantTypePreview,
+    TableFeature::VariantShreddingPreview,
+    TableFeature::CollationsPreview,
+];
+
 /// The single allow-list of `delta.*` properties a transaction may set. Any other `delta.*` key
 /// is rejected.
 pub(super) const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
@@ -366,4 +381,64 @@ pub(super) fn validate_extract_features_and_properties_for(
         reader_features,
         writer_features,
     })
+}
+
+/// Canonicalizes the key case of recognized `delta.*` properties and rejects malformed values.
+///
+/// Recognized keys are those in [`ALLOWED_DELTA_PROPERTIES`], matched case-insensitively. A value
+/// is malformed when it does not parse as the property's type. Feature signals
+/// (`delta.feature.<name>`) are matched case-insensitively in both the prefix and the name of an
+/// allowed feature. Other unrecognized keys with the exact `delta.` prefix pass through unchanged
+/// for [`validate_extract_features_and_properties_for`] to validate. Unrecognized keys whose prefix
+/// is a case variant of `delta.` are rejected. Application properties keep their original case.
+pub(super) fn validate_and_normalize_delta_properties(
+    properties: HashMap<String, String>,
+    operation: &str,
+) -> KernelResult<HashMap<String, String>> {
+    let mut normalized = HashMap::with_capacity(properties.len());
+    for (key, value) in properties {
+        let lowercase_key = key.to_ascii_lowercase();
+        let canonical_key = if !lowercase_key.starts_with(DELTA_PROPERTY_PREFIX) {
+            key
+        } else if lowercase_key.starts_with(SET_TABLE_FEATURE_SUPPORTED_PREFIX) {
+            // Like Java's case-insensitive `TableFeatures.getTableFeature`, match the feature name
+            // in any case. Unknown names are kept for the feature-signal validation to reject.
+            let name = &key[SET_TABLE_FEATURE_SUPPORTED_PREFIX.len()..];
+            let canonical_name = ALLOWED_DELTA_FEATURES
+                .iter()
+                .chain(UPDATE_ONLY_FEATURE_SIGNALS)
+                .map(ToString::to_string)
+                .find(|feature| feature.eq_ignore_ascii_case(name))
+                .unwrap_or_else(|| name.to_string());
+            format!("{SET_TABLE_FEATURE_SUPPORTED_PREFIX}{canonical_name}")
+        } else if let Some(canonical) = ALLOWED_DELTA_PROPERTIES
+            .iter()
+            .find(|allowed| allowed.eq_ignore_ascii_case(&key))
+        {
+            // A recognized key must parse to a typed value; malformed values fall through to
+            // `unknown_properties`, or leave every field unset for leniently parsed enums.
+            let parsed = TableProperties::from([(*canonical, value.as_str())]);
+            if parsed.unknown_properties.contains_key(*canonical)
+                || parsed == TableProperties::default()
+            {
+                return Err(KernelError::generic(format!(
+                    "Invalid value '{value}' for table property '{canonical}'"
+                )));
+            }
+            canonical.to_string()
+        } else if key.starts_with(DELTA_PROPERTY_PREFIX) {
+            key
+        } else {
+            return Err(KernelError::generic(format!(
+                "Setting delta property '{key}' is not supported during {operation}"
+            )));
+        };
+        if normalized.insert(canonical_key.clone(), value).is_some() {
+            return Err(KernelError::generic(format!(
+                "Table property '{canonical_key}' is supplied more than once with different key \
+                 case"
+            )));
+        }
+    }
+    Ok(normalized)
 }

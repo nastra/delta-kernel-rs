@@ -66,8 +66,6 @@ pub struct UpdateTableBuilderState {
     snapshot: SnapshotRef,
     operation: UpdateTableOperation,
     schema_changes: Option<Vec<SchemaOperation>>,
-    // Configuration overrides for the shared update preparation path. No public setter populates
-    // these yet.
     properties_added: HashMap<String, String>,
     property_keys_removed: HashSet<String>,
     domain_metadata_removals: Vec<String>,
@@ -187,6 +185,47 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
             .schema_changes
             .get_or_insert_with(Vec::new)
             .push(SchemaOperation::SetNullable { column });
+        self
+    }
+
+    /// Sets table properties, overwriting existing values for the supplied keys.
+    ///
+    /// Properties not supplied keep their current values. Each call replaces the properties
+    /// supplied by any previous call, so a later call, even with an empty map, drops the
+    /// properties of earlier calls: merge them into one map and call once. Application properties
+    /// (keys outside the `delta.` namespace) are stored as given. Recognized `delta.*` keys are
+    /// matched case-insensitively and stored with their canonical case, and their values must
+    /// parse; other `delta.*` keys are rejected, including Kernel-managed ones such as
+    /// `delta.columnMapping.maxColumnId` and ones Delta Kernel Java does not let a writer set, such
+    /// as `delta.setTransactionRetentionDuration`. `delta.feature.<name>=supported` adds a
+    /// supported feature to the protocol.
+    ///
+    /// Values must use the forms Kernel parses when it reads a table: lowercase `true`/`false`,
+    /// lowercase column mapping modes such as `name`, and intervals with the `interval` prefix and
+    /// one unit, such as `interval 2 weeks`. `delta.checkpointInterval` and
+    /// `delta.dataSkippingNumIndexedCols` are limited to the 32-bit range Delta Kernel Java reads,
+    /// and retention intervals to the units and ranges Delta Kernel Java parses (no nanoseconds).
+    ///
+    /// Setting a property changes only table metadata and, when the configuration requires a
+    /// feature the protocol lacks, the protocol. It does not rewrite or backfill data files or
+    /// create a checkpoint: for example, `delta.checkpointPolicy=v2` adds the `v2Checkpoint`
+    /// feature and only affects future checkpoints. Existing protocol features are always
+    /// retained, so disabling a property such as `delta.enableTypeWidening` keeps the feature that
+    /// existing files may need. Reasserting a property's current value changes nothing.
+    ///
+    /// [`build`](Self::build) rejects malformed values, keys that are also removed, and
+    /// transitions Kernel does not support on existing tables, such as changing the column mapping
+    /// mode, enabling or disabling row tracking, or upgrading the table to `catalogManaged`.
+    pub fn with_table_properties_added<I, K, V>(mut self, properties: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.local_state.properties_added = properties
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
         self
     }
 
@@ -370,6 +409,15 @@ fn try_new_update_table<MODE: ExecutionMode>(
         should_emit_metadata,
         should_emit_protocol,
     } = prepare_update_table_metadata(&read_snapshot, request, commit_timestamp, engine)?;
+    // No commit path upgrades an existing table to catalog-managed: the commit would run as an
+    // ordinary catalog-managed write against a table the catalog does not manage yet.
+    if !read_snapshot.table_configuration().is_catalog_managed()
+        && effective_table_config.is_catalog_managed()
+    {
+        return Err(KernelError::unsupported(
+            "Upgrading an existing table to catalogManaged is not supported",
+        ));
+    }
 
     Ok(Transaction {
         read_snapshot_opt: Some(read_snapshot),
@@ -1188,13 +1236,10 @@ mod tests {
             .build(&engine, Box::new(FileSystemCommitter::new()))?
             .commit(&engine)?
             .unwrap_post_commit_snapshot();
-        let mut builder =
-            snapshot.update_table(UpdateTableOperation::AlterTable, "test-engine", false);
-        builder
-            .local_state
-            .properties_added
-            .insert(ENABLE_IN_COMMIT_TIMESTAMPS.to_string(), "true".to_string());
-        let transaction = builder.build(&engine, Box::new(FileSystemCommitter::new()))?;
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([(ENABLE_IN_COMMIT_TIMESTAMPS, "true")])
+            .build(&engine, Box::new(FileSystemCommitter::new()))?;
         assert!(transaction.should_emit_protocol);
         let committed = transaction.commit(&engine)?.unwrap_post_commit_snapshot();
 
@@ -1212,6 +1257,40 @@ mod tests {
         assert_eq!(
             reloaded.reader().get_in_commit_timestamp(&engine)?,
             Some(timestamp)
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    fn catalog_managed_upgrade_is_rejected_at_build(
+        #[values(None, Some("true"), Some("false"))] in_commit_timestamps: Option<&str>,
+    ) -> Result<()> {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let snapshot = create_table("memory:///", test_schema_flat(), "test", true)
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
+            .unwrap_post_commit_snapshot();
+        let mut properties = vec![("delta.feature.catalogManaged", "supported")];
+        properties.extend(in_commit_timestamps.map(|value| (ENABLE_IN_COMMIT_TIMESTAMPS, value)));
+        let error = snapshot
+            .clone()
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added(properties)
+            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        // Explicitly disabling ICT fails first, with Java's message.
+        let expected = if in_commit_timestamps == Some("false") {
+            "Cannot disable inCommitTimestamp when enabling catalogManaged"
+        } else {
+            "Upgrading an existing table to catalogManaged is not supported"
+        };
+        assert!(error.to_string().contains(expected), "{error}");
+
+        let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
+        assert_eq!(reloaded.version(), snapshot.version());
+        assert_eq!(
+            reloaded.table_configuration().protocol(),
+            snapshot.table_configuration().protocol()
         );
         Ok(())
     }
@@ -1286,6 +1365,22 @@ mod tests {
                 .get(key),
             None
         );
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_property_calls_replace_previous_properties() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let builder = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([("app.a", "1"), ("app.b", "1")])
+            .with_table_properties_added([("app.b", "2")]);
+        let expected = [("app.b", "2")].map(|(key, value)| (key.to_string(), value.to_string()));
+        assert_eq!(builder.local_state.properties_added, expected.into());
+
+        let transaction = builder.build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        assert!(transaction.should_emit_metadata);
+        assert!(!transaction.should_emit_protocol);
         Ok(())
     }
 
@@ -1444,6 +1539,54 @@ mod tests {
             config.table_properties().column_mapping_max_column_id,
             Some(12)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn enabling_column_mapping_on_variant_and_file_columns_matches_create_table() -> Result<()> {
+        let schema = Arc::new(StructType::try_new([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("v", DataType::unshredded_variant()),
+            StructField::nullable("f", DataType::file_type()),
+        ])?);
+        let create = |url: &str, engine: &SyncEngine, mode: &str| -> Result<SnapshotRef> {
+            Ok(create_table(url, schema.clone(), "test", true)
+                .with_table_properties([(COLUMN_MAPPING_MODE, mode)])
+                .build(engine, Box::new(FileSystemCommitter::new()))?
+                .commit(engine)?
+                .unwrap_post_commit_snapshot())
+        };
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let created_with_mapping = create("memory:///created/", &engine, "name")?;
+        let snapshot = create("memory:///altered/", &engine, "none")?;
+
+        let mut builder =
+            snapshot.update_table(UpdateTableOperation::AlterTable, "test-engine", false);
+        builder
+            .local_state
+            .properties_added
+            .insert(COLUMN_MAPPING_MODE.to_string(), "name".to_string());
+        let transaction = builder.build(&engine, Box::new(FileSystemCommitter::new()))?;
+        let prepared = transaction.effective_table_config.clone();
+        transaction.commit(&engine)?.unwrap_committed();
+
+        let reloaded = Snapshot::builder_for("memory:///altered/").build(&engine)?;
+        let created = created_with_mapping.table_configuration();
+        // Variant and file values keep their inner fields unannotated, as CREATE TABLE does, both
+        // in the prepared configuration and after reload.
+        for altered in [&prepared, reloaded.table_configuration()] {
+            for name in ["v", "f"] {
+                assert_eq!(
+                    altered.logical_schema().field(name).unwrap().data_type(),
+                    created.logical_schema().field(name).unwrap().data_type(),
+                    "{name}"
+                );
+            }
+            assert_eq!(
+                altered.table_properties().column_mapping_max_column_id,
+                created.table_properties().column_mapping_max_column_id
+            );
+        }
         Ok(())
     }
 

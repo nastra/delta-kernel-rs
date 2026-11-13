@@ -296,6 +296,29 @@ pub unsafe extern "C" fn update_table_txn_builder_with_domain_metadata(
     unsafe { result.into_extern_result(&engine) }
 }
 
+/// Sets table properties, overwriting the current values for the supplied keys.
+///
+/// Duplicate keys are rejected by the FFI map decoder. Each call replaces the properties supplied
+/// by any previous call. See [`UpdateTableTransactionBuilder::with_table_properties_added`] for the
+/// property contract. Invalid properties are rejected when the builder is built.
+///
+/// # Safety
+///
+/// All handles and map pointers must be valid. This call borrows `engine` and `properties` and
+/// unconditionally consumes `builder`, including on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn update_table_txn_builder_with_table_properties_added(
+    builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
+    properties: &FfiStringMap,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
+    let builder = unsafe { *builder.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    let result = unsafe { properties.try_to_hash_map() }
+        .map(|properties| Box::new(builder.with_table_properties_added(properties)).into());
+    unsafe { result.into_extern_result(&engine) }
+}
+
 /// Adds a nullable top-level field described by a single-field engine schema.
 ///
 /// # Safety

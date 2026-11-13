@@ -51,7 +51,7 @@ pub use update_table::*;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use url::Url;
 
-use crate::delta_types::{FfiColumnName, FfiNullableStringMap};
+use crate::delta_types::{FfiColumnName, FfiNullableStringMap, FfiStringMap};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::engine_funcs::FileMeta;
 use crate::error::{ExternResult, IntoExternResult};
@@ -142,6 +142,7 @@ mod tests {
     use delta_kernel::{KernelError, KernelResult, Snapshot};
     use delta_kernel_ffi::delta_types::{
         FfiColumnNameArray, FfiNullableStringMap, FfiNullableStringMapEntry, FfiStringArray,
+        FfiStringMap, FfiStringMapEntry,
     };
     use delta_kernel_ffi::engine_data::{ArrowFFIData, get_engine_data};
     use delta_kernel_ffi::error::FFIKernelError;
@@ -4379,6 +4380,142 @@ mod tests {
         unsafe { free_create_table_txn(txn) };
 
         unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_table_txn_builder_sets_table_properties() -> delta_kernel::Result<()> {
+        let (store, kernel_engine, table_url) =
+            test_utils::engine_store_setup("test_update_builder_table_properties", None);
+        delta_kernel::transaction::create_table::create_table(
+            table_url.as_str(),
+            schema_ref! { nullable "id": INTEGER },
+            "test-engine/1.0",
+            true,
+        )
+        .build(&kernel_engine, Box::new(FileSystemCommitter::new()))?
+        .commit(&kernel_engine)?
+        .unwrap_committed();
+        let engine = engine_handle_for_store(store);
+        let snapshot =
+            delta_kernel::Snapshot::builder_for(table_url.clone()).build(&kernel_engine)?;
+        let snapshot_handle: Handle<SharedSnapshot> = snapshot.into();
+        let mut builder = unsafe {
+            ok_or_panic(new_update_table_txn_builder(
+                snapshot_handle.shallow_copy(),
+                KernelUpdateTableOperation::AlterTable,
+                ffi_str("test-engine/1.0"),
+                false,
+                engine.shallow_copy(),
+            ))
+        };
+        // The second call replaces the first, so `app.dropped` is not committed.
+        let calls = [
+            vec![("app.dropped", "value")],
+            vec![("app.key", "value"), ("DELTA.CHECKPOINTINTERVAL", "5")],
+        ];
+        for call in calls {
+            let entries: Vec<_> = call
+                .into_iter()
+                .map(|(key, value)| FfiStringMapEntry {
+                    key: ffi_str(key),
+                    value: ffi_str(value),
+                })
+                .collect();
+            let properties = unsafe { FfiStringMap::new_unsafe(&entries) };
+            builder = ok_or_panic(unsafe {
+                update_table_txn_builder_with_table_properties_added(
+                    builder,
+                    &properties,
+                    engine.shallow_copy(),
+                )
+            });
+        }
+        let txn =
+            ok_or_panic(unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
+        assert_eq!(unsafe { version_and_free(committed) }, 1);
+        unsafe {
+            free_snapshot(snapshot_handle);
+            free_engine(engine);
+        }
+
+        let snapshot = delta_kernel::Snapshot::builder_for(table_url).build(&kernel_engine)?;
+        let configuration = snapshot.table_configuration().metadata().configuration();
+        assert_eq!(
+            configuration.get("app.key").map(String::as_str),
+            Some("value")
+        );
+        assert!(!configuration.contains_key("app.dropped"));
+        assert_eq!(
+            configuration
+                .get("delta.checkpointInterval")
+                .map(String::as_str),
+            Some("5")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_table_txn_builder_rejects_invalid_table_properties()
+    -> delta_kernel::Result<()> {
+        let (store, kernel_engine, table_url) =
+            test_utils::engine_store_setup("test_update_builder_invalid_table_properties", None);
+        delta_kernel::transaction::create_table::create_table(
+            table_url.as_str(),
+            schema_ref! { nullable "id": INTEGER },
+            "test-engine/1.0",
+            true,
+        )
+        .build(&kernel_engine, Box::new(FileSystemCommitter::new()))?
+        .commit(&kernel_engine)?
+        .unwrap_committed();
+        let engine = engine_handle_for_store(store);
+        let snapshot =
+            delta_kernel::Snapshot::builder_for(table_url.clone()).build(&kernel_engine)?;
+        let read_configuration = snapshot
+            .table_configuration()
+            .metadata()
+            .configuration()
+            .clone();
+        let snapshot_handle: Handle<SharedSnapshot> = snapshot.into();
+        let builder = unsafe {
+            ok_or_panic(new_update_table_txn_builder(
+                snapshot_handle.shallow_copy(),
+                KernelUpdateTableOperation::AlterTable,
+                ffi_str("test-engine/1.0"),
+                false,
+                engine.shallow_copy(),
+            ))
+        };
+        let entries = [FfiStringMapEntry {
+            key: ffi_str("delta.unknown"),
+            value: ffi_str("x"),
+        }];
+        let properties = unsafe { FfiStringMap::new_unsafe(&entries) };
+        let builder = ok_or_panic(unsafe {
+            update_table_txn_builder_with_table_properties_added(
+                builder,
+                &properties,
+                engine.shallow_copy(),
+            )
+        });
+        assert_extern_result_error_contains(
+            unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) },
+            FFIKernelError::GenericError,
+            "Setting delta property 'delta.unknown' is not supported",
+        );
+        unsafe {
+            free_snapshot(snapshot_handle);
+            free_engine(engine);
+        }
+
+        let reloaded = delta_kernel::Snapshot::builder_for(table_url).build(&kernel_engine)?;
+        assert_eq!(reloaded.version(), 0);
+        assert_eq!(
+            reloaded.table_configuration().metadata().configuration(),
+            &read_configuration
+        );
         Ok(())
     }
 
