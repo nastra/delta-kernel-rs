@@ -225,6 +225,8 @@ fn is_iso_local_date_time(value: &str) -> bool {
             }
         })
         && NaiveTime::parse_from_str(time, format).is_ok()
+        // chrono accepts second 60 as a leap second, but Java's second-of-minute range is 0-59.
+        && time.get(6..).is_none_or(|seconds| seconds < "60")
 }
 
 /// Strips the offset of a Java `ISO_OFFSET_DATE_TIME` value and returns the local date-time. The
@@ -328,6 +330,9 @@ mod tests {
     #[case::timestamp_ntz_empty_fraction(DataType::TIMESTAMP_NTZ, "2025-01-01T00:00:00.")]
     #[case::timestamp_ntz_long_fraction(DataType::TIMESTAMP_NTZ, "2025-01-01T00:00:00.1234567890")]
     #[case::timestamp_ntz_bad_hour(DataType::TIMESTAMP_NTZ, "2025-01-01T24:00:00")]
+    #[case::timestamp_ntz_leap_second(DataType::TIMESTAMP_NTZ, "2025-01-01T23:59:60")]
+    #[case::timestamp_ntz_leap_second_fraction(DataType::TIMESTAMP_NTZ, "2025-01-01T23:59:60.5")]
+    #[case::timestamp_leap_second(DataType::TIMESTAMP, "2025-06-30T23:59:60Z")]
     fn validate_literal_rejects_non_literals(#[case] data_type: DataType, #[case] value: &str) {
         assert_eq!(
             validate_literal(&data_type, value),

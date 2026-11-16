@@ -2031,6 +2031,8 @@ async fn updated_schema_sets_changes_and_removes_top_level_and_nested_defaults()
 #[case::date_format("dt", "2022/01/05", "Only literal values")]
 #[case::timestamp_without_time("ts", "2025-01-01", "Only literal values")]
 #[case::timestamp_ntz_with_offset("ntz", "2025-01-01T00:00:00+02:00", "Only literal values")]
+#[case::timestamp_leap_second("ts", "2025-06-30T23:59:60Z", "Only literal values")]
+#[case::timestamp_ntz_leap_second("ntz", "2025-01-01T23:59:60", "Only literal values")]
 #[case::non_literal_expression("ts", "current_timestamp()", "Only literal values")]
 #[case::null("i", "NULL", "Only literal values")]
 #[case::unsupported_byte("b", "1", "does not support default values for data type byte")]
