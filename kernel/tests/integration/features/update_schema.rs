@@ -1882,6 +1882,8 @@ fn defaults_schema() -> SchemaRef {
         StructField::nullable("zip", DataType::INTEGER),
     ])
     .unwrap();
+    let event = StructType::try_new([StructField::nullable("kind", DataType::STRING)]).unwrap();
+    let attr = StructType::try_new([StructField::nullable("score", DataType::INTEGER)]).unwrap();
     Arc::new(
         StructType::try_new([
             StructField::nullable("name", DataType::STRING),
@@ -1894,6 +1896,8 @@ fn defaults_schema() -> SchemaRef {
             StructField::nullable("ntz", DataType::TIMESTAMP_NTZ),
             StructField::nullable("b", DataType::BYTE),
             StructField::nullable("arr", ArrayType::new(DataType::INTEGER, true)),
+            StructField::nullable("events", ArrayType::new(event, true)),
+            StructField::nullable("attrs", MapType::new(DataType::STRING, attr, true)),
         ])
         .unwrap(),
     )
@@ -1907,7 +1911,9 @@ fn create_column_defaults_table(
     iceberg_compat_v3: bool,
 ) -> delta_kernel::Result<SnapshotRef> {
     let properties = if iceberg_compat_v3 {
-        iceberg_compat_properties("icebergCompatV3")
+        let mut properties = iceberg_compat_properties("icebergCompatV3");
+        properties.push(TYPE_WIDENING);
+        properties
     } else {
         vec![("delta.columnMapping.mode", "name")]
     };
@@ -1997,6 +2003,77 @@ fn reloaded_name_and_zip_defaults(
     )
 }
 
+/// Returns `schema` with `edit` applied to the struct inside the `events` array and the `attrs`
+/// map value.
+fn with_container_structs(
+    schema: &StructType,
+    mut edit: impl FnMut(&str, &StructType) -> StructType,
+) -> StructType {
+    with_fields(schema.fields().map(|field| {
+        let data_type = match field.data_type() {
+            DataType::Array(array) if field.name() == "events" => {
+                let DataType::Struct(element) = array.element_type() else {
+                    panic!("events must hold structs");
+                };
+                ArrayType::new(edit("events", element), array.contains_null()).into()
+            }
+            DataType::Map(map) if field.name() == "attrs" => {
+                let DataType::Struct(value) = map.value_type() else {
+                    panic!("attrs must map to structs");
+                };
+                MapType::new(
+                    map.key_type().clone(),
+                    edit("attrs", value),
+                    map.value_contains_null(),
+                )
+                .into()
+            }
+            _ => return field.clone(),
+        };
+        StructField {
+            data_type,
+            ..field.clone()
+        }
+    }))
+}
+
+/// Returns `schema` with the defaults of `events[].kind` and `attrs{}.score` set to `kind_default`
+/// and `score_default`.
+fn with_container_defaults(
+    schema: &StructType,
+    kind_default: Option<&str>,
+    score_default: Option<&str>,
+) -> StructType {
+    with_container_structs(schema, |container, nested| {
+        let value = if container == "events" {
+            kind_default
+        } else {
+            score_default
+        };
+        with_fields(nested.fields().map(|f| with_default(f.clone(), value)))
+    })
+}
+
+/// Returns the defaults of `events[].kind` and `attrs{}.score` in the reloaded table.
+fn reloaded_container_defaults(
+    table_path: &str,
+    engine: &dyn Engine,
+) -> (Option<String>, Option<String>) {
+    let schema = Snapshot::builder_for(table_path)
+        .build(engine)
+        .unwrap()
+        .schema();
+    let mut defaults = HashMap::new();
+    with_container_structs(&schema, |container, nested| {
+        defaults.insert(
+            container.to_string(),
+            nested.fields().next().and_then(default_sql),
+        );
+        nested.clone()
+    });
+    (defaults["events"].clone(), defaults["attrs"].clone())
+}
+
 #[tokio::test]
 async fn updated_schema_sets_changes_and_removes_top_level_and_nested_defaults()
 -> delta_kernel::Result<()> {
@@ -2019,6 +2096,85 @@ async fn updated_schema_sets_changes_and_removes_top_level_and_nested_defaults()
         );
         assert_eq!(snapshot.table_configuration().protocol(), &protocol);
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn updated_schema_sets_and_removes_defaults_inside_arrays_and_maps()
+-> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let mut snapshot = create_column_defaults_table(&table_path, engine.as_ref(), true)?;
+    for (kind_default, score_default) in [
+        (Some("'click'"), Some("5")),
+        (Some("'view'"), None),
+        (None, None),
+    ] {
+        let schema = with_container_defaults(&snapshot.schema(), kind_default, score_default);
+        snapshot = update_schema(&snapshot, engine.as_ref(), schema)?;
+        assert_eq!(
+            reloaded_container_defaults(&table_path, engine.as_ref()),
+            (
+                kind_default.map(str::to_string),
+                score_default.map(str::to_string)
+            )
+        );
+    }
+    assert_update_rejected(
+        &snapshot,
+        engine.as_ref(),
+        with_container_defaults(&snapshot.schema(), None, Some("five")),
+        "Only literal values",
+    );
+    Ok(())
+}
+
+/// A default is checked against the type in the supplied schema, so it may use a type widened in
+/// the same request.
+#[rstest]
+#[case::widened_to_long(DataType::LONG, None)]
+#[case::still_integer(DataType::INTEGER, Some("Only literal values"))]
+#[tokio::test]
+async fn updated_schema_checks_a_default_against_a_type_widened_in_the_same_request(
+    #[case] data_type: DataType,
+    #[case] expected_error: Option<&str>,
+) -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_column_defaults_table(&table_path, engine.as_ref(), true)?;
+    let widened = StructField {
+        data_type: data_type.clone(),
+        ..with_default(field(&snapshot.schema(), "i"), Some("3000000000"))
+    };
+    let updated = with_fields(retype_with(&snapshot.schema(), "i", widened));
+    if let Some(expected) = expected_error {
+        assert_update_rejected(&snapshot, engine.as_ref(), updated, expected);
+        return Ok(());
+    }
+    let committed = update_schema(&snapshot, engine.as_ref(), updated)?;
+    let i = field(&committed.schema(), "i");
+    assert_eq!(i.data_type(), &data_type);
+    assert_eq!(default_sql(&i).as_deref(), Some("3000000000"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn updated_schema_sets_a_default_on_a_field_renamed_in_the_same_request()
+-> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_column_defaults_table(&table_path, engine.as_ref(), true)?;
+    let name = field(&snapshot.schema(), "name");
+    let renamed = with_default(name.with_name("full_name"), Some("'anonymous'"));
+    update_schema(
+        &snapshot,
+        engine.as_ref(),
+        with_fields(retype_with(&snapshot.schema(), "name", renamed)),
+    )?;
+    let schema = Snapshot::builder_for(&table_path)
+        .build(engine.as_ref())?
+        .schema();
+    let full_name = field(&schema, "full_name");
+    assert!(schema.field("name").is_none());
+    assert_eq!(physical_name(&full_name), physical_name(&name));
+    assert_eq!(default_sql(&full_name).as_deref(), Some("'anonymous'"));
     Ok(())
 }
 
