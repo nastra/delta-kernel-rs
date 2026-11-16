@@ -416,7 +416,8 @@ fn try_new_update_table<MODE: ExecutionMode>(
     {
         return Err(KernelError::unsupported(
             "Upgrading an existing table to catalogManaged is not supported",
-        ));
+        )
+        .into());
     }
 
     Ok(Transaction {

@@ -127,7 +127,8 @@ pub(super) fn prepare_update_table_metadata(
     {
         return Err(KernelError::generic(format!(
             "Setting delta property '{key}' is not supported during {UPDATE_TABLE}"
-        )));
+        ))
+        .into());
     }
     validate_java_int_ranges(&properties_added)?;
     validate_retention_intervals(&properties_added)?;
