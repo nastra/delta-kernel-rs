@@ -152,12 +152,12 @@ fn fits_decimal(value: &str, decimal: &DecimalType) -> bool {
         return false;
     };
     let significant = digits.trim_start_matches('0').len().max(1);
-    scale <= i64::from(decimal.scale()) && significant <= usize::from(decimal.precision())
+    scale <= i32::from(decimal.scale()) && significant <= usize::from(decimal.precision())
 }
 
 /// Parses `[+-]digits[.digits][(e|E)[+-]digits]` into the unscaled digits and the scale, as Java's
 /// `BigDecimal(String)` constructor does.
-fn parse_big_decimal(value: &str) -> Option<(String, i64)> {
+fn parse_big_decimal(value: &str) -> Option<(String, i32)> {
     let value = value.strip_prefix(['+', '-']).unwrap_or(value);
     let (mantissa, exponent) = match value.find(['e', 'E']) {
         Some(index) => (&value[..index], Some(&value[index + 1..])),
@@ -178,7 +178,9 @@ fn parse_big_decimal(value: &str) -> Option<(String, i64)> {
         }
         None => 0,
     };
+    // Like Java's `BigDecimal`, the exponent may exceed `int` as long as the scale fits `int`.
     let scale = i64::try_from(fraction.len()).ok()?.checked_sub(exponent)?;
+    let scale = i32::try_from(scale).ok()?;
     Some((format!("{integer}{fraction}"), scale))
 }
 
@@ -287,6 +289,7 @@ mod tests {
     #[case::decimal_fewer_digits(decimal(10, 5), "4.9")]
     #[case::decimal_exponent(decimal(3, 0), "1.2E+2")]
     #[case::decimal_leading_zeros(decimal(2, 1), "-007.5")]
+    #[case::decimal_min_scale(decimal(1, 0), "1e2147483648")]
     #[case::boolean(DataType::BOOLEAN, "true")]
     #[case::boolean_any_value(DataType::BOOLEAN, "yes")]
     #[case::date(DataType::DATE, "2025-01-01")]
@@ -318,6 +321,7 @@ mod tests {
     #[case::decimal_scale(decimal(10, 2), "1.234")]
     #[case::decimal_text(decimal(10, 2), "abc")]
     #[case::decimal_empty_exponent(decimal(10, 2), "1e")]
+    #[case::decimal_scale_below_int(decimal(10, 2), "1e2147483649")]
     #[case::date_slashes(DataType::DATE, "2022/01/05")]
     #[case::date_invalid_day(DataType::DATE, "2023-02-29")]
     #[case::date_short_month(DataType::DATE, "2023-1-05")]
