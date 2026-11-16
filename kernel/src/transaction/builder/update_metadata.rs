@@ -36,7 +36,7 @@ use crate::table_properties::{
 use crate::transaction::schema_evolution::{SchemaOperation, evolve_metadata};
 use crate::transaction::schema_update::evolve_metadata_to_schema;
 use crate::transforms::{SchemaTransform, transform_output_type};
-use crate::{Engine, KernelError, KernelResult};
+use crate::{Engine, KernelError, KernelResult, Result};
 
 /// Universal formats (UniForm) the table is converted to, as a comma-separated list.
 const UNIVERSAL_FORMAT_ENABLED_FORMATS: &str = "delta.universalFormat.enabledFormats";
@@ -98,7 +98,7 @@ pub(super) fn prepare_update_table_metadata(
     request: UpdateTableMetadataRequest,
     commit_timestamp: i64,
     engine: &dyn Engine,
-) -> KernelResult<PreparedUpdateTableMetadata> {
+) -> Result<PreparedUpdateTableMetadata> {
     let read_config = read_snapshot.table_configuration();
     if request.is_empty() {
         return Ok(PreparedUpdateTableMetadata {
@@ -124,7 +124,8 @@ pub(super) fn prepare_update_table_metadata(
         (Some(_), Some(_)) => {
             return Err(KernelError::internal_error(
                 "schema operations and a complete updated schema cannot be combined",
-            ));
+            )
+            .into());
         }
         (Some(changes), None) => {
             ensure_schema_changes_supported(read_config)?;
@@ -183,7 +184,8 @@ pub(super) fn prepare_update_table_metadata(
         Some(value) if enables_catalog_managed && value.eq_ignore_ascii_case("false") => {
             return Err(KernelError::generic(
                 "Cannot disable inCommitTimestamp when enabling catalogManaged",
-            ));
+            )
+            .into());
         }
         None if enables_catalog_managed => {
             configuration.insert(ENABLE_IN_COMMIT_TIMESTAMPS.to_string(), "true".to_string());
@@ -221,7 +223,8 @@ pub(super) fn prepare_update_table_metadata(
         if protocol.has_table_feature(&TableFeature::CatalogManaged) {
             return Err(KernelError::generic(
                 "Cannot disable inCommitTimestamp on a catalogManaged table",
-            ));
+            )
+            .into());
         }
         configuration.remove(IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION);
         configuration.remove(IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP);
@@ -598,6 +601,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::Error;
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
@@ -643,7 +647,7 @@ mod tests {
         engine: &dyn Engine,
         snapshot: &Snapshot,
         request: UpdateTableMetadataRequest,
-    ) -> KernelResult<PreparedUpdateTableMetadata> {
+    ) -> Result<PreparedUpdateTableMetadata> {
         prepare_update_table_metadata(snapshot, request, current_time_ms()?, engine)
     }
 
@@ -1038,7 +1042,10 @@ mod tests {
     ) {
         let (engine, snapshot) = create_test_table(table_properties);
         let error = prepare(engine.as_ref(), &snapshot, properties_request(requested)).unwrap_err();
-        assert!(matches!(error, KernelError::Unsupported(_)), "{error}");
+        assert!(
+            matches!(error, Error::Kernel(KernelError::Unsupported(_))),
+            "{error}"
+        );
         assert!(error.to_string().contains(expected), "{error}");
     }
 
@@ -1278,7 +1285,10 @@ mod tests {
             .properties_added
             .insert(COLUMN_MAPPING_MODE.to_string(), "name".to_string());
         let error = prepare(engine.as_ref(), &snapshot, request).unwrap_err();
-        assert!(matches!(error, KernelError::Unsupported(_)), "{error}");
+        assert!(
+            matches!(error, Error::Kernel(KernelError::Unsupported(_))),
+            "{error}"
+        );
         assert!(
             error
                 .to_string()
