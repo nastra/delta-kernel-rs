@@ -1328,7 +1328,10 @@ mod tests {
             .with_table_properties_removed(["app.key", key])
             .build(&engine, Box::new(FileSystemCommitter::new()))
             .unwrap_err();
-        assert!(matches!(error, KernelError::Generic(_)), "{error}");
+        assert!(
+            matches!(error, Error::Kernel(KernelError::Generic(_))),
+            "{error}"
+        );
         assert!(
             error.to_string().contains(&format!(
                 "Unsetting table property '{key}' is not supported during UPDATE TABLE"
@@ -1397,7 +1400,10 @@ mod tests {
         match expected_error {
             Some(expected) => {
                 let error = result.unwrap_err();
-                assert!(matches!(error, KernelError::Generic(_)), "{error}");
+                assert!(
+                    matches!(error, Error::Kernel(KernelError::Generic(_))),
+                    "{error}"
+                );
                 assert!(error.to_string().contains(expected), "{error}");
                 assert_table_unchanged(&engine, &snapshot)?;
             }
