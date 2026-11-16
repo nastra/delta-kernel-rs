@@ -1282,7 +1282,10 @@ mod tests {
         let error = builder
             .build(&engine, Box::new(FileSystemCommitter::new()))
             .unwrap_err();
-        assert!(matches!(error, KernelError::Unsupported(_)), "{error}");
+        assert!(
+            matches!(error, Error::Kernel(KernelError::Unsupported(_))),
+            "{error}"
+        );
 
         let reloaded = Snapshot::builder_for(url.as_str()).build(&engine)?;
         assert_eq!(reloaded.version(), version);
