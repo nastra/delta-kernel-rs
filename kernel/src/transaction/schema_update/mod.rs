@@ -351,8 +351,9 @@ fn validate_added_field(added: &FieldChange) -> KernelResult<()> {
                 ColumnMetadataKey::TypeChanges.as_ref()
             ))
         );
-        // Java accepts a default on a new field. Kernel rejects it: existing data files do not
-        // contain the field, so its existing values would not match the default.
+        // Java accepts a default on a new field. Kernel rejects it because the protocol's Default
+        // Columns rule says operations that add a column MUST NOT specify its default in the same
+        // command: existing data files do not contain the field, so its values would not match.
         require!(
             field
                 .get_config_value(&ColumnMetadataKey::CurrentDefault)

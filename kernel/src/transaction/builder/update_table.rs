@@ -231,9 +231,12 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// with an offset, or an ISO `timestamp_ntz` without one. Any value is accepted for a boolean
     /// field, as Java's `Boolean.parseBoolean` does. Unlike Java, Kernel rejects a timestamp with
     /// a `[zone]` suffix and integer or decimal digits outside ASCII. Byte and non-primitive
-    /// fields cannot have defaults. A schema
-    /// with defaults does not add the `allowColumnDefaults` feature, and a table with that feature
-    /// but without icebergCompatV3 rejects every schema update.
+    /// fields cannot have defaults. A schema with defaults does not add the `allowColumnDefaults`
+    /// feature, and a table with that feature but without icebergCompatV3 rejects every schema
+    /// update. As in Java, every default in the supplied schema is checked, not only changed
+    /// ones: a table without `allowColumnDefaults` rejects a schema that keeps `CURRENT_DEFAULT`
+    /// metadata written by another engine, and a table with the feature rejects a schema that
+    /// keeps a non-literal default such as `current_timestamp()`.
     ///
     /// [`build`](Self::build) rejects the update if the table does not use column mapping, or if
     /// the schema has no columns, tightens nullability, makes any other type change or alters
@@ -246,8 +249,8 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// combined with [`add_column`](Self::add_column), [`add_column_at`](Self::add_column_at), or
     /// [`set_nullable`](Self::set_nullable) in the same transaction.
     ///
-    /// Unlike Delta Kernel Java, `build()` also rejects a new field with a default value, because
-    /// existing data files do not contain the field, and any schema update on a table with
+    /// Unlike Delta Kernel Java, `build()` also rejects a new field with a default value, as the
+    /// protocol's Default Columns rule requires, and any schema update on a table with
     /// generated columns, whose generation expressions Kernel cannot yet maintain.
     pub fn with_updated_schema(mut self, schema: SchemaRef) -> Self {
         self.local_state.updated_schema = Some(schema);
