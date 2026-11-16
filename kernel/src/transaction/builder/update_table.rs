@@ -1460,7 +1460,10 @@ mod tests {
             .unwrap_err();
         // The complete-schema path requires column mapping on the read table, so it rejects the
         // request before the rule against combining a mode change with schema changes runs.
-        assert!(matches!(error, KernelError::Unsupported(_)), "{error}");
+        assert!(
+            matches!(error, Error::Kernel(KernelError::Unsupported(_))),
+            "{error}"
+        );
         assert!(
             error
                 .to_string()
@@ -1791,7 +1794,10 @@ mod tests {
             .with_updated_schema(snapshot.schema())
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
             .unwrap_err();
-        assert!(matches!(error, KernelError::Unsupported(_)), "{error}");
+        assert!(
+            matches!(error, Error::Kernel(KernelError::Unsupported(_))),
+            "{error}"
+        );
         assert!(
             error.to_string().contains(&format!(
                 "Schema changes are not yet supported on tables with {expected}"

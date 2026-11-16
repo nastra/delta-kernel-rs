@@ -362,7 +362,9 @@ async fn updated_schema_fails_on_tables_with_generated_columns() -> delta_kernel
         |builder| builder.with_updated_schema(snapshot.schema()),
     );
     let expected = "Schema changes are not yet supported on tables with generated columns";
-    assert!(matches!(&result, Err(KernelError::Unsupported(msg)) if msg == expected));
+    assert!(
+        matches!(&result, Err(delta_kernel::Error::Kernel(KernelError::Unsupported(msg))) if msg == expected)
+    );
 
     let reloaded = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     assert_eq!(reloaded.version(), snapshot.version());

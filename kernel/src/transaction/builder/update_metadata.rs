@@ -123,7 +123,8 @@ pub(super) fn prepare_update_table_metadata(
         (Some(_), Some(_)) => {
             return Err(KernelError::internal_error(
                 "schema operations and a complete updated schema cannot be combined",
-            ));
+            )
+            .into());
         }
         (Some(changes), None) => {
             ensure_schema_changes_supported(read_config)?;
