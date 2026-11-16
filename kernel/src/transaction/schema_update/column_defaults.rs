@@ -1,7 +1,8 @@
-//! Validates the column defaults of a replacement schema, mirroring Delta Kernel Java's
-//! `ColumnDefaults.validateSchema` and `ColumnDefaults.validateLiteral`.
+//! Validates the column defaults of a replacement schema, following Delta Kernel Java's
+//! `ColumnDefaults.validateSchema` and `ColumnDefaults.validateLiteral` apart from the literal
+//! forms listed on [`validate_literal`].
 
-use chrono::{NaiveDate, NaiveTime};
+use std::ops::RangeInclusive;
 
 use crate::schema::{
     DataType, DecimalType, PrimitiveType, StructType, try_collect_column_defaults,
@@ -85,6 +86,12 @@ enum LiteralError {
 /// must be ISO `yyyy-MM-dd`, a timestamp ISO date-time with an offset, and a `timestamp_ntz` ISO
 /// date-time without one. Like Java's `Boolean.parseBoolean`, any value is accepted for a boolean.
 /// Byte and non-primitive types are not supported, and `NULL` is not a literal.
+///
+/// Two forms that Java accepts are rejected: a timestamp with a `[zone]` suffix, because checking
+/// the zone ID needs a time-zone database that Kernel does not always include, and integer or
+/// decimal digits outside ASCII, because Rust's standard library has no table of Unicode decimal
+/// digits. Rejecting them rather than accepting them unchecked ensures Kernel never commits a
+/// default that Java rejects.
 fn validate_literal(data_type: &DataType, value: &str) -> Result<(), LiteralError> {
     let DataType::Primitive(primitive) = data_type else {
         return Err(LiteralError::UnsupportedType);
@@ -129,20 +136,47 @@ fn is_java_integer<T: std::str::FromStr>(value: &str) -> bool {
     value.parse::<T>().is_ok()
 }
 
-/// Java's `Double.parseDouble` for decimal notation: surrounding whitespace, an optional `f`,
-/// `F`, `d`, or `D` suffix, and the special values `NaN` and `Infinity`. Hexadecimal notation is
-/// not accepted.
+/// Java's `Double.parseDouble`: surrounding whitespace, an optional `f`, `F`, `d`, or `D` suffix,
+/// the special values `NaN` and `Infinity`, and decimal or hexadecimal notation. Out-of-range
+/// values are valid because they round to zero or infinity.
 fn is_java_floating_point(value: &str) -> bool {
     let value = value.trim_matches(|c: char| c <= ' ');
     let unsigned = value.strip_prefix(['+', '-']).unwrap_or(value);
     if unsigned == "Infinity" || unsigned == "NaN" {
         return true;
     }
+    let unsigned_number = unsigned
+        .strip_suffix(['f', 'F', 'd', 'D'])
+        .unwrap_or(unsigned);
+    if let Some(hex) = unsigned_number
+        .strip_prefix("0x")
+        .or_else(|| unsigned_number.strip_prefix("0X"))
+    {
+        return is_hex_significand_and_exponent(hex);
+    }
+    // Parse with the sign so that a second sign, as in `+-1`, is rejected.
     let number = value.strip_suffix(['f', 'F', 'd', 'D']).unwrap_or(value);
     number
         .chars()
         .all(|c| c.is_ascii_digit() || matches!(c, '+' | '-' | '.' | 'e' | 'E'))
         && number.parse::<f64>().is_ok()
+}
+
+/// Java's hexadecimal floating-point form after `0x`: hex digits with an optional `.`, then a
+/// binary exponent `p` or `P` with an optional sign.
+fn is_hex_significand_and_exponent(hex: &str) -> bool {
+    let Some((significand, exponent)) = hex.split_once(['p', 'P']) else {
+        return false;
+    };
+    let (integer, fraction) = significand.split_once('.').unwrap_or((significand, ""));
+    let exponent = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+    !(integer.is_empty() && fraction.is_empty())
+        && integer
+            .bytes()
+            .chain(fraction.bytes())
+            .all(|b| b.is_ascii_hexdigit())
+        && !exponent.is_empty()
+        && exponent.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Java's `new BigDecimal(value)` followed by the check that the scale and precision fit
@@ -184,21 +218,47 @@ fn parse_big_decimal(value: &str) -> Option<(String, i32)> {
     Some((format!("{integer}{fraction}"), scale))
 }
 
-/// Java's `DateTimeFormatter.ISO_LOCAL_DATE`: `yyyy-MM-dd` with a valid calendar date.
+/// Java's `DateTimeFormatter.ISO_LOCAL_DATE`: a year, `-MM-dd`, and a valid proleptic Gregorian
+/// date. The year has four digits, five to ten with a `+` sign, or four to ten with a `-` sign, and
+/// lies within Java's range of +-999,999,999. Negative zero is not a year.
 fn is_iso_local_date(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    bytes.len() == 10
-        && bytes[4] == b'-'
-        && bytes[7] == b'-'
-        && bytes
-            .iter()
-            .enumerate()
-            .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit())
-        && NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
+    let (negative, year_widths, unsigned) = if let Some(unsigned) = value.strip_prefix('+') {
+        (false, 5..=10, unsigned)
+    } else if let Some(unsigned) = value.strip_prefix('-') {
+        (true, 4..=10, unsigned)
+    } else {
+        (false, 4..=4, value)
+    };
+    let mut parts = unsigned.split('-');
+    let (Some(year), Some(month), Some(day), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let (Some(year), Some(month), Some(day)) = (
+        ascii_number(year, year_widths),
+        ascii_number(month, 2..=2),
+        ascii_number(day, 2..=2),
+    ) else {
+        return false;
+    };
+    if year > 999_999_999 || (negative && year == 0) {
+        return false;
+    }
+    let leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap_year => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=days_in_month).contains(&day)
 }
 
 /// Java's `DateTimeFormatter.ISO_LOCAL_DATE_TIME`: an ISO local date, `T` (in any case), and
-/// `HH:mm`, optionally followed by `:ss` and one to nine fractional digits.
+/// `HH:mm`, optionally followed by `:ss` and a `.` with up to nine fractional digits. Like Java,
+/// the second is at most 59, so a leap second is rejected.
 fn is_iso_local_date_time(value: &str) -> bool {
     let Some((date, time)) = value.split_once(['T', 't']) else {
         return false;
@@ -207,33 +267,37 @@ fn is_iso_local_date_time(value: &str) -> bool {
         Some((time, fraction)) => (time, Some(fraction)),
         None => (time, None),
     };
-    let format = match time.len() {
-        5 => "%H:%M",
-        8 => "%H:%M:%S",
-        _ => return false,
+    let fraction_ok =
+        |fraction: Option<&str>| fraction.is_none_or(|f| ascii_number(f, 0..=9).is_some());
+    let fields = time
+        .split(':')
+        .map(|field| ascii_number(field, 2..=2))
+        .collect::<Option<Vec<_>>>();
+    let time_ok = match fields.as_deref() {
+        Some(&[hour, minute]) => fraction.is_none() && hour < 24 && minute < 60,
+        Some(&[hour, minute, second]) => {
+            fraction_ok(fraction) && hour < 24 && minute < 60 && second < 60
+        }
+        _ => false,
     };
-    let fraction_ok = fraction.is_none_or(|fraction| {
-        time.len() == 8
-            && (1..=9).contains(&fraction.len())
-            && fraction.bytes().all(|b| b.is_ascii_digit())
-    });
-    is_iso_local_date(date)
-        && fraction_ok
-        && time.bytes().enumerate().all(|(i, b)| {
-            if i % 3 == 2 {
-                b == b':'
-            } else {
-                b.is_ascii_digit()
-            }
-        })
-        && NaiveTime::parse_from_str(time, format).is_ok()
-        // chrono accepts second 60 as a leap second, but Java's second-of-minute range is 0-59.
-        && time.get(6..).is_none_or(|seconds| seconds < "60")
+    time_ok && is_iso_local_date(date)
+}
+
+/// Parses `value` as ASCII digits whose count is within `widths`. An empty `value` is `0` when
+/// `widths` allows it.
+fn ascii_number(value: &str, widths: RangeInclusive<usize>) -> Option<u64> {
+    if !widths.contains(&value.len()) || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if value.is_empty() {
+        return Some(0);
+    }
+    value.parse().ok()
 }
 
 /// Strips the offset of a Java `ISO_OFFSET_DATE_TIME` value and returns the local date-time. The
 /// offset is `Z` (in any case) or `+HH:MM` / `-HH:MM`, optionally with `:ss`, of at most 18 hours.
-/// Java's optional `[zone]` suffix is not accepted.
+/// Java's optional `[zone]` suffix is rejected; see [`validate_literal`].
 fn split_offset(value: &str) -> Option<&str> {
     if let Some(local) = value.strip_suffix(['Z', 'z']) {
         return Some(local);
@@ -301,6 +365,20 @@ mod tests {
     #[case::timestamp_offset_seconds(DataType::TIMESTAMP, "2025-01-01T00:00:00-18:00:00")]
     #[case::timestamp_ntz(DataType::TIMESTAMP_NTZ, "2025-01-01T00:00:00")]
     #[case::timestamp_ntz_nanos(DataType::TIMESTAMP_NTZ, "'2025-01-01T23:59:59.123456789'")]
+    #[case::timestamp_ntz_empty_fraction(DataType::TIMESTAMP_NTZ, "2025-01-01T00:00:00.")]
+    #[case::timestamp_empty_fraction(DataType::TIMESTAMP, "2025-01-01T00:00:00.Z")]
+    #[case::timestamp_extended_year(DataType::TIMESTAMP, "+10000-01-01T00:00:00Z")]
+    #[case::timestamp_ntz_negative_year(DataType::TIMESTAMP_NTZ, "-0001-01-01T00:00")]
+    #[case::date_extended_year(DataType::DATE, "+10000-01-01")]
+    #[case::date_padded_year(DataType::DATE, "+00001-01-01")]
+    #[case::date_max_year(DataType::DATE, "+999999999-12-31")]
+    #[case::date_min_year(DataType::DATE, "-999999999-01-01")]
+    #[case::date_year_zero(DataType::DATE, "0000-01-01")]
+    #[case::date_extended_leap_day(DataType::DATE, "+12000-02-29")]
+    #[case::double_hex(DataType::DOUBLE, "0x1p3")]
+    #[case::double_hex_fraction(DataType::DOUBLE, "-0X1.8P-1d")]
+    #[case::float_hex_no_integer(DataType::FLOAT, "0x.8p1f")]
+    #[case::double_out_of_range(DataType::DOUBLE, "1e400")]
     fn validate_literal_accepts(#[case] data_type: DataType, #[case] value: &str) {
         assert_eq!(validate_literal(&data_type, value), Ok(()));
     }
@@ -325,13 +403,27 @@ mod tests {
     #[case::date_slashes(DataType::DATE, "2022/01/05")]
     #[case::date_invalid_day(DataType::DATE, "2023-02-29")]
     #[case::date_short_month(DataType::DATE, "2023-1-05")]
+    #[case::date_unsigned_extended_year(DataType::DATE, "10000-01-01")]
+    #[case::date_signed_four_digit_year(DataType::DATE, "+2025-01-01")]
+    #[case::date_negative_zero_year(DataType::DATE, "-0000-01-01")]
+    #[case::date_year_too_large(DataType::DATE, "+1000000000-01-01")]
+    #[case::date_extended_non_leap_day(DataType::DATE, "+12100-02-29")]
+    #[case::date_trailing_part(DataType::DATE, "2025-01-01-01")]
+    #[case::timestamp_zone_suffix(DataType::TIMESTAMP, "2025-01-01T00:00:00Z[UTC]")]
+    #[case::integer_non_ascii_digit(DataType::INTEGER, "\u{661}")]
+    #[case::decimal_non_ascii_digit(decimal(10, 2), "\u{661}")]
+    #[case::double_hex_without_exponent(DataType::DOUBLE, "0x1")]
+    #[case::double_hex_without_digits(DataType::DOUBLE, "0xp1")]
+    #[case::double_hex_empty_exponent(DataType::DOUBLE, "0x1p")]
+    #[case::double_two_signs(DataType::DOUBLE, "+-1")]
+    #[case::double_hex_two_signs(DataType::DOUBLE, "+-0x1p3")]
     #[case::timestamp_date_only(DataType::TIMESTAMP, "2025-01-01")]
     #[case::timestamp_without_offset(DataType::TIMESTAMP, "2025-01-01T00:00:00")]
     #[case::timestamp_space(DataType::TIMESTAMP, "2025-01-01 00:00:00Z")]
     #[case::timestamp_bad_offset(DataType::TIMESTAMP, "2025-01-01T00:00:00+2:00")]
     #[case::timestamp_offset_too_large(DataType::TIMESTAMP, "2025-01-01T00:00:00+18:30")]
     #[case::timestamp_ntz_offset(DataType::TIMESTAMP_NTZ, "2025-01-01T00:00:00+02:00")]
-    #[case::timestamp_ntz_empty_fraction(DataType::TIMESTAMP_NTZ, "2025-01-01T00:00:00.")]
+    #[case::timestamp_ntz_minutes_fraction(DataType::TIMESTAMP_NTZ, "2025-01-01T00:00.")]
     #[case::timestamp_ntz_long_fraction(DataType::TIMESTAMP_NTZ, "2025-01-01T00:00:00.1234567890")]
     #[case::timestamp_ntz_bad_hour(DataType::TIMESTAMP_NTZ, "2025-01-01T24:00:00")]
     #[case::timestamp_ntz_leap_second(DataType::TIMESTAMP_NTZ, "2025-01-01T23:59:60")]

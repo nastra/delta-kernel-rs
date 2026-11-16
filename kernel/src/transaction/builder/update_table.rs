@@ -226,9 +226,12 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     ///
     /// The `CURRENT_DEFAULT` of an existing field, including a nested one, may be set, changed, or
     /// removed when the table supports `allowColumnDefaults` and has `delta.enableIcebergCompatV3`
-    /// enabled. Each default must be a literal of the field's type: a quoted string or binary, a
-    /// number that fits the type, an ISO date, an ISO timestamp with an offset, or an ISO
-    /// `timestamp_ntz` without one. Byte and non-primitive fields cannot have defaults. A schema
+    /// enabled. Each default must be a literal of the field's type, as Delta Kernel Java checks
+    /// it: a quoted string or binary, a number that fits the type, an ISO date, an ISO timestamp
+    /// with an offset, or an ISO `timestamp_ntz` without one. Any value is accepted for a boolean
+    /// field, as Java's `Boolean.parseBoolean` does. Unlike Java, Kernel rejects a timestamp with
+    /// a `[zone]` suffix and integer or decimal digits outside ASCII. Byte and non-primitive
+    /// fields cannot have defaults. A schema
     /// with defaults does not add the `allowColumnDefaults` feature, and a table with that feature
     /// but without icebergCompatV3 rejects every schema update.
     ///
