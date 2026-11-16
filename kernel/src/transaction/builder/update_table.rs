@@ -25,7 +25,7 @@ use crate::transaction::{
     ExecutionMode, Imperative, Transaction, UpdateTable, UpdateTableOperation,
 };
 use crate::utils::{current_time_ms, require};
-use crate::{Engine, KernelError, KernelResult};
+use crate::{Engine, KernelError, KernelResult, Result};
 
 /// Configures DML and schema-changing DDL transactions against an existing table.
 ///
@@ -303,7 +303,7 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         self,
         engine: &dyn Engine,
         committer: Box<dyn Committer>,
-    ) -> KernelResult<Transaction<UpdateTable, MODE>> {
+    ) -> Result<Transaction<UpdateTable, MODE>> {
         self.validate()?;
         let transaction = try_new_update_table(self, committer, engine)?;
         transaction.validate_domain_metadata_operations()?;
@@ -387,7 +387,7 @@ fn try_new_update_table<MODE: ExecutionMode>(
     builder: UpdateTableTransactionBuilder<MODE>,
     committer: Box<dyn Committer>,
     engine: &dyn Engine,
-) -> KernelResult<Transaction<UpdateTable, MODE>> {
+) -> Result<Transaction<UpdateTable, MODE>> {
     let TransactionBuilder {
         common_state,
         local_state,
@@ -514,7 +514,7 @@ mod tests {
     use crate::transaction::data_layout::DataLayout;
     use crate::transaction::{SchemaOperation, UpdateTableOperation};
     use crate::unit_test_utils::{copy_test_table, load_test_table, test_schema_flat};
-    use crate::{Engine, KernelError, Result, SnapshotRef};
+    use crate::{Engine, Error, KernelError, Result, SnapshotRef};
 
     #[rstest]
     #[case::write(UpdateTableOperation::Write)]
@@ -744,7 +744,7 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(&error, KernelError::InvalidTransactionState(message)
+            matches!(&error, Error::Kernel(KernelError::InvalidTransactionState(message))
             if message == &format!("custom operation name '{operation}' is reserved"))
         );
         Ok(())
@@ -867,7 +867,7 @@ mod tests {
         if operation == UpdateTableOperation::AlterTable {
             let error = result.unwrap_err();
             assert!(
-                matches!(&error, KernelError::InvalidTransactionState(message)
+                matches!(&error, Error::Kernel(KernelError::InvalidTransactionState(message))
                 if message == "ALTER TABLE requires at least one metadata change")
             );
         } else {
@@ -913,7 +913,9 @@ mod tests {
             let error = result.unwrap_err();
             let expected =
                 format!("Schema changes are not yet supported on tables with {feature} enabled");
-            assert!(matches!(&error, KernelError::Unsupported(message) if message == &expected));
+            assert!(
+                matches!(&error, Error::Kernel(KernelError::Unsupported(message)) if message == &expected)
+            );
         } else {
             let transaction = result.expect("supported schema changes must build successfully");
             assert_eq!(transaction.operation, operation.into());
@@ -1066,7 +1068,10 @@ mod tests {
         let error = builder
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
             .unwrap_err();
-        assert!(matches!(&error, KernelError::InvalidTransactionState(_)));
+        assert!(matches!(
+            &error,
+            Error::Kernel(KernelError::InvalidTransactionState(_))
+        ));
         assert!(error.to_string().contains(expected), "{error}");
         Ok(())
     }
@@ -1125,7 +1130,7 @@ mod tests {
         assert!(!transaction.data_change);
         let error = transaction.commit(engine.as_ref()).unwrap_err();
         assert!(
-            matches!(&error, KernelError::InvalidTransactionState(message)
+            matches!(&error, Error::Kernel(KernelError::InvalidTransactionState(message))
             if message == "ALTER TABLE cannot include data-file actions")
         );
         Ok(())
@@ -1146,7 +1151,7 @@ mod tests {
         if data_change {
             let error = result.unwrap_err();
             assert!(
-                matches!(&error, KernelError::InvalidTransactionState(message)
+                matches!(&error, Error::Kernel(KernelError::InvalidTransactionState(message))
                 if message == "ALTER TABLE requires data_change to be false")
             );
         } else {
@@ -1169,7 +1174,7 @@ mod tests {
         transaction.data_change = true;
         let error = transaction.commit(engine.as_ref()).unwrap_err();
         assert!(
-            matches!(&error, KernelError::InvalidTransactionState(message)
+            matches!(&error, Error::Kernel(KernelError::InvalidTransactionState(message))
             if message == "ALTER TABLE requires data_change to be false")
         );
         Ok(())
@@ -1243,7 +1248,10 @@ mod tests {
         let error = builder
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
             .unwrap_err();
-        assert!(matches!(&error, KernelError::InvalidTransactionState(_)));
+        assert!(matches!(
+            &error,
+            Error::Kernel(KernelError::InvalidTransactionState(_))
+        ));
         assert!(error.to_string().contains(expected), "{error}");
         Ok(())
     }
@@ -1577,7 +1585,10 @@ mod tests {
             .unwrap_err();
         // The complete-schema path requires column mapping on the read table, so it rejects the
         // request before the rule against combining a mode change with schema changes runs.
-        assert!(matches!(error, KernelError::Unsupported(_)), "{error}");
+        assert!(
+            matches!(error, Error::Kernel(KernelError::Unsupported(_))),
+            "{error}"
+        );
         assert!(
             error
                 .to_string()
@@ -1675,7 +1686,10 @@ mod tests {
         let error = builder
             .build(&engine, Box::new(FileSystemCommitter::new()))
             .unwrap_err();
-        assert!(matches!(error, KernelError::Unsupported(_)), "{error}");
+        assert!(
+            matches!(error, Error::Kernel(KernelError::Unsupported(_))),
+            "{error}"
+        );
 
         let reloaded = Snapshot::builder_for(url.as_str()).build(&engine)?;
         assert_eq!(reloaded.version(), version);
