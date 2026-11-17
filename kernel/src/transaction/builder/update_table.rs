@@ -11,7 +11,7 @@ use super::update_metadata::prepare_update_table_metadata;
 use crate::actions::Metadata;
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
-use crate::schema::StructField;
+use crate::schema::{SchemaRef, StructField};
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
@@ -23,6 +23,10 @@ use crate::table_properties::{
 };
 use crate::transaction::domain_metadata::validate_unique_domains;
 use crate::transaction::schema_evolution::{SchemaOperation, evolve_metadata};
+use crate::transaction::schema_update::{
+    evolve_metadata_to_schema, validate_clustering_columns_retained,
+    validate_stats_columns_unchanged,
+};
 use crate::transaction::{
     ExecutionMode, Imperative, Transaction, UpdateTable, UpdateTableOperation,
 };
@@ -72,6 +76,8 @@ pub struct UpdateTableBuilderState {
     snapshot: SnapshotRef,
     operation: UpdateTableOperation,
     schema_changes: Option<Vec<SchemaOperation>>,
+    /// Complete replacement schema from `with_updated_schema`. Exclusive with `schema_changes`.
+    updated_schema: Option<SchemaRef>,
     /// Property-add requests in call order. Each inner vec is one
     /// with_table_properties_added call
     /// later calls override earlier values for the same canonical key at build.
@@ -87,8 +93,12 @@ impl UpdateTableBuilderState {
             || !self.properties_removed.is_empty()
     }
 
+    fn has_schema_changes(&self) -> bool {
+        self.schema_changes.is_some() || self.updated_schema.is_some()
+    }
+
     fn has_metadata_changes(&self) -> bool {
-        self.schema_changes.is_some() || self.has_property_changes()
+        self.has_schema_changes() || self.has_property_changes()
     }
 }
 
@@ -100,6 +110,10 @@ impl<MODE: ExecutionMode> std::fmt::Debug for TransactionBuilder<UpdateTable, MO
             .field(
                 "schema_change_count",
                 &self.local_state.schema_changes.as_ref().map_or(0, Vec::len),
+            )
+            .field(
+                "has_updated_schema",
+                &self.local_state.updated_schema.is_some(),
             )
             .field(
                 "properties_added_count",
@@ -131,6 +145,7 @@ impl TransactionBuilder<UpdateTable> {
                 snapshot,
                 operation,
                 schema_changes: None,
+                updated_schema: None,
                 properties_added: Vec::new(),
                 properties_removed: HashSet::new(),
                 domain_metadata_removals: Vec::new(),
@@ -270,6 +285,43 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         self
     }
 
+    /// Replaces the table schema with `schema`, the complete desired schema.
+    ///
+    /// Start from [`Snapshot::schema`](crate::Snapshot::schema) and modify it: existing fields are
+    /// identified by their column-mapping ID, so keep each retained field's column-mapping
+    /// metadata. A field without column-mapping metadata is new and receives a fresh ID and
+    /// physical name; new fields must not carry column-mapping metadata of their own. Omitting an
+    /// existing field drops it. A retained field that omits its `delta.typeChanges` history keeps
+    /// the current history, and retained fields always keep their current Parquet field ids and
+    /// nested column-mapping ids. Repeated calls replace the previous schema.
+    ///
+    /// Supported changes are adding nullable fields, dropping fields, renaming fields, reordering
+    /// fields within their struct, changing comments and other non-protocol field metadata, and
+    /// relaxing nullability. Existing fields keep their physical names, so data files are not
+    /// rewritten, and `delta.columnMapping.maxColumnId` never decreases. As with
+    /// [`add_column`](Self::add_column), `build()` adds any table feature the new schema requires.
+    /// The schema can be combined with property changes in the same transaction.
+    ///
+    /// [`build`](Self::build) rejects the update if the table does not use column mapping, or if
+    /// the schema has no columns, tightens nullability, changes a field's type, moves a field to a
+    /// different parent struct, drops or renames a partition column or a column listed in the
+    /// final `delta.dataSkippingStatsColumns`, drops a clustering column, renames a collated
+    /// field, adds a non-nullable field (at any nesting depth), a field with a default value, a
+    /// field with generation or identity metadata, or a field with Kernel-managed metadata such as
+    /// `delta.typeChanges` or `parquet.field.id`, or changes protocol-defined field metadata such
+    /// as generation expressions, invariants, or defaults. It cannot be combined with
+    /// [`add_column`](Self::add_column), [`add_column_at`](Self::add_column_at), or
+    /// [`set_nullable`](Self::set_nullable) in the same transaction.
+    ///
+    /// Unlike Delta Kernel Java, `build()` also rejects any schema update on a table with
+    /// `icebergCompatV2` or `icebergCompatV3` enabled, with `allowColumnDefaults` enabled, or with
+    /// generated columns. Kernel cannot yet maintain the nested Iceberg field IDs, default values,
+    /// or generation expressions of those tables when their schema changes.
+    pub fn with_updated_schema(mut self, schema: SchemaRef) -> Self {
+        self.local_state.updated_schema = Some(schema);
+        self
+    }
+
     /// Adds a user-controlled domain metadata removal to the transaction.
     ///
     /// If the domain exists, commit emits a tombstone that preserves its previous configuration.
@@ -348,9 +400,17 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
                 "blind append requires data_change to be true",
             ));
         }
-        if self.local_state.is_blind_append && self.local_state.schema_changes.is_some() {
+        if self.local_state.is_blind_append && self.local_state.has_schema_changes() {
             return Err(KernelError::invalid_transaction_state(
                 "blind append cannot include schema changes",
+            ));
+        }
+        // Incremental operations would have to be resolved against either the snapshot schema or
+        // the replacement schema, so the two forms are kept exclusive.
+        if self.local_state.updated_schema.is_some() && self.local_state.schema_changes.is_some() {
+            return Err(KernelError::invalid_transaction_state(
+                "with_updated_schema cannot be combined with add_column, add_column_at, or \
+                 set_nullable in one transaction",
             ));
         }
         if self.local_state.is_blind_append && self.local_state.has_property_changes() {
@@ -407,6 +467,7 @@ fn try_new_update_table<MODE: ExecutionMode>(
         snapshot: read_snapshot,
         operation,
         schema_changes,
+        updated_schema,
         properties_added,
         properties_removed,
         domain_metadata_removals,
@@ -452,10 +513,21 @@ fn try_new_update_table<MODE: ExecutionMode>(
     )?;
 
     let has_property_removes = !properties_removed.is_empty();
-    let has_schema_changes = schema_changes.is_some();
-    let metadata = match schema_changes {
-        Some(changes) => apply_schema_changes(&effective_table_config, changes)?,
-        None => effective_table_config.metadata().clone(),
+    let has_updated_schema = updated_schema.is_some();
+    let has_schema_changes = schema_changes.is_some() || has_updated_schema;
+    if has_schema_changes {
+        ensure_schema_changes_supported(&effective_table_config)?;
+    }
+    // The evolved schema of a complete-schema update, kept for the stats-column check below.
+    let mut replaced_schema = None;
+    let metadata = match (schema_changes, &updated_schema) {
+        (Some(changes), _) => evolve_metadata(&effective_table_config, changes)?.0,
+        (None, Some(schema)) => {
+            let (metadata, schema) = evolve_metadata_to_schema(&effective_table_config, schema)?;
+            replaced_schema = Some(schema);
+            metadata
+        }
+        (None, None) => effective_table_config.metadata().clone(),
     };
     let properties_added = if properties_added.is_empty() {
         HashMap::new()
@@ -482,6 +554,20 @@ fn try_new_update_table<MODE: ExecutionMode>(
     } else {
         metadata
     };
+    if let Some(schema) = &replaced_schema {
+        // Checked against the final configuration, so a request that also replaces
+        // `delta.dataSkippingStatsColumns` is validated against the new list.
+        if let Some(columns) = &metadata
+            .parse_table_properties()
+            .data_skipping_stats_columns
+        {
+            validate_stats_columns_unchanged(
+                columns,
+                &effective_table_config.logical_schema(),
+                schema,
+            )?;
+        }
+    }
     let (effective_table_config, should_emit_protocol) = if should_emit_metadata {
         let prepared =
             prepare_update_table_metadata(&effective_table_config, metadata, has_schema_changes)?;
@@ -489,6 +575,16 @@ fn try_new_update_table<MODE: ExecutionMode>(
     } else {
         (effective_table_config, false)
     };
+    // A schema update keeps the snapshot's clustering columns, so each must still resolve.
+    // Replacing or clearing them in the same transaction requires a clustering-column request,
+    // which would supply the columns validated here.
+    if let Some(columns) = clustering_columns.as_deref().filter(|_| has_updated_schema) {
+        validate_clustering_columns_retained(
+            read_snapshot.table_configuration(),
+            &effective_table_config,
+            columns,
+        )?;
+    }
 
     Ok(Transaction {
         read_snapshot_opt: Some(read_snapshot),
@@ -508,13 +604,10 @@ fn try_new_update_table<MODE: ExecutionMode>(
     })
 }
 
-/// Applies `changes` to the schema of `table_config` and returns the evolved metadata. The result
-/// is validated by [`prepare_update_table_metadata`], which first derives the protocol features the
-/// evolved schema requires.
-fn apply_schema_changes(
-    table_config: &TableConfiguration,
-    changes: Vec<SchemaOperation>,
-) -> Result<Metadata> {
+/// Rejects tables whose schema Kernel cannot evolve yet. The evolved metadata is validated by
+/// [`prepare_update_table_metadata`], which first derives the protocol features the evolved schema
+/// requires.
+fn ensure_schema_changes_supported(table_config: &TableConfiguration) -> Result<()> {
     let unsupported_iceberg_compat = [TableFeature::IcebergCompatV2, TableFeature::IcebergCompatV3]
         .into_iter()
         .find(|feature| table_config.is_feature_enabled(feature));
@@ -536,8 +629,7 @@ fn apply_schema_changes(
         )
         .into());
     }
-    let (metadata, _schema) = evolve_metadata(table_config, changes)?;
-    Ok(metadata)
+    Ok(())
 }
 
 /// Merges already-validated, changed `properties_added` into `metadata`.
@@ -640,11 +732,14 @@ mod tests {
     use crate::expressions::ColumnName;
     use crate::expressions::column_name;
     use crate::object_store::memory::InMemory;
-    use crate::schema::{DataType, StructField, schema_ref};
+    use crate::schema::{DataType, StructField, StructType, schema_ref};
     use crate::snapshot::Snapshot;
     use crate::table_features::TableFeature;
-    use crate::table_properties::{ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3};
+    use crate::table_properties::{
+        COLUMN_MAPPING_MODE, ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3,
+    };
     use crate::transaction::create_table::create_table;
+    use crate::transaction::data_layout::DataLayout;
     use crate::transaction::{SchemaOperation, UpdateTableOperation};
     use crate::unit_test_utils::{copy_test_table, load_test_table, test_schema_flat};
     use crate::{Engine, Error, KernelError, Result, SnapshotRef};
@@ -1496,6 +1591,7 @@ mod tests {
         AlterTableBlindAppend,
         BlindAppendWithoutDataChange,
         BlindAppendWithSchemaChange,
+        BlindAppendWithUpdatedSchema,
         AlterTableWithDataChange,
     }
 
@@ -1510,6 +1606,10 @@ mod tests {
     )]
     #[case::blind_append_with_schema_change(
         InvalidIntent::BlindAppendWithSchemaChange,
+        "cannot include schema changes"
+    )]
+    #[case::blind_append_with_updated_schema(
+        InvalidIntent::BlindAppendWithUpdatedSchema,
         "cannot include schema changes"
     )]
     #[case::alter_with_data_change(
@@ -1528,6 +1628,7 @@ mod tests {
             _ => UpdateTableOperation::Write,
         };
         let data_change = !matches!(intent, InvalidIntent::BlindAppendWithoutDataChange);
+        let snapshot_schema = snapshot.schema();
         let builder = snapshot.update_table(operation, "test-engine", data_change);
         let builder = match intent {
             InvalidIntent::AlterTableBlindAppend => builder
@@ -1536,6 +1637,9 @@ mod tests {
             InvalidIntent::BlindAppendWithoutDataChange => builder.with_blind_append(),
             InvalidIntent::BlindAppendWithSchemaChange => builder
                 .add_column(StructField::nullable("new_column", DataType::STRING))
+                .with_blind_append(),
+            InvalidIntent::BlindAppendWithUpdatedSchema => builder
+                .with_updated_schema(snapshot_schema.clone())
                 .with_blind_append(),
             InvalidIntent::AlterTableWithDataChange => {
                 builder.add_column(StructField::nullable("new_column", DataType::STRING))
@@ -1743,6 +1847,209 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("domainMetadata"), "{error}");
+        Ok(())
+    }
+
+    /// Creates an in-memory column-mapping table clustered by `name`.
+    fn create_clustered_column_mapping_table() -> Result<(SyncEngine, SnapshotRef)> {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let snapshot = create_table("memory:///", test_schema_flat(), "test", true)
+            .with_table_properties([("delta.columnMapping.mode", "name")])
+            .with_data_layout(DataLayout::clustered(["name"]))
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
+            .unwrap_post_commit_snapshot();
+        Ok((engine, snapshot))
+    }
+
+    #[test]
+    fn updated_schema_rejects_dropping_a_clustering_column() -> Result<()> {
+        let (engine, snapshot) = create_clustered_column_mapping_table()?;
+        let schema = snapshot.schema();
+        let without_name = StructType::try_new([schema.field("id").unwrap().clone()])?;
+        let error = snapshot
+            .clone()
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_updated_schema(Arc::new(without_name))
+            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot drop clustering column 'name'"),
+            "{error}"
+        );
+        let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
+        assert_eq!(reloaded.version(), snapshot.version());
+        Ok(())
+    }
+
+    #[rstest]
+    fn updated_schema_handles_a_nested_clustering_column(
+        #[values(false, true)] drop: bool,
+    ) -> Result<()> {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let address = StructType::try_new([
+            StructField::nullable("city", DataType::STRING),
+            StructField::nullable("zip", DataType::STRING),
+        ])?;
+        let schema = Arc::new(StructType::try_new([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("address", address),
+        ])?);
+        let snapshot = create_table("memory:///", schema, "test", true)
+            .with_table_properties([(COLUMN_MAPPING_MODE, "name")])
+            .with_data_layout(DataLayout::Clustered {
+                columns: vec![column_name!("address.city")],
+            })
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
+            .unwrap_post_commit_snapshot();
+        let schema = snapshot.schema();
+        let DataType::Struct(address) = schema.field("address").unwrap().data_type() else {
+            panic!("address is a struct");
+        };
+        let city = address.field("city").unwrap();
+        let zip = address.field("zip").unwrap().clone();
+        let address_fields = if drop {
+            vec![zip]
+        } else {
+            vec![city.with_name("town"), zip]
+        };
+        let mut new_address = schema.field("address").unwrap().clone();
+        new_address.data_type = StructType::try_new(address_fields)?.into();
+        let updated = StructType::try_new([schema.field("id").unwrap().clone(), new_address])?;
+
+        let result = snapshot
+            .clone()
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_updated_schema(Arc::new(updated))
+            .build(&engine, Box::new(FileSystemCommitter::new()));
+        if drop {
+            let error = result.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Cannot drop clustering column 'address.city'"),
+                "{error}"
+            );
+            let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
+            assert_eq!(reloaded.version(), snapshot.version());
+            return Ok(());
+        }
+        let committed = result?.commit(&engine)?.unwrap_post_commit_snapshot();
+        let reader = committed.reader();
+        assert_eq!(
+            reader.get_physical_clustering_columns(&engine)?,
+            snapshot.reader().get_physical_clustering_columns(&engine)?
+        );
+        let infos = reader.get_clustering_column_infos(&engine)?.unwrap();
+        assert_eq!(infos[0].logical_column, column_name!("address.town"));
+        Ok(())
+    }
+
+    #[test]
+    fn updated_schema_with_a_case_insensitive_duplicate_is_rejected() -> Result<()> {
+        let (engine, snapshot) = create_clustered_column_mapping_table()?;
+        let schema = snapshot.schema();
+        // `StructType::try_new` rejects this; a schema built without validation must still fail.
+        let duplicate = StructType::new_unchecked([
+            schema.field("id").unwrap().clone(),
+            schema.field("name").unwrap().clone(),
+            StructField::nullable("NAME", DataType::STRING),
+        ]);
+        let error = snapshot
+            .clone()
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_updated_schema(Arc::new(duplicate))
+            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Duplicate field name (case-insensitive): 'NAME'"),
+            "{error}"
+        );
+
+        let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
+        assert_eq!(reloaded.version(), snapshot.version());
+        assert_eq!(reloaded.schema(), snapshot.schema());
+        Ok(())
+    }
+
+    #[test]
+    fn unchanged_updated_schema_counts_as_a_request_and_commits() -> Result<()> {
+        let (engine, snapshot) = create_clustered_column_mapping_table()?;
+        let transaction = snapshot
+            .clone()
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_updated_schema(snapshot.schema())
+            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+        assert!(transaction.should_emit_metadata);
+        assert!(!transaction.should_emit_protocol);
+        transaction.commit(&engine)?.unwrap_committed();
+
+        let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
+        assert_eq!(reloaded.version(), snapshot.version() + 1);
+        assert_eq!(reloaded.schema(), snapshot.schema());
+        Ok(())
+    }
+
+    #[test]
+    fn updated_schema_rename_keeps_clustering_column() -> Result<()> {
+        let (engine, snapshot) = create_clustered_column_mapping_table()?;
+        let schema = snapshot.schema();
+        let renamed = StructType::try_new([
+            schema.field("id").unwrap().clone(),
+            schema.field("name").unwrap().with_name("label"),
+        ])?;
+        let committed = snapshot
+            .clone()
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_updated_schema(Arc::new(renamed))
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
+            .unwrap_post_commit_snapshot();
+
+        let reader = committed.reader();
+        assert_eq!(
+            reader.get_physical_clustering_columns(&engine)?,
+            snapshot.reader().get_physical_clustering_columns(&engine)?
+        );
+        let infos = reader.get_clustering_column_infos(&engine)?.unwrap();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].logical_column, column_name!("label"));
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::iceberg_compat_v2(TableFeature::IcebergCompatV2, "icebergCompatV2 enabled")]
+    #[case::iceberg_compat_v3(TableFeature::IcebergCompatV3, "icebergCompatV3 enabled")]
+    #[case::column_defaults(TableFeature::AllowColumnDefaults, "allowColumnDefaults enabled")]
+    fn updated_schema_is_rejected_on_tables_kernel_cannot_evolve_yet(
+        #[case] feature: TableFeature,
+        #[case] expected: &str,
+    ) -> Result<()> {
+        let (engine, snapshot, _tempdir) = create_schema_validation_table(Some(&feature), true);
+        let error = snapshot
+            .clone()
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_updated_schema(snapshot.schema())
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Kernel(KernelError::Unsupported(_))),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains(&format!(
+                "Schema changes are not yet supported on tables with {expected}"
+            )),
+            "{error}"
+        );
+
+        let reloaded = Snapshot::builder_for(snapshot.table_root()).build(engine.as_ref())?;
+        assert_eq!(reloaded.version(), snapshot.version());
         Ok(())
     }
 
