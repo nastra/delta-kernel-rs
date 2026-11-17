@@ -285,19 +285,19 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// Replaces the table's clustering columns with `columns`, in order.
     ///
     /// Each column is a logical path, possibly nested, matched case-insensitively against the
-    /// schema that results from this transaction's schema and property changes. The commit records
-    /// the physical paths in the `delta.clustering` domain metadata. An empty list clears the
-    /// clustering columns but keeps the `clustering` table feature. On a table without clustering,
-    /// any call, including one with an empty list, adds the `clustering` and `domainMetadata`
-    /// features. Without this call, the transaction keeps the current clustering columns. Repeated
-    /// calls replace earlier ones.
+    /// schema that results from this transaction's schema changes. The commit records the physical
+    /// paths in the `delta.clustering` domain metadata. An empty list clears the clustering columns
+    /// but keeps the `clustering` table feature. On a table without clustering, any call, including
+    /// one with an empty list, adds the `clustering` and `domainMetadata` features. Without this
+    /// call, the transaction keeps the current clustering columns. Repeated calls replace earlier
+    /// ones.
     ///
     /// Changing clustering columns affects only how future writes cluster data; it does not
     /// rewrite existing files. It never adds or drops schema fields: every column must already
     /// exist in the resulting schema.
     ///
-    /// [`build`](Self::build) rejects partitioned tables, columns that do not resolve, duplicate
-    /// columns, and columns whose type does not support min/max statistics.
+    /// [`build`](Self::build) rejects partitioned tables, blind appends, columns that do not
+    /// resolve, duplicate columns, and columns whose type does not support min/max statistics.
     pub fn with_clustering_columns(mut self, columns: Vec<ColumnName>) -> Self {
         self.local_state.clustering_columns = Some(columns);
         self
@@ -336,7 +336,7 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     ///
     /// Returns an error for:
     /// - Invalid operation intent, including incompatible blind-append, schema, or property intent.
-    /// - Invalid clustering columns, or clustering columns on a partitioned table.
+    /// - Invalid clustering columns, or a clustering change on a partitioned table or blind append.
     /// - Unsupported table writes, schema evolution, property updates, or CDF validation failures.
     /// - Conflicting application ids or domain metadata, or reserved or unsupported domains.
     /// - Connector commit information that does not contain exactly one row.
@@ -390,6 +390,11 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         if self.local_state.is_blind_append && self.local_state.has_property_changes() {
             return Err(KernelError::invalid_transaction_state(
                 "blind append cannot include property changes",
+            ));
+        }
+        if self.local_state.is_blind_append && self.local_state.clustering_columns.is_some() {
+            return Err(KernelError::invalid_transaction_state(
+                "blind append cannot include clustering changes",
             ));
         }
         if let Some(columns) = &self.local_state.clustering_columns {
@@ -724,9 +729,7 @@ mod tests {
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    use crate::expressions::ColumnName;
-    use crate::expressions::column_name;
+    use crate::expressions::{ColumnName, column_name};
     use crate::object_store::memory::InMemory;
     use crate::schema::{DataType, StructField, schema_ref};
     use crate::snapshot::Snapshot;
@@ -1334,6 +1337,26 @@ mod tests {
             &error,
             Error::Kernel(KernelError::InvalidTransactionState(message))
             if message == "blind append cannot include property changes"
+        ));
+        Ok(())
+    }
+
+    #[rstest]
+    fn blind_append_rejects_clustering_changes(
+        #[values(vec![], vec![column_name!("value")])] columns: Vec<ColumnName>,
+    ) -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let error = snapshot
+            .update_table(UpdateTableOperation::Write, "test-engine", true)
+            .with_blind_append()
+            .with_clustering_columns(columns)
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            Error::Kernel(KernelError::InvalidTransactionState(message))
+            if message == "blind append cannot include clustering changes"
         ));
         Ok(())
     }
