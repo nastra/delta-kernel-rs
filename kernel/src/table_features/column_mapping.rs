@@ -693,7 +693,13 @@ fn flat_cm_info_for_nested_data_type(
 ///   "<phys>.value":       4
 /// }
 /// ```
-fn assign_nested_cm_ids(schema: &StructType, max_id: &mut i64) -> KernelResult<StructType> {
+///
+/// Ids already recorded for a slot are kept, as in Java's `ColumnMapping.maybeUpdateFieldId`, so
+/// enabling IcebergCompat on an existing table only assigns ids to slots that have none.
+pub(crate) fn assign_nested_cm_ids(
+    schema: &StructType,
+    max_id: &mut i64,
+) -> KernelResult<StructType> {
     fn walk(
         data_type: &DataType,
         max_id: &mut i64,
@@ -704,9 +710,7 @@ fn assign_nested_cm_ids(schema: &StructType, max_id: &mut i64) -> KernelResult<S
             DataType::Struct(inner) => Ok(DataType::from(assign_nested_cm_ids(inner, max_id)?)),
             DataType::Array(array_type) => {
                 let element_path = format!("{path}.element");
-                *max_id += 1;
-                nested_ids.insert(element_path.clone(), serde_json::Value::from(*max_id));
-                let slot_id = *max_id;
+                let slot_id = nested_slot_id(nested_ids, &element_path, max_id);
                 reserve_file_subfield_ids(array_type.element_type(), slot_id, max_id)?;
                 let new_element =
                     walk(array_type.element_type(), max_id, &element_path, nested_ids)?;
@@ -718,14 +722,10 @@ fn assign_nested_cm_ids(schema: &StructType, max_id: &mut i64) -> KernelResult<S
             DataType::Map(map_type) => {
                 let key_path = format!("{path}.key");
                 let value_path = format!("{path}.value");
-                *max_id += 1;
-                nested_ids.insert(key_path.clone(), serde_json::Value::from(*max_id));
-                let slot_id = *max_id;
+                let slot_id = nested_slot_id(nested_ids, &key_path, max_id);
                 reserve_file_subfield_ids(map_type.key_type(), slot_id, max_id)?;
                 let new_key = walk(map_type.key_type(), max_id, &key_path, nested_ids)?;
-                *max_id += 1;
-                nested_ids.insert(value_path.clone(), serde_json::Value::from(*max_id));
-                let slot_id = *max_id;
+                let slot_id = nested_slot_id(nested_ids, &value_path, max_id);
                 reserve_file_subfield_ids(map_type.value_type(), slot_id, max_id)?;
                 let new_value = walk(map_type.value_type(), max_id, &value_path, nested_ids)?;
                 Ok(DataType::from(MapType::new(
@@ -746,7 +746,13 @@ fn assign_nested_cm_ids(schema: &StructType, max_id: &mut i64) -> KernelResult<S
         .fields()
         .map(|field| {
             let physical = expect_physical_name(field)?;
-            let mut nested_ids = NestedFieldIds::new();
+            let mut nested_ids = match field
+                .metadata
+                .get(ColumnMetadataKey::ColumnMappingNestedIds.as_ref())
+            {
+                Some(MetadataValue::Other(serde_json::Value::Object(ids))) => ids.clone(),
+                _ => NestedFieldIds::new(),
+            };
             let new_dt = walk(&field.data_type, max_id, &physical, &mut nested_ids)?;
             let mut new_field = field.clone();
             new_field.data_type = new_dt;
@@ -757,6 +763,17 @@ fn assign_nested_cm_ids(schema: &StructType, max_id: &mut i64) -> KernelResult<S
         })
         .collect::<KernelResult<Vec<_>>>()?;
     StructType::try_new(new_fields)
+}
+
+/// Returns the id recorded for `path` in `nested_ids`, or records and returns the next id.
+fn nested_slot_id(nested_ids: &mut NestedFieldIds, path: &str, max_id: &mut i64) -> i64 {
+    if let Some(id) = nested_ids.get(path).and_then(serde_json::Value::as_i64) {
+        *max_id = (*max_id).max(id);
+        return id;
+    }
+    *max_id += 1;
+    nested_ids.insert(path.to_string(), serde_json::Value::from(*max_id));
+    *max_id
 }
 
 // Get the physical name for a field. Error if the field is missing the physical name annotation.
@@ -2832,5 +2849,35 @@ mod tests {
         );
         let schema = schema! { (field) };
         assert_eq!(find_max_column_id_in_schema(&schema), Some(99));
+    }
+
+    #[test]
+    fn assign_nested_cm_ids_keeps_recorded_slot_ids() {
+        let mut field = field_with_id(
+            "m",
+            MapType::new(DataType::INTEGER, DataType::INTEGER, false),
+            1,
+        );
+        field.metadata.insert(
+            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref().into(),
+            MetadataValue::String("m".to_string()),
+        );
+        field.metadata.insert(
+            ColumnMetadataKey::ColumnMappingNestedIds.as_ref().into(),
+            MetadataValue::Other(serde_json::json!({ "m.key": 7 })),
+        );
+        let mut max_id = 7;
+        let schema = assign_nested_cm_ids(&schema! { (field) }, &mut max_id).unwrap();
+        assert_eq!(
+            schema
+                .field("m")
+                .unwrap()
+                .get_config_value(&ColumnMetadataKey::ColumnMappingNestedIds),
+            Some(&MetadataValue::Other(serde_json::json!({
+                "m.key": 7,
+                "m.value": 8,
+            })))
+        );
+        assert_eq!(max_id, 8);
     }
 }

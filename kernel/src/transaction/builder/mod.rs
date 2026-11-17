@@ -7,6 +7,7 @@
 
 pub mod create_table;
 mod state;
+mod update_metadata;
 pub mod update_table;
 
 use std::marker::PhantomData;

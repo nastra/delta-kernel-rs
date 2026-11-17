@@ -207,13 +207,13 @@ fn ensure_table_does_not_exist(
 }
 
 /// Result of validating and transforming table properties.
-struct ValidatedTableProperties {
+pub(super) struct ValidatedTableProperties {
     /// Table properties with feature signals removed (to be stored in metadata)
-    properties: HashMap<String, String>,
+    pub(super) properties: HashMap<String, String>,
     /// Reader features extracted from feature signals (for ReaderWriter features)
-    reader_features: Vec<TableFeature>,
+    pub(super) reader_features: Vec<TableFeature>,
     /// Writer features extracted from feature signals (for all features)
-    writer_features: Vec<TableFeature>,
+    pub(super) writer_features: Vec<TableFeature>,
 }
 
 impl ValidatedTableProperties {
@@ -382,7 +382,10 @@ fn apply_data_layout(
 
 /// Conditionally adds the `variantType` feature to the protocol when the schema contains Variant
 /// columns anywhere in the schema tree (top-level, nested structs, arrays, maps).
-fn maybe_enable_variant_type(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
+pub(super) fn maybe_enable_variant_type(
+    schema: &SchemaRef,
+    validated: &mut ValidatedTableProperties,
+) {
     if schema_contains_variant_type(schema) {
         add_feature_to_lists(
             TableFeature::VariantType,
@@ -397,7 +400,10 @@ fn maybe_enable_variant_type(schema: &SchemaRef, validated: &mut ValidatedTableP
 ///
 /// The stable `fileType` feature is deliberately not written: the protocol change is still only
 /// proposed, and a stable feature name is permanent once it is in a table's protocol.
-fn maybe_enable_file_type_preview(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
+pub(super) fn maybe_enable_file_type_preview(
+    schema: &SchemaRef,
+    validated: &mut ValidatedTableProperties,
+) {
     if schema_contains_file_type(schema) {
         add_feature_to_lists(
             TableFeature::FileTypePreview,
@@ -409,7 +415,10 @@ fn maybe_enable_file_type_preview(schema: &SchemaRef, validated: &mut ValidatedT
 
 /// Conditionally adds the `timestampNtz` feature to the protocol when the schema contains
 /// TimestampNTZ columns anywhere in the schema tree (top-level, nested structs, arrays, maps).
-fn maybe_enable_timestamp_ntz(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
+pub(super) fn maybe_enable_timestamp_ntz(
+    schema: &SchemaRef,
+    validated: &mut ValidatedTableProperties,
+) {
     if schema_contains_timestamp_ntz(schema) {
         add_feature_to_lists(
             TableFeature::TimestampWithoutTimezone,
@@ -420,7 +429,10 @@ fn maybe_enable_timestamp_ntz(schema: &SchemaRef, validated: &mut ValidatedTable
 }
 
 /// Adds the stable collation feature for annotated schemas.
-fn maybe_enable_collations(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
+pub(super) fn maybe_enable_collations(
+    schema: &SchemaRef,
+    validated: &mut ValidatedTableProperties,
+) {
     if schema_has_collations(schema) {
         add_feature_to_lists(
             TableFeature::Collations,
