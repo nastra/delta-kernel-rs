@@ -505,11 +505,31 @@ mod tests {
             (DataType::file_type(), TableFeature::FileTypePreview)
         )]
         added: (DataType, TableFeature),
+        #[values("table-without-dv-small", "kernel_created")] table: &str,
+    ) {
+        assert_schema_change_derives_type_feature_and_retains_existing_features(added, table);
+    }
+
+    /// Legacy writer version 5 implies `checkConstraints`, which Kernel writes only with
+    /// `check-constraints-in-dev`.
+    #[cfg(feature = "check-constraints-in-dev")]
+    #[rstest]
+    fn schema_change_on_legacy_column_mapping_protocol_retains_existing_features(
         #[values(
-            "table-without-dv-small",
-            "cdf-column-mapping-name-mode",
-            "kernel_created"
+            (DataType::TIMESTAMP_NTZ, TableFeature::TimestampWithoutTimezone),
+            (DataType::unshredded_variant(), TableFeature::VariantType),
+            (DataType::file_type(), TableFeature::FileTypePreview)
         )]
+        added: (DataType, TableFeature),
+    ) {
+        assert_schema_change_derives_type_feature_and_retains_existing_features(
+            added,
+            "cdf-column-mapping-name-mode",
+        );
+    }
+
+    fn assert_schema_change_derives_type_feature_and_retains_existing_features(
+        added: (DataType, TableFeature),
         table: &str,
     ) {
         let (data_type, feature) = added;
