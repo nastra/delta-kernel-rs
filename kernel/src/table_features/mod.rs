@@ -488,9 +488,6 @@ static ICEBERG_COMPAT_V1_INFO: FeatureInfo = FeatureInfo {
 /// <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#writer-requirements-for-icebergcompatv2>
 /// for more requirements to support.
 ///
-/// TODO(#1125): Implement the schema-evolution requirements for IcebergCompatV2.
-/// TODO: Support ALTER TABLE on tables with IcebergCompatV2 enabled.
-///
 /// Requirements to enforce when the corresponding write paths are supported:
 /// - REPLACE TABLE: when supported, partition columns must not change across the replace.
 /// - Timestamp parquet encoding: if/when kernel can write INT96 or INT64, IcebergCompatV2 tables
@@ -517,9 +514,6 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
 /// IcebergCompatV3 ensures tables can be converted to Apache Iceberg V3.
 ///
 /// Spec: <https://github.com/delta-io/delta/blob/master/protocol_rfcs/iceberg-compat-v3.md>
-///
-/// TODO(#2492): Implement the schema-evolution requirements for IcebergCompatV3.
-/// TODO: Support ALTER TABLE on tables with IcebergCompatV3 enabled.
 ///
 /// Requirements to enforce when the corresponding write paths are supported:
 /// - Geo types: when supported, they must not be usable as partition columns on IcebergCompatV3
