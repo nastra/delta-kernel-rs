@@ -5,6 +5,9 @@
 //! features that the final schema requires, validates the transition from the read snapshot, and
 //! validates the final table configuration. It mirrors the update path of Delta Kernel Java's
 //! `TransactionMetadataFactory`.
+//!
+//! [`prepare_clustering_columns`] then resolves requested clustering columns against that final
+//! configuration and adds the `clustering` feature when the protocol lacks it.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -15,6 +18,8 @@ use super::create_table::{
     maybe_enable_timestamp_ntz, maybe_enable_variant_type,
 };
 use crate::actions::{Metadata, Protocol};
+use crate::clustering::resolve_physical_clustering_columns;
+use crate::expressions::ColumnName;
 use crate::schema::{ColumnMetadataKey, MetadataValue, SchemaRef, StructField, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
@@ -127,6 +132,69 @@ pub(super) fn prepare_update_table_metadata(
     Ok(PreparedUpdateTableMetadata {
         table_config,
         should_emit_protocol,
+    })
+}
+
+/// Table configuration and physical clustering columns that a clustering change commits.
+#[derive(Debug)]
+pub(super) struct PreparedClusteringColumns {
+    pub(super) table_config: TableConfiguration,
+    /// `true` if the protocol of `table_config` gained the `clustering` feature.
+    pub(super) added_clustering_feature: bool,
+    /// Physical paths to record in the `delta.clustering` domain, in request order.
+    pub(super) physical_columns: Vec<ColumnName>,
+}
+
+/// Resolves `logical_columns` against `table_config`, the final configuration of the update, and
+/// adds the `clustering` feature (and its `domainMetadata` dependency) if the protocol lacks it.
+///
+/// Columns resolve against the final schema and column mapping mode, so they may name fields added
+/// by schema changes in the same update and get the physical names that enabling column mapping
+/// assigns. An empty list clears the clustering columns and skips resolution. The feature is never
+/// removed. Mirrors Java's `TransactionMetadataFactory.performProtocolUpgrades` (with
+/// `clusteringRequired`) and `updateColumnMappingMetadataAndResolveClusteringColumns`.
+pub(super) fn prepare_clustering_columns(
+    table_config: TableConfiguration,
+    logical_columns: &[ColumnName],
+) -> Result<PreparedClusteringColumns> {
+    let physical_columns = if logical_columns.is_empty() {
+        Vec::new()
+    } else {
+        resolve_physical_clustering_columns(
+            table_config.logical_schema_ref(),
+            logical_columns,
+            table_config.column_mapping_mode(),
+        )?
+    };
+    if table_config.is_feature_supported(&TableFeature::ClusteredTable) {
+        return Ok(PreparedClusteringColumns {
+            table_config,
+            added_clustering_feature: false,
+            physical_columns,
+        });
+    }
+    let mut reader_features = Vec::new();
+    let mut writer_features = Vec::new();
+    add_feature_to_lists(
+        TableFeature::ClusteredTable,
+        &mut reader_features,
+        &mut writer_features,
+    );
+    ensure_domain_metadata_dependency(&mut reader_features, &mut writer_features);
+    reader_features.retain(|feature| !table_config.is_feature_supported(feature));
+    writer_features.retain(|feature| !table_config.is_feature_supported(feature));
+    let protocol = upgrade_protocol(&table_config, reader_features, writer_features)?;
+    let upgraded = TableConfiguration::try_new(
+        table_config.metadata().clone(),
+        protocol,
+        table_config.table_root().clone(),
+        table_config.version(),
+    )?;
+    upgraded.ensure_write_supported()?;
+    Ok(PreparedClusteringColumns {
+        table_config: upgraded,
+        added_clustering_feature: true,
+        physical_columns,
     })
 }
 
