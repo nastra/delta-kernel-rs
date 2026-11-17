@@ -10,7 +10,10 @@ use crate::schema::{DataType, StructField};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{TableFeature, find_max_column_id_in_schema};
-use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
+use crate::table_properties::{
+    COLUMN_MAPPING_MAX_COLUMN_ID, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
+    MATERIALIZED_ROW_ID_COLUMN_NAME,
+};
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
     minimal_checkpoint_action, setup_table, write_commit_after_manifest_commit,
     write_manifest_commit,
@@ -211,7 +214,12 @@ fn manifest_commit_after_schema_change_uses_evolved_schema(
         .expect("checkpoint fixture uses column mapping");
     checkpoint.metadata = checkpoint
         .metadata
-        .with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, max_column_id.to_string());
+        .with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, max_column_id.to_string())
+        .with_configuration_entry(MATERIALIZED_ROW_ID_COLUMN_NAME, "_row-id-col")
+        .with_configuration_entry(
+            MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
+            "_row-commit-version-col",
+        );
     write_manifest_commit(&engine, &table_root, 1, checkpoint)?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let initial_schema = snapshot.table_configuration().physical_schema();

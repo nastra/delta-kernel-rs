@@ -546,6 +546,14 @@ impl Metadata {
         self
     }
 
+    /// Returns a new Metadata with the configuration replaced, preserving all other fields.
+    pub(crate) fn with_configuration(self, configuration: HashMap<String, String>) -> Self {
+        Self {
+            configuration,
+            ..self
+        }
+    }
+
     /// Drops entries from `new_properties` that already match this metadata's configuration.
     ///
     /// A key is kept when it is absent from the current configuration or when its value differs.
