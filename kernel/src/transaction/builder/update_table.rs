@@ -302,8 +302,18 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// [`add_column`](Self::add_column), `build()` adds any table feature the new schema requires.
     /// The schema can be combined with property changes in the same transaction.
     ///
+    /// When `delta.enableTypeWidening` is `true`, the type of a field, array element, or map key
+    /// or value may also change to a wider type the Delta protocol supports, such as `integer` to
+    /// `long`. Kernel appends each change to the field's `delta.typeChanges` metadata, keeping the
+    /// existing history when the supplied field omits it. Tables that support `icebergCompatV1`
+    /// or `icebergCompatV2`, or enable `icebergCompatV3`, allow only the widenings Iceberg V2
+    /// supports. A partition column cannot widen from `date` to `timestamp_ntz`, change its
+    /// decimal scale, or widen from an integer to a decimal with a non-zero scale, because Kernel
+    /// cannot parse its existing partition values as the new type.
+    ///
     /// [`build`](Self::build) rejects the update if the table does not use column mapping, or if
-    /// the schema has no columns, tightens nullability, changes a field's type, moves a field to a
+    /// the schema has no columns, tightens nullability, makes any other type change or alters
+    /// `delta.typeChanges`, moves a field to a
     /// different parent struct, drops or renames a partition column or a column listed in the
     /// final `delta.dataSkippingStatsColumns`, drops a clustering column, renames a collated
     /// field, adds a non-nullable field (at any nesting depth), a field with a default value, a
