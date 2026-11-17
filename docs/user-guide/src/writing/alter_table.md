@@ -117,9 +117,10 @@ commit includes a Protocol action. For example, adding a `TIMESTAMP_NTZ` column 
 `fileType-preview` this way and keeps every feature the table already supports.
 
 > [!NOTE]
-> Kernel rejects schema changes at `build()` when `allowColumnDefaults` is enabled or when the
-> table has generated columns. This restriction applies to both workflows, regardless of the
-> transaction operation or `dataChange` value.
+> Kernel rejects schema changes at `build()` when the table has generated columns, and rejects
+> `add_column()`, `add_column_at()`, and `set_nullable()` when `allowColumnDefaults` is enabled.
+> These restrictions apply to both workflows, regardless of the transaction operation or
+> `dataChange` value.
 
 ## Chaining multiple operations
 
@@ -207,6 +208,11 @@ Renamed and reordered columns keep their physical names, so existing data files 
 correctly. When the table sets `delta.enableTypeWidening` to `true`, you can also widen a column's
 type, for example from `INTEGER` to `LONG`. Kernel records the change in the column's
 `delta.typeChanges` metadata, and readers convert values in existing files to the wider type.
+
+On a table that supports `allowColumnDefaults` and enables icebergCompatV3, you can also set,
+change, or remove the literal default of an existing column by editing its `CURRENT_DEFAULT`
+metadata. A new column cannot have a default. Both features must already be on the table: property
+updates cannot add `allowColumnDefaults` or set `delta.enableIcebergCompatV3`.
 
 You cannot combine `with_updated_schema()` with `add_column()` or `set_nullable()` in one
 transaction. For the supported changes and the rules `build()` enforces, see the
