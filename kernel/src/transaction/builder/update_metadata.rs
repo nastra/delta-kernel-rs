@@ -144,18 +144,29 @@ fn is_iceberg_compat_enabled(configuration: &HashMap<String, String>) -> bool {
         .any(|key| is_property_true(configuration, key))
 }
 
-/// Returns `true` if `table_config` supports `feature` or, for a stable feature with a preview
-/// predecessor, the preview feature. Adding the stable feature next to a supported preview feature
-/// could break clients that only understand the preview feature.
+/// Returns `true` if `table_config` supports `feature` or the other form of a feature that has
+/// both a preview and a stable form. Either form satisfies a derived feature: adding the stable
+/// form next to a supported preview could break clients that only understand the preview, and
+/// adding the preview next to a supported stable form would upgrade the protocol on every update,
+/// including property-only ones.
 fn is_already_supported(table_config: &TableConfiguration, feature: &TableFeature) -> bool {
-    let preview = match feature {
+    let other_form = match feature {
         TableFeature::VariantType => Some(TableFeature::VariantTypePreview),
+        TableFeature::VariantTypePreview => Some(TableFeature::VariantType),
+        TableFeature::VariantShredding => Some(TableFeature::VariantShreddingPreview),
+        TableFeature::VariantShreddingPreview => Some(TableFeature::VariantShredding),
         TableFeature::TypeWidening => Some(TableFeature::TypeWideningPreview),
+        TableFeature::TypeWideningPreview => Some(TableFeature::TypeWidening),
         TableFeature::Collations => Some(TableFeature::CollationsPreview),
+        TableFeature::CollationsPreview => Some(TableFeature::Collations),
+        TableFeature::FileType => Some(TableFeature::FileTypePreview),
+        TableFeature::FileTypePreview => Some(TableFeature::FileType),
+        TableFeature::CatalogManaged => Some(TableFeature::CatalogOwnedPreview),
+        TableFeature::CatalogOwnedPreview => Some(TableFeature::CatalogManaged),
         _ => None,
     };
     table_config.is_feature_supported(feature)
-        || preview.is_some_and(|preview| table_config.is_feature_supported(&preview))
+        || other_form.is_some_and(|other| table_config.is_feature_supported(&other))
 }
 
 /// Rejects configuration transitions that Kernel does not support on existing tables.
@@ -861,5 +872,71 @@ mod tests {
                 result.unwrap();
             }
         }
+    }
+
+    /// Returns a table with a `file` column whose protocol supports only the stable `fileType`
+    /// feature, as tables written by other engines may.
+    fn stable_file_type_table() -> TableConfiguration {
+        let schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("f", DataType::file_type()),
+        ]));
+        let created = create_test_table(schema, &[("app.owner", "kernel")]);
+        let to_stable = |features: &[TableFeature]| -> Vec<TableFeature> {
+            features
+                .iter()
+                .map(|feature| match feature {
+                    TableFeature::FileTypePreview => TableFeature::FileType,
+                    other => other.clone(),
+                })
+                .collect()
+        };
+        let protocol = created.protocol();
+        let protocol = Protocol::try_new_modern(
+            to_stable(protocol.reader_features().unwrap()),
+            to_stable(protocol.writer_features().unwrap()),
+        )
+        .unwrap();
+        let read_config = TableConfiguration::try_new(
+            created.metadata().clone(),
+            protocol,
+            created.table_root().clone(),
+            created.version(),
+        )
+        .unwrap();
+        assert!(read_config.is_feature_supported(&TableFeature::FileType));
+        assert!(!read_config.is_feature_supported(&TableFeature::FileTypePreview));
+        read_config
+    }
+
+    #[rstest]
+    #[case::property_added("property_added")]
+    #[case::property_removed("property_removed")]
+    #[case::string_column_added("string_column_added")]
+    #[case::file_column_added("file_column_added")]
+    fn update_on_stable_file_type_table_keeps_protocol(#[case] update: &str) {
+        let read_config = stable_file_type_table();
+        let prepared = match update {
+            "property_added" => {
+                let requested = with_configuration(&read_config, &[("app.key", Some("value"))]);
+                prepare_update_table_metadata(&read_config, requested, false)
+            }
+            "property_removed" => {
+                let requested = with_configuration(&read_config, &[("app.owner", None)]);
+                prepare_update_table_metadata(&read_config, requested, false)
+            }
+            "string_column_added" => add_column(
+                &read_config,
+                StructField::nullable("added", DataType::STRING),
+            ),
+            "file_column_added" => add_column(
+                &read_config,
+                StructField::nullable("added", DataType::file_type()),
+            ),
+            other => panic!("unexpected update {other}"),
+        }
+        .unwrap();
+        assert!(!prepared.should_emit_protocol);
+        assert_eq!(prepared.table_config.protocol(), read_config.protocol());
     }
 }
