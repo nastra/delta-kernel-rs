@@ -1091,8 +1091,11 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             .map_err(KernelError::invalid_transaction_state)?;
         match (self.is_create_table(), &self.operation) {
             (true, CommitOperation::CreateTable) => Ok(()),
+            // A clustering change is the only system domain an update writes, and it may commit
+            // without a Metadata action.
             (false, CommitOperation::UpdateTable(UpdateTableOperation::AlterTable))
-                if !self.should_emit_metadata =>
+                if !self.should_emit_metadata
+                    && self.system_domain_metadata_additions.is_empty() =>
             {
                 Err(KernelError::invalid_transaction_state(
                     "ALTER TABLE requires at least one table change",

@@ -1,5 +1,6 @@
 //! Reader-side protocol-feature integration tests.
 
+mod alter_clustering;
 mod alter_table;
 mod cdf;
 mod clustering_e2e;
