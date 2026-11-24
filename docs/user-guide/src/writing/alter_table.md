@@ -205,8 +205,18 @@ let result = snapshot
 ```
 
 Renamed and reordered columns keep their physical names, so existing data files still read
-correctly. You cannot combine `with_updated_schema()` with `add_column()` or `set_nullable()` in
-one transaction. For the supported changes and the rules `build()` enforces, see the
+correctly. When the table sets `delta.enableTypeWidening` to `true`, you can also widen a column's
+type, for example from `INTEGER` to `LONG`. Kernel records the change in the column's
+`delta.typeChanges` metadata, and readers convert values in existing files to the wider type.
+
+Kernel can't enable `delta.enableTypeWidening` on an existing table.
+`with_table_properties_added()` rejects it as a feature-enabling property, whether you set it in
+its own transaction or together with the schema update. To widen types, set the property when you
+create the table (see [Creating a Table](./create_table.md)), or enable it with another engine such
+as Delta Spark.
+
+You cannot combine `with_updated_schema()` with `add_column()` or `set_nullable()` in one
+transaction. For the supported changes and the rules `build()` enforces, see the
 [`with_updated_schema` rustdoc](https://docs.rs/delta_kernel/latest/delta_kernel/transaction/type.UpdateTableTransactionBuilder.html).
 
 ## Evolving a schema while writing
