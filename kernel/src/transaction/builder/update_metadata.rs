@@ -35,6 +35,8 @@ use crate::{KernelError, KernelResult, Result};
 
 /// Universal formats (UniForm) the table is converted to, as a comma-separated list.
 const UNIVERSAL_FORMAT_ENABLED_FORMATS: &str = "delta.universalFormat.enabledFormats";
+/// The values `delta.universalFormat.enabledFormats` may list.
+const UNIVERSAL_FORMATS: [&str; 2] = ["hudi", "iceberg"];
 
 /// Table configuration that an update to an existing table commits.
 #[derive(Debug)]
@@ -144,18 +146,29 @@ fn is_iceberg_compat_enabled(configuration: &HashMap<String, String>) -> bool {
         .any(|key| is_property_true(configuration, key))
 }
 
-/// Returns `true` if `table_config` supports `feature` or, for a stable feature with a preview
-/// predecessor, the preview feature. Adding the stable feature next to a supported preview feature
-/// could break clients that only understand the preview feature.
+/// Returns `true` if `table_config` supports `feature` or the other form of a feature that has
+/// both a preview and a stable form. Either form satisfies a derived feature: adding the stable
+/// form next to a supported preview could break clients that only understand the preview, and
+/// adding the preview next to a supported stable form would upgrade the protocol on every update,
+/// including property-only ones.
 fn is_already_supported(table_config: &TableConfiguration, feature: &TableFeature) -> bool {
-    let preview = match feature {
+    let other_form = match feature {
         TableFeature::VariantType => Some(TableFeature::VariantTypePreview),
+        TableFeature::VariantTypePreview => Some(TableFeature::VariantType),
+        TableFeature::VariantShredding => Some(TableFeature::VariantShreddingPreview),
+        TableFeature::VariantShreddingPreview => Some(TableFeature::VariantShredding),
         TableFeature::TypeWidening => Some(TableFeature::TypeWideningPreview),
+        TableFeature::TypeWideningPreview => Some(TableFeature::TypeWidening),
         TableFeature::Collations => Some(TableFeature::CollationsPreview),
+        TableFeature::CollationsPreview => Some(TableFeature::Collations),
+        TableFeature::FileType => Some(TableFeature::FileTypePreview),
+        TableFeature::FileTypePreview => Some(TableFeature::FileType),
+        TableFeature::CatalogManaged => Some(TableFeature::CatalogOwnedPreview),
+        TableFeature::CatalogOwnedPreview => Some(TableFeature::CatalogManaged),
         _ => None,
     };
     table_config.is_feature_supported(feature)
-        || preview.is_some_and(|preview| table_config.is_feature_supported(&preview))
+        || other_form.is_some_and(|other| table_config.is_feature_supported(&other))
 }
 
 /// Rejects configuration transitions that Kernel does not support on existing tables.
@@ -252,11 +265,23 @@ fn validate_iceberg_compat_v2_without_deletion_vectors(
 
 /// Requires exactly one of `icebergCompatV2` and `icebergCompatV3` to be enabled when
 /// `delta.universalFormat.enabledFormats` contains `iceberg`, and at most one whenever the property
-/// is set. Mirrors Java's `IcebergUniversalFormatMetadataValidatorAndUpdater.validate`.
+/// is set, and rejects values other than `iceberg` and `hudi`. Mirrors Java's
+/// `IcebergUniversalFormatMetadataValidatorAndUpdater.validate`.
 fn validate_universal_format(configuration: &HashMap<String, String>) -> KernelResult<()> {
     let Some(formats) = configuration.get(UNIVERSAL_FORMAT_ENABLED_FORMATS) else {
         return Ok(());
     };
+    // Java: `TableConfig.UNIVERSAL_FORMAT_ENABLED_FORMATS` accepts only these values.
+    if !formats.is_empty()
+        && formats
+            .split(',')
+            .any(|format| !UNIVERSAL_FORMATS.contains(&format.trim()))
+    {
+        return Err(KernelError::generic(format!(
+            "Invalid value for table property '{UNIVERSAL_FORMAT_ENABLED_FORMATS}': '{formats}'. \
+             Each value must be in the set: {UNIVERSAL_FORMATS:?}"
+        )));
+    }
     let iceberg_enabled = formats.split(',').any(|format| format.trim() == "iceberg");
     let compat_keys = [ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3];
     let enabled_compat_count = compat_keys
@@ -302,10 +327,19 @@ fn validate_row_tracking_column_names(table_config: &TableConfiguration) -> Kern
             }
             continue;
         };
-        if schema
-            .fields()
-            .any(|field| field.name() == name || field.physical_name(column_mapping_mode) == name)
-        {
+        // Java's `ColumnMapping.getPhysicalName` reads a physical-name annotation whenever it is
+        // present, including one left over on a table with column mapping disabled.
+        let conflicts = |field: &StructField| {
+            let annotated =
+                match field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
+                    Some(MetadataValue::String(physical_name)) => Some(physical_name),
+                    _ => None,
+                };
+            field.name() == name
+                || field.physical_name(column_mapping_mode) == name
+                || annotated == Some(name)
+        };
+        if schema.fields().any(conflicts) {
             return Err(KernelError::generic(format!(
                 "Cannot use column name '{name}' because it is reserved for internal use"
             )));
@@ -359,22 +393,27 @@ fn assign_column_mapping_to_existing_fields(
 }
 
 /// Assigns `delta.columnMapping.nested.ids` to the array and map slots of a column-mapped `schema`
-/// that have none, as Java's `ColumnMapping.rewriteFieldIdsForIceberg` does, and records the new
-/// `delta.columnMapping.maxColumnId` in `configuration` when ids are assigned. Returns `schema`
-/// itself when every slot already has an id.
+/// that have none, as Java's `ColumnMapping.rewriteFieldIdsForIceberg` does. Records the new
+/// `delta.columnMapping.maxColumnId` in `configuration` when ids are assigned or when the
+/// configured value is lower than the largest id in `schema`, as Java's
+/// `ColumnMapping.assignColumnIdAndPhysicalName` does. Returns `schema` itself when every slot
+/// already has an id.
 fn assign_iceberg_compat_nested_ids(
     schema: &SchemaRef,
     configuration: &mut HashMap<String, String>,
 ) -> KernelResult<SchemaRef> {
-    let mut max_id = TableProperties::from(configuration.iter())
-        .column_mapping_max_column_id
+    let configured_max_id =
+        TableProperties::from(configuration.iter()).column_mapping_max_column_id;
+    let mut max_id = configured_max_id
         .unwrap_or(0)
         .max(find_max_column_id_in_schema(schema).unwrap_or(0));
     let with_nested_ids = assign_nested_cm_ids(schema, &mut max_id)?;
+    if configured_max_id != Some(max_id) {
+        configuration.insert(COLUMN_MAPPING_MAX_COLUMN_ID.to_string(), max_id.to_string());
+    }
     if &with_nested_ids == schema.as_ref() {
         return Ok(schema.clone());
     }
-    configuration.insert(COLUMN_MAPPING_MAX_COLUMN_ID.to_string(), max_id.to_string());
     Ok(Arc::new(with_nested_ids))
 }
 
@@ -861,5 +900,277 @@ mod tests {
                 result.unwrap();
             }
         }
+    }
+
+    /// Returns a table with a `file` column whose protocol supports only the stable `fileType`
+    /// feature, as tables written by other engines may.
+    fn stable_file_type_table() -> TableConfiguration {
+        let schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("f", DataType::file_type()),
+        ]));
+        let created = create_test_table(schema, &[("app.owner", "kernel")]);
+        let to_stable = |features: &[TableFeature]| -> Vec<TableFeature> {
+            features
+                .iter()
+                .map(|feature| match feature {
+                    TableFeature::FileTypePreview => TableFeature::FileType,
+                    other => other.clone(),
+                })
+                .collect()
+        };
+        let protocol = created.protocol();
+        let protocol = Protocol::try_new_modern(
+            to_stable(protocol.reader_features().unwrap()),
+            to_stable(protocol.writer_features().unwrap()),
+        )
+        .unwrap();
+        let read_config = TableConfiguration::try_new(
+            created.metadata().clone(),
+            protocol,
+            created.table_root().clone(),
+            created.version(),
+        )
+        .unwrap();
+        assert!(read_config.is_feature_supported(&TableFeature::FileType));
+        assert!(!read_config.is_feature_supported(&TableFeature::FileTypePreview));
+        read_config
+    }
+
+    #[rstest]
+    #[case::property_added("property_added")]
+    #[case::property_removed("property_removed")]
+    #[case::string_column_added("string_column_added")]
+    #[case::file_column_added("file_column_added")]
+    fn update_on_stable_file_type_table_keeps_protocol(#[case] update: &str) {
+        let read_config = stable_file_type_table();
+        let prepared = match update {
+            "property_added" => {
+                let requested = with_configuration(&read_config, &[("app.key", Some("value"))]);
+                prepare_update_table_metadata(&read_config, requested, false)
+            }
+            "property_removed" => {
+                let requested = with_configuration(&read_config, &[("app.owner", None)]);
+                prepare_update_table_metadata(&read_config, requested, false)
+            }
+            "string_column_added" => add_column(
+                &read_config,
+                StructField::nullable("added", DataType::STRING),
+            ),
+            "file_column_added" => add_column(
+                &read_config,
+                StructField::nullable("added", DataType::file_type()),
+            ),
+            other => panic!("unexpected update {other}"),
+        }
+        .unwrap();
+        assert!(!prepared.should_emit_protocol);
+        assert_eq!(prepared.table_config.protocol(), read_config.protocol());
+    }
+
+    #[test]
+    fn iceberg_compat_update_rewrites_stale_max_column_id() {
+        let created = iceberg_compat_v2_table();
+        let max_id = created
+            .table_properties()
+            .column_mapping_max_column_id
+            .unwrap();
+        let stale = with_configuration(&created, &[(COLUMN_MAPPING_MAX_COLUMN_ID, Some("1"))]);
+        let read_config = TableConfiguration::try_new(
+            stale,
+            created.protocol().clone(),
+            created.table_root().clone(),
+            created.version(),
+        )
+        .unwrap();
+
+        let requested = with_configuration(&read_config, &[("app.key", Some("value"))]);
+        let prepared = prepare_update_table_metadata(&read_config, requested, false).unwrap();
+
+        assert_eq!(
+            prepared.table_config.logical_schema(),
+            read_config.logical_schema()
+        );
+        assert_eq!(
+            prepared
+                .table_config
+                .table_properties()
+                .column_mapping_max_column_id,
+            Some(max_id)
+        );
+    }
+
+    #[rstest]
+    #[case::iceberg_with_one_compat_version(&[("iceberg", ""), (ENABLE_ICEBERG_COMPAT_V2, "true")], None)]
+    #[case::hudi(&[("hudi", "")], None)]
+    #[case::empty(&[("", "")], None)]
+    #[case::unknown_format(
+        &[("iceberg,delta", ""), (ENABLE_ICEBERG_COMPAT_V2, "true")],
+        Some("Each value must be in the set: [\"hudi\", \"iceberg\"]")
+    )]
+    #[case::both_compat_versions(
+        &[("iceberg", ""), (ENABLE_ICEBERG_COMPAT_V2, "true"), (ENABLE_ICEBERG_COMPAT_V3, "true")],
+        Some("'delta.enableIcebergCompatV2' and 'delta.enableIcebergCompatV3' cannot be enabled at \
+              the same time")
+    )]
+    #[case::both_compat_versions_without_iceberg(
+        &[("hudi", ""), (ENABLE_ICEBERG_COMPAT_V2, "true"), (ENABLE_ICEBERG_COMPAT_V3, "true")],
+        Some("cannot be enabled at the same time")
+    )]
+    fn validate_universal_format_checks_formats_and_compat_versions(
+        #[case] entries: &[(&str, &str)],
+        #[case] expected_error: Option<&str>,
+    ) {
+        // The first entry is the `delta.universalFormat.enabledFormats` value; the rest are
+        // properties.
+        let (formats, _) = entries[0];
+        let mut configuration: HashMap<String, String> = entries[1..]
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        configuration.insert(
+            UNIVERSAL_FORMAT_ENABLED_FORMATS.to_string(),
+            formats.to_string(),
+        );
+        let result = validate_universal_format(&configuration).map_err(crate::Error::from);
+        match expected_error {
+            Some(expected) => assert_error_contains(result, expected),
+            None => result.unwrap(),
+        }
+    }
+
+    #[test]
+    fn enabling_column_mapping_on_legacy_protocol_moves_to_table_features() {
+        let (_engine, snapshot, _tempdir) = load_test_table("table-without-dv-small").unwrap();
+        let read_config = snapshot.table_configuration().clone();
+        assert_eq!(read_config.protocol().min_reader_version(), 1);
+        assert_eq!(read_config.protocol().min_writer_version(), 2);
+        let requested = with_configuration(&read_config, &[(COLUMN_MAPPING_MODE, Some("name"))]);
+
+        let prepared = prepare_update_table_metadata(&read_config, requested, false).unwrap();
+
+        assert!(prepared.should_emit_protocol);
+        let protocol = prepared.table_config.protocol();
+        assert_eq!(
+            protocol.min_reader_version(),
+            TABLE_FEATURES_MIN_READER_VERSION
+        );
+        assert_eq!(
+            protocol.min_writer_version(),
+            TABLE_FEATURES_MIN_WRITER_VERSION
+        );
+        assert_eq!(
+            protocol.reader_features(),
+            Some([TableFeature::ColumnMapping].as_slice())
+        );
+        let mut writer_features = protocol.writer_features().unwrap().to_vec();
+        writer_features.sort_by_key(|feature| feature.to_string());
+        assert_eq!(
+            writer_features,
+            [
+                TableFeature::AppendOnly,
+                TableFeature::ColumnMapping,
+                TableFeature::Invariants
+            ]
+        );
+        assert_eq!(
+            prepared.table_config.column_mapping_mode(),
+            ColumnMappingMode::Name
+        );
+    }
+
+    #[test]
+    fn schema_change_never_derives_allow_column_defaults() {
+        let read_config = create_test_table(test_schema_flat(), &[]);
+        let with_default = StructField::nullable("added", DataType::STRING).with_metadata([(
+            ColumnMetadataKey::CurrentDefault.as_ref(),
+            MetadataValue::String("'x'".to_string()),
+        )]);
+        let schema = StructType::try_new(
+            read_config
+                .logical_schema()
+                .fields()
+                .cloned()
+                .chain([with_default]),
+        )
+        .unwrap();
+        let requested = read_config
+            .metadata()
+            .clone()
+            .with_schema(Arc::new(schema))
+            .unwrap();
+
+        let prepared = prepare_update_table_metadata(&read_config, requested, true).unwrap();
+
+        assert!(
+            !prepared
+                .table_config
+                .is_feature_supported(&TableFeature::AllowColumnDefaults)
+        );
+        assert!(!prepared.should_emit_protocol);
+    }
+
+    #[test]
+    fn iceberg_compat_v2_with_deletion_vectors_only_in_read_protocol_is_rejected() {
+        let final_config = iceberg_compat_v2_table();
+        let protocol = final_config.protocol();
+        let mut reader_features = protocol.reader_features().unwrap().to_vec();
+        reader_features.push(TableFeature::DeletionVectors);
+        let mut writer_features = protocol.writer_features().unwrap().to_vec();
+        writer_features.push(TableFeature::DeletionVectors);
+        let read_config = TableConfiguration::try_new(
+            final_config.metadata().clone(),
+            Protocol::try_new_modern(reader_features, writer_features).unwrap(),
+            final_config.table_root().clone(),
+            final_config.version(),
+        )
+        .unwrap();
+        assert!(!final_config.is_feature_supported(&TableFeature::DeletionVectors));
+        let result =
+            validate_iceberg_compat_v2_without_deletion_vectors(&read_config, &final_config)
+                .map_err(crate::Error::from);
+        assert_error_contains(
+            result,
+            "Table features [deletionVectors] are incompatible with icebergCompatV2",
+        );
+    }
+
+    #[test]
+    fn leftover_physical_name_conflicting_with_row_tracking_column_is_rejected() {
+        let created = create_test_table(test_schema_flat(), &[(ENABLE_ROW_TRACKING, "true")]);
+        assert_eq!(created.column_mapping_mode(), ColumnMappingMode::None);
+        let name = created
+            .metadata()
+            .configuration()
+            .get(MATERIALIZED_ROW_ID_COLUMN_NAME)
+            .unwrap()
+            .clone();
+        let schema = StructType::try_new(created.logical_schema().fields().map(|field| {
+            let mut field = field.clone();
+            if field.name() == "id" {
+                field.metadata.insert(
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref().into(),
+                    MetadataValue::String(name.clone()),
+                );
+            }
+            field
+        }))
+        .unwrap();
+        let read_config = TableConfiguration::try_new(
+            created
+                .metadata()
+                .clone()
+                .with_schema(Arc::new(schema))
+                .unwrap(),
+            created.protocol().clone(),
+            created.table_root().clone(),
+            created.version(),
+        )
+        .unwrap();
+        let requested = with_configuration(&read_config, &[("app.key", Some("value"))]);
+        assert_error_contains(
+            prepare_update_table_metadata(&read_config, requested, false),
+            "is reserved for internal use",
+        );
     }
 }
