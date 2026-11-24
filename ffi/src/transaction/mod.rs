@@ -3670,7 +3670,7 @@ mod tests {
         let builder = ok_or_panic(unsafe {
             update_table_txn_builder_with_table_properties_removed(
                 builder,
-                &keys,
+                keys,
                 engine.shallow_copy(),
             )
         });
