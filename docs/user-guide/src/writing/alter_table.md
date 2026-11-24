@@ -12,6 +12,7 @@ Before reading this page, make sure you understand
 
 Use **ALTER TABLE** for a standalone, metadata-only change. For example, you can add a nullable
 column or set table properties without writing or removing data files.
+`UpdateTableOperation::AlterTable` records `ALTER TABLE` as the operation.
 
 Use **SCHEMA EVOLUTION** to change the schema while writing or rewriting data files in the same
 transaction. For example, you can add a nullable column and append rows containing values for that
@@ -148,8 +149,8 @@ Ordinary application properties (keys that do not start with `delta.`) are store
 original casing. Recognized config-only `delta.*` keys, such as `delta.checkpointInterval`,
 `delta.logRetentionDuration`, `delta.setTransactionRetentionDuration`, or
 `delta.parquet.format.version`, are matched case-insensitively, rewritten to their canonical form,
-and value-validated. Repeated calls merge. Two case-variant spellings of one `delta.*` key in the
-same call are rejected.
+and value-validated. Repeated calls merge. Two entries for the same `delta.*` key in one call
+(including exact duplicates and case variants) are rejected.
 
 Feature-enabling properties (for example `delta.enableChangeDataFeed`), `delta.feature.*` signals,
 unknown `delta.*` keys, and CHECK constraints are rejected. Setting properties does not change the
@@ -208,6 +209,12 @@ Renamed and reordered columns keep their physical names, so existing data files 
 correctly. When the table sets `delta.enableTypeWidening` to `true`, you can also widen a column's
 type, for example from `INTEGER` to `LONG`. Kernel records the change in the column's
 `delta.typeChanges` metadata, and readers convert values in existing files to the wider type.
+
+Kernel can't enable `delta.enableTypeWidening` on an existing table.
+`with_table_properties_added()` rejects it as a feature-enabling property, whether you set it in
+its own transaction or together with the schema update. To widen types, set the property when you
+create the table (see [Creating a Table](./create_table.md)), or enable it with another engine such
+as Delta Spark.
 
 On a table that supports `allowColumnDefaults` and enables icebergCompatV3, you can also set,
 change, or remove the literal default of an existing column by editing its `CURRENT_DEFAULT`

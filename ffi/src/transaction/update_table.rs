@@ -403,7 +403,8 @@ pub unsafe extern "C" fn update_table_txn_builder_with_table_properties_added(
     unsafe { result.into_extern_result(&engine) }
 }
 
-/// Replaces requested table-property removals with a borrowed string array.
+/// Adds requested table-property removals from a borrowed string array. Repeated calls accumulate
+/// keys.
 ///
 /// Copies keys before returning a replacement builder, or a decoding error. Build rejects Delta
 /// property removals and overlap with additions. An absent ordinary key is a successful no-op.
@@ -415,7 +416,7 @@ pub unsafe extern "C" fn update_table_txn_builder_with_table_properties_added(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_builder_with_table_properties_removed(
     builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
-    keys: &FfiStringArray,
+    keys: FfiStringArray,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
     let builder = unsafe { *builder.into_inner() };
