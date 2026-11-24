@@ -6,6 +6,8 @@ use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 
+use crate::KernelResult;
+use crate::actions::Metadata;
 use crate::error::KernelError;
 use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
@@ -19,7 +21,6 @@ use crate::table_features::{
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
 use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::FoldWithOption as _;
-use crate::{KernelResult, Result};
 
 /// A schema evolution operation to be applied to a table.
 ///
@@ -199,7 +200,7 @@ pub(crate) fn apply_schema_operations(
                     // <https://github.com/delta-io/delta-kernel-rs/issues/2492>
                     try_assign_flat_column_mapping_info(&field, id)?
                 } else {
-                    // `evolve_table_config` strips column-mapping annotations introduced into a
+                    // `evolve_metadata` strips column-mapping annotations introduced into a
                     // mapping-disabled table whose original schema had none. Existing residual
                     // annotations are preserved.
                     field
@@ -249,16 +250,19 @@ pub(crate) fn apply_schema_operations(
     })
 }
 
-/// Applies schema changes and validates the resulting table configuration.
+/// Applies schema changes and returns the evolved metadata and logical schema.
+///
+/// The result is not validated against the table protocol; callers derive any required protocol
+/// features and validate the final table configuration.
 ///
 /// # Errors
 ///
-/// Returns an error when an operation is invalid, the evolved schema violates Delta schema
-/// rules, or the evolved metadata is incompatible with the table protocol.
-pub(crate) fn evolve_table_config(
+/// Returns an error when an operation is invalid or the evolved schema violates Delta schema
+/// rules.
+pub(crate) fn evolve_metadata(
     table_config: &TableConfiguration,
     operations: Vec<SchemaOperation>,
-) -> Result<TableConfiguration> {
+) -> KernelResult<(Metadata, SchemaRef)> {
     let schema = Arc::unwrap_or_clone(table_config.logical_schema());
     let column_mapping_mode = table_config.column_mapping_mode();
     let current_max_column_id = table_config.table_properties().column_mapping_max_column_id;
@@ -297,8 +301,7 @@ pub(crate) fn evolve_table_config(
             evolved_metadata.with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, id.to_string())
         });
 
-    // Validates the evolved metadata against the protocol.
-    TableConfiguration::try_new_with_schema(table_config, evolved_metadata, evolved_schema)
+    Ok((evolved_metadata, evolved_schema))
 }
 
 #[cfg(test)]

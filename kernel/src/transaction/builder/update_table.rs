@@ -7,6 +7,8 @@ use delta_kernel_derive::internal_api;
 
 use super::TransactionBuilder;
 use super::state::TransactionBuilderState;
+use super::update_metadata::prepare_update_table_metadata;
+use crate::actions::Metadata;
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::schema::StructField;
@@ -20,7 +22,7 @@ use crate::table_properties::{
     DELTA_PROPERTY_PREFIX, is_delta_property_key, validate_and_normalize_property_for_update,
 };
 use crate::transaction::domain_metadata::validate_unique_domains;
-use crate::transaction::schema_evolution::{SchemaOperation, evolve_table_config};
+use crate::transaction::schema_evolution::{SchemaOperation, evolve_metadata};
 use crate::transaction::{
     ExecutionMode, Imperative, Transaction, UpdateTable, UpdateTableOperation,
 };
@@ -49,6 +51,10 @@ use crate::{Engine, Error, KernelError, KernelResult, Result};
 /// In both workflows, configure schema operations and property updates before `build()`, which
 /// validates and applies them. For schema evolution, stage data-file changes on the returned
 /// [`Transaction`], using the evolved schema provided by [`Transaction::write_state`].
+///
+/// When the evolved schema needs a table feature that the protocol lacks, such as `timestampNtz`
+/// for a `TIMESTAMP_NTZ` column, `build()` adds the feature and the transaction also commits a
+/// Protocol action. Every feature the table already supports is kept.
 ///
 /// Set `data_change` when constructing the builder: `true` for logical data changes, or `false`
 /// for metadata-only changes and data-preserving rewrites. `ALTER TABLE` requires `false` and at
@@ -421,9 +427,7 @@ fn try_new_update_table<MODE: ExecutionMode>(
     // did not support generated columns, so a protocol upgrade cannot activate previously ignored
     // formulas.
 
-    // TODO(#3240): Validate that delta.enableRowTracking=true has the required protocol support
-    // and materialized column-name properties. Materialized names must be distinct and must not
-    // collide with physical data columns.
+    // TODO(#3240): Validate that the two materialized row-tracking column names are distinct.
 
     // Read clustering columns from snapshot (returns None if clustering not enabled)
     let clustering_columns = read_snapshot
@@ -454,9 +458,9 @@ fn try_new_update_table<MODE: ExecutionMode>(
 
     let is_alter = operation == UpdateTableOperation::AlterTable;
     let has_schema_changes = schema_changes.is_some();
-    let effective_table_config = match schema_changes {
-        Some(changes) => apply_schema_changes(effective_table_config, changes)?,
-        None => effective_table_config,
+    let metadata = match schema_changes {
+        Some(changes) => apply_schema_changes(&effective_table_config, changes)?,
+        None => effective_table_config.metadata().clone(),
     };
     let properties_added = if properties_added.is_empty() {
         HashMap::new()
@@ -488,15 +492,23 @@ fn try_new_update_table<MODE: ExecutionMode>(
     };
     let has_property_removes = !properties_removed.is_empty();
     let should_emit_metadata = has_schema_changes || has_property_adds || has_property_removes;
-    let effective_table_config = if has_property_adds || has_property_removes {
-        apply_table_property_changes(effective_table_config, properties_added, properties_removed)?
+    let metadata = if has_property_adds || has_property_removes {
+        apply_table_property_changes(metadata, properties_added, properties_removed)
     } else {
-        effective_table_config
+        metadata
+    };
+    let (effective_table_config, should_emit_protocol) = if should_emit_metadata {
+        let prepared =
+            prepare_update_table_metadata(&effective_table_config, metadata, has_schema_changes)?;
+        (prepared.table_config, prepared.should_emit_protocol)
+    } else {
+        (effective_table_config, false)
     };
 
     Ok(Transaction {
         read_snapshot_opt: Some(read_snapshot),
         should_emit_metadata,
+        should_emit_protocol,
         user_domain_removals: domain_metadata_removals,
         is_blind_append,
         physical_clustering_columns: clustering_columns,
@@ -511,10 +523,13 @@ fn try_new_update_table<MODE: ExecutionMode>(
     })
 }
 
+/// Applies `changes` to the schema of `table_config` and returns the evolved metadata. The result
+/// is validated by [`prepare_update_table_metadata`], which first derives the protocol features the
+/// evolved schema requires.
 fn apply_schema_changes(
-    table_config: TableConfiguration,
+    table_config: &TableConfiguration,
     changes: Vec<SchemaOperation>,
-) -> Result<TableConfiguration> {
+) -> Result<Metadata> {
     let unsupported_iceberg_compat = [TableFeature::IcebergCompatV2, TableFeature::IcebergCompatV3]
         .into_iter()
         .find(|feature| table_config.is_feature_enabled(feature));
@@ -536,7 +551,8 @@ fn apply_schema_changes(
         )
         .into());
     }
-    evolve_table_config(&table_config, changes)
+    let (metadata, _schema) = evolve_metadata(table_config, changes)?;
+    Ok(metadata)
 }
 
 /// Drops entries from `new_properties` that already match `current` exactly.
@@ -572,21 +588,20 @@ fn filter_absent_property_removals(
 /// Callers must validate/canonicalize adds and filter no-ops first. Adds and removes must not
 /// overlap.
 fn apply_table_property_changes(
-    table_config: TableConfiguration,
+    metadata: Metadata,
     properties_added: HashMap<String, String>,
     properties_removed: HashSet<String>,
-) -> Result<TableConfiguration> {
+) -> Metadata {
     let metadata = properties_added
         .into_iter()
-        .fold(table_config.metadata().clone(), |metadata, (key, value)| {
+        .fold(metadata, |metadata, (key, value)| {
             metadata.with_configuration_entry(key, value)
         });
-    let metadata = if properties_removed.is_empty() {
+    if properties_removed.is_empty() {
         metadata
     } else {
         metadata.with_configuration_keys_unset(properties_removed)
-    };
-    TableConfiguration::try_new_with_schema(&table_config, metadata, table_config.logical_schema())
+    }
 }
 
 fn validate_and_canonicalize_properties_added(
@@ -1066,6 +1081,38 @@ mod tests {
                 .contains("Conflicting spellings of table property"),
             "error={error}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn final_configuration_violation_is_rejected_at_build_and_commits_nothing() -> Result<()> {
+        let engine = Arc::new(SyncEngine::in_memory());
+        let snapshot = create_table("memory:///", test_schema_flat(), "test-engine", true)
+            .with_table_properties([("delta.enableRowTracking", "true")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+        let reserved_name = snapshot
+            .table_configuration()
+            .metadata()
+            .configuration()
+            .get("delta.rowTracking.materializedRowIdColumnName")
+            .unwrap()
+            .clone();
+
+        let error = snapshot
+            .clone()
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .add_column(StructField::nullable(reserved_name, DataType::LONG))
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("is reserved for internal use"),
+            "{error}"
+        );
+        let reloaded = Snapshot::builder_for("memory:///").build(engine.as_ref())?;
+        assert_eq!(reloaded.version(), snapshot.version());
         Ok(())
     }
 
