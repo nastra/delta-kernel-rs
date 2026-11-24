@@ -2629,3 +2629,46 @@ async fn updated_schema_requires_iceberg_compat_v3_with_allow_column_defaults(
     );
     Ok(())
 }
+
+/// Neither feature that column defaults need can be enabled in the same request as the defaults:
+/// property updates reject feature signals and `delta.enableIcebergCompatV3`.
+#[rstest]
+#[case::allow_column_defaults_signal(
+    false,
+    ("delta.feature.allowColumnDefaults", "supported"),
+    "Protocol changes via 'delta.feature.allowColumnDefaults'"
+)]
+#[case::iceberg_compat_v3(
+    true,
+    ("delta.enableIcebergCompatV3", "true"),
+    "Cannot modify the table property 'delta.enableIcebergCompatV3'"
+)]
+#[tokio::test]
+async fn updated_schema_rejects_enabling_default_features_in_the_same_request(
+    #[case] has_allow_column_defaults: bool,
+    #[case] property: (&str, &str),
+    #[case] expected: &str,
+) -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = if has_allow_column_defaults {
+        create_column_defaults_table(&table_path, engine.as_ref(), false)?
+    } else {
+        create(
+            &table_path,
+            engine.as_ref(),
+            defaults_schema(),
+            &iceberg_compat_properties("icebergCompatV3"),
+            None,
+        )?
+    };
+    let updated = with_name_and_zip_defaults(&snapshot.schema(), Some("'x'"), None);
+    let result = snapshot
+        .clone()
+        .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+        .with_updated_schema(Arc::new(updated))
+        .with_table_properties_added([property])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+    assert_result_error_with_message(result, expected);
+    assert_nothing_committed(&snapshot, engine.as_ref());
+    Ok(())
+}
