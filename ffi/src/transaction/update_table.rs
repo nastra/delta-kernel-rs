@@ -357,6 +357,30 @@ pub unsafe extern "C" fn update_table_txn_builder_set_nullable(
     unsafe { result.into_extern_result(&engine) }
 }
 
+/// Replaces the table schema with `schema`, the complete desired schema.
+///
+/// Fields are identified by column-mapping ID, so retained fields must carry the column-mapping
+/// metadata from the snapshot schema; fields without it are new. See
+/// `UpdateTableTransactionBuilder::with_updated_schema` for the supported changes. Build rejects
+/// combining this with add-column or set-nullable changes.
+///
+/// # Safety
+///
+/// All handles and `schema` must be valid. This call borrows `engine` and `schema` and
+/// unconditionally consumes `builder`, including on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn update_table_txn_builder_with_updated_schema(
+    builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
+    schema: &EngineSchema,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
+    let builder = unsafe { *builder.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    let result = decode_engine_schema(schema)
+        .map(|schema| Box::new(builder.with_updated_schema(Arc::new(schema))).into());
+    unsafe { result.into_extern_result(&engine) }
+}
+
 /// Adds or updates requested table properties from a borrowed string map. Repeated calls merge.
 ///
 /// Copies keys and values before returning a replacement builder. Returns decoding errors here;
