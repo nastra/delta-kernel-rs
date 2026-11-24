@@ -313,6 +313,12 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// decimal scale, or widen from an integer to a decimal with a non-zero scale, because Kernel
     /// cannot parse its existing partition values as the new type.
     ///
+    /// Kernel cannot enable type widening on an existing table:
+    /// [`with_table_properties_added`](Self::with_table_properties_added) rejects
+    /// `delta.enableTypeWidening` as a feature-enabling property, including in the same
+    /// transaction as the schema update. Set it at
+    /// [`create_table`](crate::transaction::create_table::create_table) or with another engine.
+    ///
     /// [`build`](Self::build) rejects the update if the table does not use column mapping, or if
     /// the schema has no columns, tightens nullability, makes any other type change or alters
     /// `delta.typeChanges`, moves a field to a
