@@ -30,15 +30,17 @@ use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::{FoldWithOption as _, require};
 use crate::{KernelError, KernelResult};
 
+mod column_defaults;
 mod type_widening;
 
 /// Replaces the table schema with `schema` and returns the evolved metadata and logical schema.
 ///
 /// Supported changes are nullable field additions, drops, renames, reordering within a struct,
-/// non-protocol metadata changes such as comments, nullability relaxation, and type widening (see
-/// [`type_widening::apply_type_changes`]). Existing fields
-/// keep their column-mapping IDs and physical names; new fields get fresh ones and advance
-/// `delta.columnMapping.maxColumnId`, which never decreases.
+/// non-protocol metadata changes such as comments, nullability relaxation, type widening (see
+/// [`type_widening::apply_type_changes`]), and literal default changes on existing fields (see
+/// [`column_defaults::validate_column_defaults`]). Existing fields keep their column-mapping IDs
+/// and physical names; new fields get fresh ones and advance `delta.columnMapping.maxColumnId`,
+/// which never decreases.
 ///
 /// The result is not validated against the table protocol; callers derive any required protocol
 /// features and validate the final table configuration.
@@ -98,6 +100,10 @@ pub(crate) fn evolve_metadata_to_schema(
         );
         StructType::ensure_no_metadata_columns_in_field(field)?;
     }
+    // Like Java's `validateUpdatedSchemaAndGetUpdatedSchema`, validate the defaults before the
+    // schema diff. An update cannot request `allowColumnDefaults` or toggle
+    // `delta.enableIcebergCompatV3`, so the read configuration decides what is allowed.
+    column_defaults::validate_column_defaults(table_config, schema)?;
     let mut current_fields = HashMap::new();
     for_each_struct_field(&current_schema, |field| {
         current_fields.extend(field.column_mapping_id().map(|id| (id, field)));
@@ -372,14 +378,21 @@ fn validate_added_field(added: &FieldChange) -> KernelResult<()> {
                 field.name()
             ))
         );
+        // Java accepts a default on a new field. Kernel rejects it because the protocol's Default
+        // Columns rule says operations that add a column MUST NOT specify its default in the same
+        // command: existing data files do not contain the field, so its values would not match.
         require!(
             field
                 .get_config_value(&ColumnMetadataKey::CurrentDefault)
                 .is_none(),
-            KernelError::schema(format!(
-                "Cannot add field '{}' under '{path}' with a default value",
-                field.name()
-            ))
+            if std::ptr::eq(field, &added.field) {
+                KernelError::schema(format!("Cannot add field '{path}' with a default value"))
+            } else {
+                KernelError::schema(format!(
+                    "Cannot add field '{}' under '{path}' with a default value",
+                    field.name()
+                ))
+            }
         );
         // Kernel maintains these for existing fields; a new field has no history or file ids.
         let managed_key = [
@@ -436,8 +449,9 @@ fn validate_field_update(update: &FieldUpdate) -> KernelResult<()> {
 }
 
 /// Rejects changes to field metadata that the Delta protocol or Kernel interprets, such as
-/// generation expressions, identity, invariants, defaults, and collations. Other metadata, such as
-/// comments, may change freely. Column-mapping metadata is validated by the schema diff.
+/// generation expressions, identity, invariants, and collations. Other metadata, such as comments,
+/// may change freely. Column-mapping metadata is validated by the schema diff, and defaults by
+/// [`column_defaults::validate_column_defaults`].
 fn validate_metadata_change(update: &FieldUpdate) -> KernelResult<()> {
     let before = &update.before.metadata;
     let after = &update.after.metadata;
@@ -447,6 +461,7 @@ fn validate_metadata_change(update: &FieldUpdate) -> KernelResult<()> {
         .filter(|key| before.get(*key) != after.get(*key))
         // The type-change history is validated by `type_widening::apply_type_changes`.
         .filter(|key| key.as_str() != ColumnMetadataKey::TypeChanges.as_ref())
+        .filter(|key| key.as_str() != ColumnMetadataKey::CurrentDefault.as_ref())
         .find(|key| is_protocol_metadata_key(key.as_str()));
     match changed_key {
         Some(key) => Err(KernelError::schema(format!(
