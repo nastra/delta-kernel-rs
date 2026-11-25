@@ -5,7 +5,7 @@ use delta_kernel::engine_data::FilteredEngineData;
 
 use super::committed::commit_result_to_committed_handle;
 use super::*;
-use crate::delta_types::{FfiStringArray, FfiStringMap};
+use crate::delta_types::{FfiColumnNameArray, FfiStringArray, FfiStringMap};
 
 /// A handle for an update-table transaction (`Transaction<UpdateTable>`).
 ///
@@ -399,6 +399,33 @@ pub unsafe extern "C" fn update_table_txn_builder_with_table_properties_removed(
     let engine = unsafe { engine.as_ref() };
     let result = unsafe { keys.try_to_strings() }
         .map(|keys| Box::new(builder.with_table_properties_removed(keys)).into());
+    unsafe { result.into_extern_result(&engine) }
+}
+
+/// Replaces the table's clustering columns with ordered logical column paths.
+///
+/// Each [`FfiColumnName`] contains literal field-name segments; dots within a segment are not
+/// separators. An empty array clears the clustering columns; not calling this function keeps them.
+/// Repeated calls replace earlier ones. Copies the paths before returning a replacement builder,
+/// or a decoding error. See [`UpdateTableTransactionBuilder::with_clustering_columns`] for the
+/// validation that runs at build.
+///
+/// # Safety
+///
+/// All handles must be valid. The column array, nested path arrays, and string bytes are borrowed
+/// for this call and must follow the [`crate::FfiSlice`] contract: empty arrays may have null
+/// pointers. Borrows `columns` and `engine`, and unconditionally consumes `builder`, including on
+/// errors.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn update_table_txn_builder_with_clustering_columns(
+    builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
+    columns: &FfiColumnNameArray,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
+    let builder = unsafe { *builder.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    let result = unsafe { columns.try_to_column_names() }
+        .map(|columns| Box::new(builder.with_clustering_columns(columns)).into());
     unsafe { result.into_extern_result(&engine) }
 }
 
