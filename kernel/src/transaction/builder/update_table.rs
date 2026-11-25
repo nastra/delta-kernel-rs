@@ -13,11 +13,12 @@ use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    IcebergCompatValidationContext, Operation, SET_TABLE_FEATURE_SUPPORTED_PREFIX, TableFeature,
-    V2_VALIDATOR, V3_VALIDATOR, validate_iceberg_compat_if_needed,
+    IcebergCompatValidationContext, Operation, TableFeature, V2_VALIDATOR, V3_VALIDATOR,
+    validate_iceberg_compat_if_needed,
 };
 use crate::table_properties::{
-    DELTA_PROPERTY_PREFIX, is_delta_property_key, validate_and_normalize_property_for_update,
+    DELTA_PROPERTY_PREFIX, is_delta_property_key, is_table_feature_signal_key,
+    validate_and_normalize_property_batch_for_update, validate_retention_for_property_adds,
 };
 use crate::transaction::domain_metadata::validate_unique_domains;
 use crate::transaction::protocol_prep::{parse_feature_signal, prepare_protocol_for_update};
@@ -317,13 +318,15 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         engine: &dyn Engine,
         committer: Box<dyn Committer>,
     ) -> Result<Transaction<UpdateTable, MODE>> {
-        self.validate()?;
-        let transaction = try_new_update_table(self, committer, engine)?;
+        let properties_added = self.validate()?;
+        let transaction = try_new_update_table(self, committer, engine, properties_added)?;
         transaction.validate_domain_metadata_operations()?;
         Ok(transaction)
     }
 
-    fn validate(&self) -> KernelResult<()> {
+    /// Validates the builder and returns the canonicalized property additions that the retention
+    /// check ran against.
+    fn validate(&self) -> KernelResult<HashMap<String, String>> {
         let operation = &self.local_state.operation;
         operation
             .validate()
@@ -372,7 +375,7 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
             .map(|batch| {
                 batch
                     .iter()
-                    .filter(|(key, _)| !key.starts_with(SET_TABLE_FEATURE_SUPPORTED_PREFIX))
+                    .filter(|(key, _)| !is_table_feature_signal_key(key))
                     .cloned()
                     .collect()
             })
@@ -405,7 +408,17 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         }
         // Duplicate additions are validated by the shared builder state.
         self.common_state.validate()?;
-        Ok(())
+        // Retention checks do not need the engine; reject before I/O. Retention is checked only
+        // when a retention key is being set (Spark parity).
+        validate_retention_for_property_adds(
+            self.local_state
+                .snapshot
+                .table_configuration()
+                .metadata()
+                .configuration(),
+            &properties_added,
+        )?;
+        Ok(properties_added)
     }
 }
 
@@ -413,6 +426,7 @@ fn try_new_update_table<MODE: ExecutionMode>(
     builder: UpdateTableTransactionBuilder<MODE>,
     committer: Box<dyn Committer>,
     engine: &dyn Engine,
+    validated_properties_added: HashMap<String, String>,
 ) -> Result<Transaction<UpdateTable, MODE>> {
     let TransactionBuilder {
         common_state,
@@ -471,24 +485,13 @@ fn try_new_update_table<MODE: ExecutionMode>(
     )?;
 
     let is_alter = operation == UpdateTableOperation::AlterTable;
-    reject_duplicate_delta_keys_in_batch(&properties_added)?;
-    // Feature signals (`delta.feature.X=supported`) are partitioned out of each add-batch and are
-    // not stored in metadata; remaining batches keep call-order for canonicalization.
-    let mut feature_signal_pairs = HashMap::new();
-    let mut remaining_batches = Vec::new();
-    for batch in properties_added {
-        let mut remaining = Vec::new();
-        for (key, value) in batch {
-            if key.starts_with(SET_TABLE_FEATURE_SUPPORTED_PREFIX) {
-                feature_signal_pairs.insert(key, value);
-            } else {
-                remaining.push((key, value));
-            }
-        }
-        if !remaining.is_empty() {
-            remaining_batches.push(remaining);
-        }
-    }
+    // Feature signals (`delta.feature.X=supported`) are not stored in metadata. The remaining adds
+    // were validated and canonicalized before I/O (`validated_properties_added`).
+    let feature_signal_pairs: HashMap<String, String> = properties_added
+        .into_iter()
+        .flatten()
+        .filter(|(key, _)| is_table_feature_signal_key(key))
+        .collect();
     let feature_signals = feature_signal_pairs
         .iter()
         .map(|(key, value)| parse_feature_signal(key, value, "UPDATE TABLE"))
@@ -506,21 +509,16 @@ fn try_new_update_table<MODE: ExecutionMode>(
         Some(changes) => apply_schema_changes(effective_table_config, changes)?,
         None => effective_table_config,
     };
-    let properties_added = if remaining_batches.is_empty() {
-        HashMap::new()
+    // ALTER TABLE always keeps requested adds (Spark always rewrites Metadata for SET
+    // TBLPROPERTIES). Data operations drop identical values so Metadata is emitted only when
+    // a value actually changes.
+    let properties_added = if is_alter {
+        validated_properties_added
     } else {
-        let validated = validate_and_canonicalize_properties_added(&remaining_batches)?;
-        // ALTER TABLE always keeps requested adds (Spark always rewrites Metadata for SET
-        // TBLPROPERTIES). Data operations drop identical values so Metadata is emitted only when
-        // a value actually changes.
-        if is_alter {
-            validated
-        } else {
-            filter_out_unchanged_properties(
-                effective_table_config.metadata().configuration(),
-                validated,
-            )
-        }
+        filter_out_unchanged_properties(
+            effective_table_config.metadata().configuration(),
+            validated_properties_added,
+        )
     };
     let has_property_adds = !properties_added.is_empty();
     // ALTER TABLE always keeps requested removals (Spark always rewrites Metadata for UNSET
@@ -672,11 +670,9 @@ fn validate_and_canonicalize_properties_added(
 ) -> KernelResult<HashMap<String, String>> {
     let mut validated = HashMap::new();
     for batch in properties_added {
-        for (key, value) in batch {
-            let (canonical_key, value) =
-                validate_and_normalize_property_for_update(key.clone(), value.clone())?;
-            validated.insert(canonical_key, value);
-        }
+        validated.extend(validate_and_normalize_property_batch_for_update(
+            batch.iter().cloned(),
+        )?);
     }
     Ok(validated)
 }
@@ -759,9 +755,10 @@ mod tests {
     use crate::snapshot::Snapshot;
     use crate::table_features::TableFeature;
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    use crate::table_properties::ENABLE_DELETION_VECTORS;
+    use crate::table_properties::{ENABLE_DELETION_VECTORS, ENABLE_IN_COMMIT_TIMESTAMPS};
     use crate::table_properties::{
-        ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
+        DELETED_FILE_RETENTION_DURATION, ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3,
+        LOG_RETENTION_DURATION,
     };
     use crate::transaction::create_table::create_table;
     use crate::transaction::{SchemaOperation, UpdateTableOperation};
@@ -1900,6 +1897,54 @@ mod tests {
             error.to_string().contains(
                 "IcebergNativeV4 requires 'delta.enableDeletionVectors' to be 'true', got 'false'"
             ),
+            "error={error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_added_rejects_incompatible_retention_durations() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([
+                ("delta.logRetentionDuration", "interval 1 days"),
+                ("delta.deletedFileRetentionDuration", "interval 7 days"),
+            ])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("needs to be greater than or equal to"),
+            "error={error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_added_checks_retention_against_existing_log_value() -> Result<()> {
+        let engine = Arc::new(SyncEngine::in_memory());
+        let snapshot = create_table("memory:///", test_schema_flat(), "test-engine", true)
+            .with_table_properties([
+                (LOG_RETENTION_DURATION, "interval 3 days"),
+                (DELETED_FILE_RETENTION_DURATION, "interval 1 days"),
+            ])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([(DELETED_FILE_RETENTION_DURATION, "interval 7 days")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("needs to be greater than or equal to"),
             "error={error}"
         );
         Ok(())

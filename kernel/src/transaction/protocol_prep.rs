@@ -14,9 +14,9 @@ use crate::schema::validation::validate_cdf_column_names;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     ColumnMappingMode, FeatureRequirement, LEGACY_WRITER_FEATURES,
-    SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
-    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature,
-    add_feature_to_lists, auto_enable_property_driven_features, ensure_domain_metadata_dependency,
+    SET_TABLE_FEATURE_SUPPORTED_VALUE, TABLE_FEATURES_MIN_READER_VERSION,
+    TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature, add_feature_to_lists,
+    auto_enable_property_driven_features, ensure_domain_metadata_dependency,
     extract_enabled_reader_features, schema_contains_timestamp_ntz,
 };
 use crate::table_properties::{
@@ -25,7 +25,7 @@ use crate::table_properties::{
     ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING, IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP,
     IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
     MATERIALIZED_ROW_ID_COLUMN_NAME, ROW_TRACKING_SUSPENDED, TableProperties,
-    UNIVERSAL_FORMAT_ENABLED_FORMATS,
+    UNIVERSAL_FORMAT_ENABLED_FORMATS, strip_table_feature_signal_prefix,
 };
 use crate::{KernelError, KernelResult, Result};
 
@@ -109,21 +109,21 @@ pub(crate) fn parse_feature_signal(
             "Invalid value '{value}' for '{key}'. Only '{SET_TABLE_FEATURE_SUPPORTED_VALUE}' is allowed."
         )));
     }
-    let Some(feature_name) = key.strip_prefix(SET_TABLE_FEATURE_SUPPORTED_PREFIX) else {
+    let Some(feature_name) = strip_table_feature_signal_prefix(key) else {
         return Err(KernelError::generic(format!(
             "'{key}' is not a feature signal"
         )));
     };
-    // Unknown names become TableFeature::Unknown, which is never in the allowlist.
-    let feature: TableFeature = feature_name
-        .parse()
-        .unwrap_or_else(|_| TableFeature::Unknown(feature_name.to_string()));
-    if !ALLOWED_DELTA_FEATURES.contains(&feature) {
-        return Err(KernelError::generic(format!(
-            "Enabling feature '{feature_name}' via '{key}' is not supported during {operation}"
-        )));
-    }
-    Ok(feature)
+    // The prefix and feature name match case-insensitively and resolve to the canonical feature.
+    ALLOWED_DELTA_FEATURES
+        .iter()
+        .find(|feature| feature.as_ref().eq_ignore_ascii_case(feature_name))
+        .cloned()
+        .ok_or_else(|| {
+            KernelError::generic(format!(
+                "Enabling feature '{feature_name}' via '{key}' is not supported during {operation}"
+            ))
+        })
 }
 
 /// Returns `protocol` with `timestampNtz` added when `schema` has timestamp-without-timezone
